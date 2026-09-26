@@ -11,13 +11,28 @@
 //! diagnostic line on stderr). Reports go to stderr, so stdout stays free
 //! for the CLI's JSON progress protocol.
 const std = @import("std");
+const builtin = @import("builtin");
 const contract = @import("contract.zig");
 const settings_mod = @import("settings.zig");
 const identity_mod = @import("project_identity.zig");
 const doctor = @import("doctor.zig");
+const sdk = @import("sdk.zig");
+const actions = @import("actions.zig");
 
 /// What an invocation runs.
-pub const Action = enum { doctor };
+pub const Action = enum {
+    doctor,
+    /// `labelle android run`: install + launch the built APK.
+    run_command,
+    /// `labelle android deploy`: upload a bundled APK to GitHub Releases.
+    deploy_command,
+    /// `after build`: package `zig-out/apk/game.apk`.
+    package_hook,
+    /// `replace run`: install + launch that APK with the run options.
+    deploy_hook,
+    /// `replace bundle`: the release APK in the bundle output directory.
+    bundle_hook,
+};
 
 const Kind = @FieldType(contract.Invocation, "kind");
 
@@ -32,11 +47,13 @@ const Route = struct {
     needs_project: bool,
 };
 
-/// PR 1 declares `doctor` only; the packaging hooks (`package`, `deploy`,
-/// `bundle`) and the `run`/`deploy` commands arrive with their
-/// implementation.
 const routes = [_]Route{
     .{ .kind = .command, .id = "doctor", .action = .doctor, .needs_project = false },
+    .{ .kind = .command, .id = "run", .action = .run_command, .needs_project = true },
+    .{ .kind = .command, .id = "deploy", .action = .deploy_command, .needs_project = true },
+    .{ .kind = .hook, .id = "package", .step = .build, .phase = .after, .action = .package_hook, .needs_project = true },
+    .{ .kind = .hook, .id = "deploy", .step = .run, .phase = .replace, .action = .deploy_hook, .needs_project = true },
+    .{ .kind = .hook, .id = "bundle", .step = .bundle, .phase = .replace, .action = .bundle_hook, .needs_project = true },
 };
 
 /// The one target this provider's hooks serve.
@@ -98,21 +115,30 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !bool {
     const ctx = parsed.value;
     const action = try route(ctx);
 
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
-    defer args.deinit();
-    _ = args.skip();
-    while (args.next()) |arg| {
-        if (ctx.invocation.kind == .hook) return error.UnexpectedHookArguments;
-        try out.print("labelle-android: unknown argument '{s}'\n", .{arg});
-        return error.UnknownArgument;
+    var args: std.ArrayList([]const u8) = .empty;
+    {
+        var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
+        defer it.deinit();
+        _ = it.skip();
+        while (it.next()) |arg| {
+            if (ctx.invocation.kind == .hook) return error.UnexpectedHookArguments;
+            try args.append(a, try a.dupe(u8, arg));
+        }
+    }
+    if (action == .doctor) {
+        for (args.items) |arg| {
+            try out.print("labelle-android: unknown argument '{s}'\n", .{arg});
+            return error.UnknownArgument;
+        }
     }
 
     // Validate settings before any side effect.
     var settings: ?settings_mod.Settings = null;
+    var settings_bytes: []const u8 = "";
     if (ctx.config_file) |path| {
-        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024));
+        settings_bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024));
         var diag: settings_mod.Diagnostic = .{};
-        settings = settings_mod.parse(a, raw, &diag) catch |err| {
+        settings = settings_mod.parse(a, settings_bytes, &diag) catch |err| {
             try out.print("labelle-android: {s}: {s}\n", .{ path, diag.message });
             return err;
         };
@@ -120,22 +146,50 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !bool {
     var identity: ?identity_mod.Identity = null;
     if (ctx.project_dir) |project| identity = try identity_mod.load(a, io, project);
 
-    switch (action) {
-        .doctor => {
-            if (settings) |s| {
-                try out.print("\n  package: {s}  label: \"{s}\"  min SDK: {d}\n", .{
-                    s.package_name,
-                    settings_mod.appName(s, if (identity) |id| id.title else ""),
-                    s.min_sdk_version,
-                });
-            } else if (ctx.project_dir != null) {
-                try out.writeAll("\n  note: no providers/android.json for this project (`.provider_config`); using defaults\n");
-            }
-            const level = if (settings) |s| s.target_sdk_version else settings_mod.default_target_sdk;
-            const summary = try doctor.run(a, io, init.environ_map, .{ .target_sdk_version = level }, out);
-            return summary.failures != 0;
-        },
+    if (action == .doctor) {
+        if (settings) |s| {
+            try out.print("\n  package: {s}  label: \"{s}\"  min SDK: {d}\n", .{
+                s.package_name,
+                settings_mod.appName(s, if (identity) |id| id.title else ""),
+                s.min_sdk_version,
+            });
+        } else if (ctx.project_dir != null) {
+            try out.writeAll("\n  note: no providers/android.json for this project (`.provider_config`); using defaults\n");
+        }
+        const level = if (settings) |s| s.target_sdk_version else settings_mod.default_target_sdk;
+        const summary = try doctor.run(a, io, init.environ_map, .{ .target_sdk_version = level }, out);
+        return summary.failures != 0;
     }
+
+    // Everything else packages or installs, so it needs the settings.
+    const s = settings orelse {
+        try out.writeAll(
+            \\labelle-android: this project has no Android settings. Add providers/android.json
+            \\  (at least {"schema_version": 1, "package_name": "com.studio.game"}) and declare it in project.labelle:
+            \\  .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
+            \\
+        );
+        return error.MissingSettings;
+    };
+    try out.flush();
+    const run_ctx: actions.Context = .{
+        .a = a,
+        .io = io,
+        .env = init.environ_map,
+        .ctx = ctx,
+        .settings = s,
+        .settings_bytes = settings_bytes,
+        .identity = identity.?,
+    };
+    switch (action) {
+        .doctor => unreachable,
+        .run_command => try actions.runCommand(run_ctx, args.items),
+        .deploy_command => try actions.deployCommand(run_ctx, args.items),
+        .package_hook => try actions.packageHook(run_ctx),
+        .deploy_hook => try actions.deployHook(run_ctx),
+        .bundle_hook => try actions.bundleHook(run_ctx),
+    }
+    return false;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -157,23 +211,16 @@ fn contextFor(kind: Kind, id: []const u8, step: ?contract.Step, phase: ?contract
     };
 }
 
-fn expectRoute(kind: Kind, id: []const u8, step: ?contract.Step, phase: ?contract.Phase, project: bool, accepted: *usize) !void {
-    const ctx = contextFor(kind, id, step, phase, project);
-    const declared = kind == .command and std.mem.eql(u8, id, "doctor") and step == null and phase == null;
-    if (route(ctx)) |action| {
-        try std.testing.expect(declared);
-        try std.testing.expectEqual(Action.doctor, action);
-        accepted.* += 1;
-    } else |err| {
-        try std.testing.expect(!declared);
-        const expected: RouteError = if (kind == .hook)
-            error.UnknownHook
-        else if (std.mem.eql(u8, id, "doctor"))
-            error.InvalidInvocation
-        else
-            error.UnknownCommand;
-        try std.testing.expectEqual(expected, err);
+/// What `route` must answer for one invocation, derived independently of
+/// `route` from the declared table.
+fn expected(kind: Kind, id: []const u8, step: ?contract.Step, phase: ?contract.Phase, project: bool) RouteError!Action {
+    for (routes) |r| {
+        if (r.kind != kind or !std.mem.eql(u8, r.id, id)) continue;
+        if (!sameStep(r.step, step) or !samePhase(r.phase, phase)) return error.InvalidInvocation;
+        if (r.needs_project and !project) return error.InvalidInvocation;
+        return r.action;
     }
+    return if (kind == .hook) error.UnknownHook else error.UnknownCommand;
 }
 
 test "invocation matrix: only the declared (kind, id, step, phase) runs" {
@@ -186,33 +233,61 @@ test "invocation matrix: only the declared (kind, id, step, phase) runs" {
             for (steps) |step| {
                 for (phases) |phase| {
                     for ([_]bool{ false, true }) |project| {
-                        try expectRoute(kind, id, step, phase, project, &accepted);
+                        const want = expected(kind, id, step, phase, project);
+                        const got = route(contextFor(kind, id, step, phase, project));
+                        if (want) |action| {
+                            try std.testing.expectEqual(action, try got);
+                            accepted += 1;
+                        } else |err| try std.testing.expectError(err, got);
                     }
                 }
             }
         }
     }
-    // doctor, inside a project and outside one.
-    try std.testing.expectEqual(@as(usize, 2), accepted);
+    // doctor inside a project and outside one; run and deploy commands in a
+    // project; the three hooks on their own (step, phase).
+    try std.testing.expectEqual(@as(usize, 7), accepted);
+    // Spot-check the table itself, so `expected` cannot drift with it.
+    try std.testing.expectEqual(Action.package_hook, try route(contextFor(.hook, "package", .build, .after, true)));
+    try std.testing.expectEqual(Action.deploy_hook, try route(contextFor(.hook, "deploy", .run, .replace, true)));
+    try std.testing.expectEqual(Action.bundle_hook, try route(contextFor(.hook, "bundle", .bundle, .replace, true)));
+    try std.testing.expectEqual(Action.deploy_command, try route(contextFor(.command, "deploy", null, null, true)));
+    try std.testing.expectError(error.InvalidInvocation, route(contextFor(.hook, "package", .build, .before, true)));
+    try std.testing.expectError(error.InvalidInvocation, route(contextFor(.command, "run", null, null, false)));
+    try std.testing.expectError(error.UnknownCommand, route(contextFor(.command, "studio", null, null, true)));
+}
+
+test "a hook for another target is refused" {
+    var ctx = contextFor(.hook, "package", .build, .after, true);
+    ctx.target = "desktop";
+    try std.testing.expectError(error.UnsupportedTarget, route(ctx));
 }
 
 test "routes mirror plugin.labelle" {
+    const a = std.testing.allocator;
     const manifest = @embedFile("plugin.labelle");
+    const tool = ".build_step = \"install-provider\", .executable = \"bin/labelle-android\"";
+    var commands: usize = 0;
+    var hooks: usize = 0;
     for (routes) |r| {
         const needle = switch (r.kind) {
-            .command => try std.fmt.allocPrint(std.testing.allocator, ".name = \"{s}\"", .{r.id}),
-            .hook => try std.fmt.allocPrint(std.testing.allocator, ".id = \"{s}\"", .{r.id}),
+            .command => try std.fmt.allocPrint(a, ".name = \"{s}\", {s}", .{ r.id, tool }),
+            .hook => try std.fmt.allocPrint(a, ".id = \"{s}\", .step = .{s}, .target = \"{s}\", .when = .{s}, {s}", .{
+                r.id, @tagName(r.step.?), target, @tagName(r.phase.?), tool,
+            }),
         };
-        defer std.testing.allocator.free(needle);
+        defer a.free(needle);
         try std.testing.expect(std.mem.indexOf(u8, manifest, needle) != null);
-        if (r.kind == .command) {
-            const project = if (r.needs_project) ".needs_project = true" else ".needs_project = false";
-            try std.testing.expect(std.mem.indexOf(u8, manifest, project) != null);
+        switch (r.kind) {
+            .command => commands += 1,
+            .hook => hooks += 1,
         }
     }
-    // No hooks declared until their implementation lands.
-    try std.testing.expect(std.mem.indexOf(u8, manifest, ".hooks") == null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"bin/labelle-android\"") != null);
+    // Nothing declared that the table does not route.
+    const declared = manifest[std.mem.indexOf(u8, manifest, ".commands = .{").?..];
+    try std.testing.expectEqual(commands, std.mem.count(u8, declared, ".name = \""));
+    try std.testing.expectEqual(hooks, std.mem.count(u8, declared, ".id = \""));
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "studio") == null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, ".command_contract = \">=1.2.0 <1.3.0\"") != null);
 }
 
@@ -229,6 +304,7 @@ test "the vendored decoder is contract 1.2.0 and accepts its own fixtures" {
 
 test {
     _ = contract;
+    _ = actions;
     _ = settings_mod;
     _ = identity_mod;
     _ = doctor;
