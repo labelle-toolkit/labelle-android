@@ -74,10 +74,16 @@ const DEVICE_RATE: i32 = 48000;
 const DEVICE_CHANNELS: i32 = 2;
 
 /// Upper bound on the wait for STARTING → STARTED right after
-/// `requestStart` (the transition is typically sub-millisecond on MMAP
-/// streams, a few ms on legacy ones). Past it the stream is kept and the
-/// marker is deferred to a later `ensureStarted` poll — never logged early.
-const START_WAIT_NS: i64 = 50 * std.time.ns_per_ms;
+/// `requestStart`. `AAudioStream_waitForStateChange` returns as soon as the
+/// state leaves STARTING (it polls the server every 20 ms), so the bound is
+/// only ever paid in full by a stream that is stuck starting. MMAP streams
+/// flip near-instantly; the legacy AudioTrack path measured 105 ms on the
+/// SM-T505 (Android 12), which a 50 ms bound missed — and since the mixer
+/// only calls `ensureStarted` from `load*`/`play*`, a game whose first sound
+/// is also its last would then never log the marker. Past the bound the
+/// stream is kept and the marker is deferred to a later `ensureStarted`
+/// poll — never logged early.
+const START_WAIT_NS: i64 = 250 * std.time.ns_per_ms;
 
 // AAudio C ABI (subset). aaudio_result_t AAUDIO_OK == 0.
 const AAudioStreamBuilder = opaque {};
