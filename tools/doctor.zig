@@ -77,8 +77,13 @@ const Fake = struct {
         std.testing.allocator.destroy(self);
     }
 
+    /// `root/rel` with `rel`'s `/` turned into the host separator, so
+    /// expected paths match what the lookup builds on Windows too.
     fn abs(self: *Fake, rel: []const u8) ![]const u8 {
-        return std.fs.path.join(self.arena.allocator(), &.{ self.root, rel });
+        const a = self.arena.allocator();
+        const native = try a.dupe(u8, rel);
+        if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, native, '/', std.fs.path.sep);
+        return std.fs.path.join(a, &.{ self.root, native });
     }
 
     /// Create `dir/<tool with host suffix>`.
