@@ -66,25 +66,41 @@ pub const BuildTools = struct {
     version: []const u8,
 };
 
-/// The newest `<sdk>/build-tools/<version>/`, compared numerically
-/// (`10.0.0` > `9.0.0`).
+/// A build-tools file the packager launches.
+pub const BuildTool = struct { name: []const u8, kind: ToolKind };
+
+/// Exactly the files the packager launches from build-tools (aapt,
+/// zipalign, and the apksigner `.bat` on Windows).
+pub const required_build_tools = [_]BuildTool{
+    .{ .name = "aapt", .kind = .native_exe },
+    .{ .name = "zipalign", .kind = .native_exe },
+    .{ .name = "apksigner", .kind = .script },
+};
+
+/// The greatest `<sdk>/build-tools/<version>/` that holds every
+/// `required_build_tools` file, compared by `parseVersion` (`10.0.0` >
+/// `9.0.0`, `35.0.0` > `35.0.0-rc1`). An incomplete revision, say from an
+/// interrupted install, cannot shadow an older complete one (the rule
+/// `findNdkRoot` applies to sysroots).
 pub fn findBuildTools(a: std.mem.Allocator, io: std.Io, sdk_home: []const u8) !?BuildTools {
     const root = try std.fs.path.join(a, &.{ sdk_home, "build-tools" });
     var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch return null;
     defer dir.close(io);
-    var best: ?[]const u8 = null;
-    var best_version: u64 = 0;
+    var best: ?BuildTools = null;
+    var best_version: u128 = 0;
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
+    entries: while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         const v = parseVersion(entry.name);
-        if (best == null or v > best_version) {
-            best = try a.dupe(u8, entry.name);
-            best_version = v;
+        if (best != null and v <= best_version) continue;
+        const candidate = try std.fs.path.join(a, &.{ root, entry.name });
+        for (required_build_tools) |tool| {
+            if (!isFile(io, try toolPath(a, candidate, tool.name, tool.kind))) continue :entries;
         }
+        best = .{ .dir = candidate, .version = try a.dupe(u8, entry.name) };
+        best_version = v;
     }
-    const version = best orelse return null;
-    return .{ .dir = try std.fs.path.join(a, &.{ root, version }), .version = version };
+    return best;
 }
 
 /// `<sdk>/platforms/android-<level>/android.jar`, the aapt compile classpath.
@@ -106,7 +122,7 @@ pub fn findNdkRoot(a: std.mem.Allocator, io: std.Io, env: *const Env, sdk_home: 
     var dir = std.Io.Dir.cwd().openDir(io, ndk_dir, .{ .iterate = true }) catch return null;
     defer dir.close(io);
     var best: ?[]u8 = null;
-    var best_version: u64 = 0;
+    var best_version: u128 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
@@ -170,20 +186,39 @@ pub fn findOnPath(a: std.mem.Allocator, io: std.Io, env: *const Env, name: []con
 }
 
 /// `"1.2.3"` → a comparable number (the CLI's `util.parseVersion`, widened
-/// so NDK build numbers like `27.2.12479018` do not overflow). Non-digit
-/// bytes are skipped.
-pub fn parseVersion(version: []const u8) u64 {
-    var parts: [3]u64 = .{ 0, 0, 0 };
+/// so NDK build numbers like `27.2.12479018` do not overflow). Parsing of
+/// the numeric part stops at the first byte that is neither a digit nor
+/// `.`; anything from there on is a pre-release suffix (`35.0.0-rc1`),
+/// which ranks BELOW the same stable release and, among pre-releases of
+/// one version, by the suffix's trailing number (`rc2` > `rc1`).
+pub fn parseVersion(version: []const u8) u128 {
+    var parts: [3]u128 = .{ 0, 0, 0 };
     var i: usize = 0;
-    for (version) |c| {
+    var end: usize = version.len;
+    for (version, 0..) |c, at| {
         if (c == '.') {
             i += 1;
+            // A fourth component is ignored, not a pre-release.
             if (i >= parts.len) break;
         } else if (c >= '0' and c <= '9') {
-            parts[i] = @min(parts[i] *| 10 +| (c - '0'), 999_999);
+            parts[i] = @min(parts[i] *| 10 +| (c - '0'), 999_999_999);
+        } else {
+            end = at;
+            break;
         }
     }
-    return parts[0] * 1_000_000_000_000 + parts[1] * 1_000_000 + parts[2];
+    // Stable releases take the top rank; a pre-release ranks by the number
+    // that ends its suffix (`-rc1` → 1), capped below stable.
+    const rank: u128 = if (end >= version.len) 999 else blk: {
+        const suffix = version[end..];
+        var start = suffix.len;
+        while (start > 0 and suffix[start - 1] >= '0' and suffix[start - 1] <= '9') start -= 1;
+        var n: u128 = 0;
+        for (suffix[start..]) |c| n = @min(n * 10 + (c - '0'), 998);
+        break :blk n;
+    };
+    const base = (parts[0] * 1_000_000_000 + parts[1]) * 1_000_000_000 + parts[2];
+    return base * 1000 + rank;
 }
 
 // ── detect ────────────────────────────────────────────────────────────────
@@ -245,14 +280,7 @@ pub fn detect(a: std.mem.Allocator, io: std.Io, env: *const Env, opts: DetectOpt
             .path = if (bt) |b| b.dir else null,
             .hint = "install build-tools: `sdkmanager \"build-tools;34.0.0\"`",
         });
-        // Exactly the files the packager launches (aapt, zipalign, and the
-        // apksigner `.bat` on Windows).
-        const tools = [_]struct { name: []const u8, kind: ToolKind }{
-            .{ .name = "aapt", .kind = .native_exe },
-            .{ .name = "zipalign", .kind = .native_exe },
-            .{ .name = "apksigner", .kind = .script },
-        };
-        for (tools) |tool| {
+        for (required_build_tools) |tool| {
             var found: ?[]const u8 = null;
             if (bt) |b| {
                 const path = try toolPath(a, b.dir, tool.name, tool.kind);
@@ -316,6 +344,24 @@ test "parseVersion orders numerically, not lexicographically" {
     try std.testing.expect(parseVersion("34.0.0") > parseVersion("33.0.2"));
     try std.testing.expect(parseVersion("27.2.12479018") > parseVersion("27.0.12077973"));
     try std.testing.expectEqual(parseVersion("1.2.3"), parseVersion("1.2.3"));
+}
+
+test "parseVersion: a pre-release ranks below its stable release, not above" {
+    // Suffix digits must not leak into the patch number (`-rc1` → `01`).
+    try std.testing.expect(parseVersion("35.0.0") > parseVersion("35.0.0-rc1"));
+    try std.testing.expect(parseVersion("35.0.0") > parseVersion("35.0.0-rc5"));
+    try std.testing.expect(parseVersion("35.0.0-rc2") > parseVersion("35.0.0-rc1"));
+    // The higher version wins whatever the suffix.
+    try std.testing.expect(parseVersion("36.0.0-rc1") > parseVersion("35.0.1"));
+    try std.testing.expect(parseVersion("35.0.1") > parseVersion("35.0.0-rc9"));
+    try std.testing.expect(parseVersion("35.0.0-rc1") > parseVersion("34.0.0"));
+    // NDK directory names: build numbers compare numerically; a suffixed
+    // (beta) NDK ranks below the same build without one.
+    try std.testing.expect(parseVersion("28.2.13676358") > parseVersion("28.0.12916984"));
+    try std.testing.expect(parseVersion("27.2.12479018") > parseVersion("27.2.12479018-beta1"));
+    try std.testing.expect(parseVersion("28.0.12433566-beta1") > parseVersion("27.2.12479018"));
+    // A fourth numeric component is ignored, not read as a pre-release.
+    try std.testing.expectEqual(parseVersion("1.2.3"), parseVersion("1.2.3.4"));
 }
 
 test "ndkHostTag: darwin-x86_64 on macOS whatever the CPU" {

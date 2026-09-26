@@ -77,8 +77,13 @@ const Fake = struct {
         std.testing.allocator.destroy(self);
     }
 
+    /// `root/rel` with `rel`'s `/` turned into the host separator, so
+    /// expected paths match what the lookup builds on Windows too.
     fn abs(self: *Fake, rel: []const u8) ![]const u8 {
-        return std.fs.path.join(self.arena.allocator(), &.{ self.root, rel });
+        const a = self.arena.allocator();
+        const native = try a.dupe(u8, rel);
+        if (std.fs.path.sep != '/') std.mem.replaceScalar(u8, native, '/', std.fs.path.sep);
+        return std.fs.path.join(a, &.{ self.root, native });
     }
 
     /// Create `dir/<tool with host suffix>`.
@@ -152,6 +157,46 @@ test "doctor: a complete fake SDK passes and resolves the right versions" {
     try std.testing.expect(std.mem.indexOf(u8, text, "28.2.13676358") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "9.0.0") == null);
     if (builtin.os.tag == .windows) try expectContains(text, "apksigner.bat");
+}
+
+test "doctor: an incomplete newest build-tools revision does not shadow a complete one" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    // An interrupted install: the greatest revision lacks apksigner, and a
+    // stable release outranks a complete release candidate of it.
+    for ([_][]const u8{ "aapt", "zipalign" }) |name| try fake.tool("sdk/build-tools/36.0.0", name, .native_exe);
+    for ([_][]const u8{ "aapt", "zipalign" }) |name| try fake.tool("sdk/build-tools/35.0.0-rc1", name, .native_exe);
+    try fake.tool("sdk/build-tools/35.0.0-rc1", "apksigner", .script);
+    for ([_][]const u8{ "aapt", "zipalign" }) |name| try fake.tool("sdk/build-tools/35.0.0", name, .native_exe);
+    try fake.tool("sdk/build-tools/35.0.0", "apksigner", .script);
+    const bt = (try sdk.findBuildTools(fake.arena.allocator(), std.testing.io, try fake.abs("sdk"))).?;
+    try std.testing.expectEqualStrings("35.0.0", bt.version);
+    try std.testing.expectEqualStrings(try fake.abs("sdk/build-tools/35.0.0"), bt.dir);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const summary = try fake.doctor(.{}, &out.writer);
+    try std.testing.expectEqual(@as(usize, 0), summary.failures);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "36.0.0") == null);
+    // The path ends the line, so `35.0.0-rc1` cannot satisfy this.
+    const line = try std.fmt.allocPrint(fake.arena.allocator(), "{s}\n", .{try fake.abs("sdk/build-tools/35.0.0")});
+    try expectContains(out.written(), line);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "rc1") == null);
+}
+
+test "doctor: no complete build-tools revision fails build-tools" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    try fake.tmp.dir.deleteTree(std.testing.io, "sdk/build-tools/34.0.0");
+    try fake.tool("sdk/build-tools/36.0.0", "aapt", .native_exe);
+    try std.testing.expect(try sdk.findBuildTools(fake.arena.allocator(), std.testing.io, try fake.abs("sdk")) == null);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const summary = try fake.doctor(.{}, &out.writer);
+    try expectContains(out.written(), "[ FAIL ] build-tools");
+    // build-tools itself plus aapt, zipalign and apksigner.
+    try std.testing.expectEqual(@as(usize, 4), summary.failures);
 }
 
 test "doctor: a missing platform for the configured target SDK fails with a hint" {

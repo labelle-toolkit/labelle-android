@@ -36,6 +36,7 @@ cli, zig = str(Path(a.cli).resolve()), str(Path(a.zig).resolve())
 repo = Path(__file__).resolve().parents[2]
 version = subprocess.check_output([zig, 'version'], text=True).strip()
 windows = os.name == 'nt'
+# `os.uname()` does not exist on Windows; `sys.platform` does everywhere.
 host = 'windows-x86_64' if windows else ('darwin-x86_64' if sys.platform == 'darwin' else 'linux-x86_64')
 exe = '.exe' if windows else ''
 
