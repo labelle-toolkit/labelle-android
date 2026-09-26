@@ -49,7 +49,7 @@ The Android compile-check compiles and links every AAudio entry point (`ensureSt
 
 **Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase). The packaging hooks (`package` after `build`, `deploy` replacing `run`, `bundle` replacing `bundle`) and the `run`/`deploy` commands arrive in the next release; until then `labelle bundle --platform=android` reports that no provider replaces the bundle step.
 
-Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440)) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). CI drives the real CLI through `tests/provider/e2e.py`; until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
+Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440), on `development`) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). CI drives the real CLI through `tests/provider/e2e.py`; until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
 
 ### Project setup
 

@@ -95,12 +95,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # labelle-cli PR #440 (contract 1.2.0), head of `feat/contract-1.2.0`.
-      # Move the pin to `development` once #440 and #405 PR 3 merge.
+      # labelle-cli `development` at the merge of PR #440 (contract 1.2.0).
+      # Move the pin forward (and drop the unreserve step) once #405 PR 3 merges.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: cc2fce95cc26303a0e95267488570cc3b0f4ab96
+          ref: 23aa180d0da9d7bfc71cdac765d36706a0d605ad
           path: .test-cli
           persist-credentials: false
       # Until #405 PR 3, the CLI reserves the `android` namespace for its

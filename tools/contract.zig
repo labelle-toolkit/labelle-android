@@ -1,6 +1,5 @@
-//! Vendored from labelle-cli `src/cli/provider_contract.zig` at commit
-//! 88025c364f9a1ec3bdcaabce4e29ce691c5c7fb9 (PR #440, branch
-//! `feat/contract-1.2.0`, head cc2fce95cc26303a0e95267488570cc3b0f4ab96):
+//! Vendored from labelle-cli `src/cli/provider_contract.zig` on `development`
+//! at 23aa180d0da9d7bfc71cdac765d36706a0d605ad (PR #440 merged):
 //! the strict provider wire decoder, contract 1.2.0. Its JSON fixtures are
 //! vendored alongside in `provider_contract/`. Re-vendor verbatim (keep this
 //! header) when the CLI ships a new contract minor; do not edit below.
