@@ -21,8 +21,10 @@
 //!     each tagged with the output format current when it was emitted, and
 //!     resamples every format segment to 48 kHz stereo at `finish`. Host-tested
 //!     with a fake buffer sequence including a mid-stream rate/channel change.
-//!   * `classifyDequeue` / `outFrames48k` — pure helpers for the drain
-//!     decisions and the (u64-widened) frame-count arithmetic; host-tested.
+//!   * `classifyDequeue` / `afterOutputBuffer` / `outFrames48k` — pure
+//!     helpers for the drain decisions (incl. stopping once the output cap is
+//!     full, labelle-android#5) and the (u64-widened) frame-count arithmetic;
+//!     host-tested.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -108,6 +110,34 @@ const InputQueue = struct {
         return if (self.failures >= MAX_INPUT_QUEUE_FAILURES) .failed else .retry;
     }
 };
+
+/// What the drive loop does after releasing one output buffer (pure;
+/// host-tested; labelle-android#5).
+const OutputStep = enum {
+    /// Keep feeding input and draining output.
+    drain,
+    /// Stop decoding and `finish` with the accumulated PCM.
+    finish,
+    /// The codec refused the release: give up (`DecodeFailed`).
+    fail,
+};
+
+/// `release_status` is `AMediaCodec_releaseOutputBuffer`'s result, `eos`
+/// whether the buffer carried `FLAG_END_OF_STREAM`, `cap_full` whether the
+/// accumulator's output cap is reached (`PcmAccumulator.full`).
+///   - Output EOS or a full cap FINISHES. Past the cap `push` drops every
+///     sample, so draining on to EOS decodes the rest of the track for
+///     nothing: a track far longer than the cap then overran
+///     `DECODE_DEADLINE_NS` and lost ALL its audio instead of keeping the
+///     capped first 5 min. A refused release on that last buffer is moot.
+///   - Otherwise a refused release FAILS at once: the buffer never returns to
+///     the codec, and a few such losses exhaust its output pool so the loop
+///     would only poll on to the deadline.
+fn afterOutputBuffer(release_status: i32, eos: bool, cap_full: bool) OutputStep {
+    if (eos or cap_full) return .finish;
+    if (release_status != 0) return .fail; // != AMEDIA_OK
+    return .drain;
+}
 
 /// Classify a `AMediaCodec_dequeue{Input,Output}Buffer` result. Any negative
 /// value that is not one of the three `AMEDIACODEC_INFO_*` constants is a
@@ -224,8 +254,8 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
     defer acc.deinit(allocator);
     var input_done = false;
     var input_queue: InputQueue = .{};
-    // Ends ONLY on the output buffer carrying FLAG_EOS, a codec error, or the
-    // deadline. After input EOS is queued, `TRY_AGAIN_LATER` merely means no
+    // Ends ONLY on the output buffer carrying FLAG_EOS, a full output cap
+    // (`afterOutputBuffer`), a codec error, or the deadline. After input EOS is queued, `TRY_AGAIN_LATER` merely means no
     // output surfaced within this poll: the decoder still owes the delayed tail
     // of the track (and a short or slow-to-start decode owes all of it).
     while (true) {
@@ -278,8 +308,20 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
                     const end: usize = @min(start + @as(usize, @intCast(@max(info.size, 0))), size);
                     acc.push(allocator, buf[start..end]) catch return error.OutOfMemory;
                 }
-                _ = X.AMediaCodec_releaseOutputBuffer(codec, idx, false);
-                if (info.flags & FLAG_EOS != 0) break;
+                const rc = X.AMediaCodec_releaseOutputBuffer(codec, idx, false);
+                switch (afterOutputBuffer(rc, info.flags & FLAG_EOS != 0, acc.full())) {
+                    .drain => {},
+                    // Output EOS, or the output cap is full: finish with what
+                    // is accumulated. Past the cap every further sample is
+                    // dropped, so decoding the rest of a long track would only
+                    // spend the deadline (and lose ALL the audio on overrun).
+                    // Leaving before EOS is safe: the `defer` stops the codec.
+                    .finish => break,
+                    .fail => {
+                        std.log.err("video: audio codec refused an output buffer release ({d}) — giving up", .{rc});
+                        return error.DecodeFailed;
+                    },
+                }
             },
             .format_changed => {
                 // The decoded layout may differ from the container's track
@@ -365,6 +407,12 @@ const PcmAccumulator = struct {
         const seg_cap: usize = @as(usize, srcFramesFor(out_left, self.rate)) * self.ch;
         const seg_len = self.raw.items.len - self.seg_start;
         return seg_cap -| seg_len;
+    }
+
+    /// The output cap is reached: every further `push` would be dropped, so
+    /// the drive loop stops decoding (`afterOutputBuffer`).
+    fn full(self: *const PcmAccumulator) bool {
+        return self.rawRoom() == 0;
     }
 
     fn deinit(self: *PcmAccumulator, allocator: std.mem.Allocator) void {
@@ -561,6 +609,54 @@ test "PcmAccumulator: the output cap spans segments — a high-rate segment afte
     try testing.expectEqual(@as(i16, 1), pcm.samples[399 * 2]);
     try testing.expectEqual(@as(i16, 2), pcm.samples[400 * 2]);
     try testing.expectEqual(@as(i16, 2), pcm.samples[999 * 2 + 1]);
+}
+
+test "afterOutputBuffer: a full output cap finishes BEFORE output EOS (no decode to the deadline)" {
+    // Ordinary buffer with room left: keep draining.
+    try testing.expectEqual(OutputStep.drain, afterOutputBuffer(0, false, false));
+    // Output EOS finishes, as before.
+    try testing.expectEqual(OutputStep.finish, afterOutputBuffer(0, true, false));
+    // Mechanism (#5): the cap alone ends the decode — no FLAG_EOS needed, so
+    // a track far longer than the cap no longer decodes on to the deadline.
+    try testing.expectEqual(OutputStep.finish, afterOutputBuffer(0, false, true));
+    // A refused release mid-track fails at once (no poll to the deadline)…
+    try testing.expectEqual(OutputStep.fail, afterOutputBuffer(-10000, false, false));
+    // …but not on the last buffer the decode needs anyway.
+    try testing.expectEqual(OutputStep.finish, afterOutputBuffer(-10000, true, false));
+    try testing.expectEqual(OutputStep.finish, afterOutputBuffer(-10000, false, true));
+}
+
+test "PcmAccumulator.full: flips exactly when the cap is reached, and drives the loop's finish" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.max_frames = 100;
+    const buf = try pcmBytes(a, 60, &.{ 3, -3 });
+    defer a.free(buf);
+    try acc.push(a, buf); // 60 of 100 frames
+    try testing.expect(!acc.full());
+    try testing.expectEqual(OutputStep.drain, afterOutputBuffer(0, false, acc.full()));
+    try acc.push(a, buf); // 40 more fit, 20 dropped
+    try testing.expect(acc.full());
+    try testing.expectEqual(OutputStep.finish, afterOutputBuffer(0, false, acc.full()));
+    // Finishing without EOS keeps the capped PCM (the open segment is closed
+    // and resampled by `finish`).
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 100), pcm.frames);
+    try testing.expectEqual(@as(i16, 3), pcm.samples[99 * 2]);
+}
+
+test "PcmAccumulator.full: a cap filled by CLOSED segments is full with an empty open segment" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.max_frames = 50;
+    const buf = try pcmBytes(a, 50, &.{ 1, 1 });
+    defer a.free(buf);
+    try acc.push(a, buf);
+    try acc.setFormat(a, 44_100, 1); // closes the segment at the cap
+    try testing.expect(acc.full());
 }
 
 test "InputQueue: a failed queueInputBuffer retries the packet, then fails after the bound; success resets" {
