@@ -31,16 +31,18 @@ const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 
 const OUT_RATE: u32 = 48000;
 const OUT_CHANNELS: u32 = 2;
-/// 5 min cap on the decoded, post-resample output.
+/// 5 min cap on the decoded, post-resample output. The raw (source-rate)
+/// accumulation is bounded in OUTPUT-frame units from the active format
+/// (`PcmAccumulator.rawRoom`), so a 5.1 or 96 kHz source reaches the same
+/// 5 min of output as a stereo 44.1 kHz one — a fixed raw-sample cap
+/// (`MAX_FRAMES * 4`, the earlier rule) truncated 48 kHz 5.1 after 200 s.
 const MAX_FRAMES: usize = 5 * 60 * OUT_RATE;
-/// Cap on the accumulated SOURCE-rate samples (all channels). Loose: it only
-/// bounds memory while decoding; `finish` applies the exact `MAX_FRAMES` cap.
-const MAX_RAW_SAMPLES: usize = MAX_FRAMES * 4;
-comptime {
-    // `outFrames48k` takes a u32 frame count; the raw cap keeps every segment's
-    // frame count representable.
-    std.debug.assert(MAX_RAW_SAMPLES <= std.math.maxInt(u32));
-}
+
+/// How many times a `AMediaCodec_queueInputBuffer` failure is retried (with
+/// a fresh input buffer, the extractor NOT advanced) before the decode fails.
+/// A codec that refuses its input is not going to produce EOS; without the
+/// bound the loop would poll to the 30 s deadline. See `InputQueue`.
+const MAX_INPUT_QUEUE_FAILURES: u32 = 8;
 
 /// Wall-clock bound on the WHOLE decode (feeding input + draining to output
 /// EOS), measured from codec start on the monotonic clock. A codec that never
@@ -86,6 +88,27 @@ const INFO_OUTPUT_BUFFERS_CHANGED: isize = -3;
 
 const DequeueResult = enum { buffer, try_again, format_changed, buffers_changed, codec_error };
 
+/// Tracks `AMediaCodec_queueInputBuffer` results (pure; host-tested). A
+/// failed queue leaves the codec WITHOUT that packet: the drive loop must
+/// neither mark input EOS (the EOS would never be queued and the decode
+/// would wait out its deadline) nor advance the extractor (the sample would
+/// be silently dropped). `onQueue` says whether to proceed, retry the same
+/// packet with the next input buffer, or give up after
+/// `MAX_INPUT_QUEUE_FAILURES` consecutive failures.
+const InputQueue = struct {
+    const Outcome = enum { queued, retry, failed };
+    failures: u32 = 0,
+
+    fn onQueue(self: *InputQueue, status: i32) Outcome {
+        if (status == 0) { // AMEDIA_OK
+            self.failures = 0;
+            return .queued;
+        }
+        self.failures += 1;
+        return if (self.failures >= MAX_INPUT_QUEUE_FAILURES) .failed else .retry;
+    }
+};
+
 /// Classify a `AMediaCodec_dequeue{Input,Output}Buffer` result. Any negative
 /// value that is not one of the three `AMEDIACODEC_INFO_*` constants is a
 /// real codec error (`AMEDIA_ERROR_*` are ≤ -10000): the codec will never
@@ -127,7 +150,8 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
         extern fn AMediaCodec_delete(*Codec) void;
         extern fn AMediaCodec_dequeueInputBuffer(*Codec, i64) isize;
         extern fn AMediaCodec_getInputBuffer(*Codec, usize, *usize) ?[*]u8;
-        extern fn AMediaCodec_queueInputBuffer(*Codec, usize, u32, usize, u64, u32) i32;
+        // `offset` is `_off_t_compat` (NdkMediaCodec.h): `long`-sized.
+        extern fn AMediaCodec_queueInputBuffer(*Codec, usize, c_long, usize, u64, u32) i32;
         extern fn AMediaCodec_dequeueOutputBuffer(*Codec, *BufferInfo, i64) isize;
         extern fn AMediaCodec_getOutputBuffer(*Codec, usize, *usize) ?[*]u8;
         extern fn AMediaCodec_getOutputFormat(*Codec) ?*Format;
@@ -199,6 +223,7 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
     var acc = PcmAccumulator.init(@intCast(@max(src_rate, 1)), @intCast(@max(src_ch, 1)));
     defer acc.deinit(allocator);
     var input_done = false;
+    var input_queue: InputQueue = .{};
     // Ends ONLY on the output buffer carrying FLAG_EOS, a codec error, or the
     // deadline. After input EOS is queued, `TRY_AGAIN_LATER` merely means no
     // output surfaced within this poll: the decoder still owes the delayed tail
@@ -214,13 +239,27 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
                 const idx: usize = @intCast(in_idx);
                 var cap: usize = 0;
                 if (X.AMediaCodec_getInputBuffer(codec, idx, &cap)) |buf| {
+                    // `readSampleData` does not advance: a packet whose queue
+                    // fails is re-read into the next input buffer. State
+                    // (input EOS / the extractor position) moves only on a
+                    // successful queue — `InputQueue`.
                     const got = X.AMediaExtractor_readSampleData(ex, buf, cap);
-                    if (got < 0) {
-                        _ = X.AMediaCodec_queueInputBuffer(codec, idx, 0, 0, 0, FLAG_EOS);
-                        input_done = true;
-                    } else {
-                        _ = X.AMediaCodec_queueInputBuffer(codec, idx, 0, @intCast(got), 0, 0);
-                        _ = X.AMediaExtractor_advance(ex);
+                    const eos = got < 0;
+                    const status = if (eos)
+                        X.AMediaCodec_queueInputBuffer(codec, idx, 0, 0, 0, FLAG_EOS)
+                    else
+                        X.AMediaCodec_queueInputBuffer(codec, idx, 0, @intCast(got), 0, 0);
+                    switch (input_queue.onQueue(status)) {
+                        .queued => if (eos) {
+                            input_done = true;
+                        } else {
+                            _ = X.AMediaExtractor_advance(ex);
+                        },
+                        .retry => std.log.warn("video: audio codec refused an input buffer ({d}); retrying the packet", .{status}),
+                        .failed => {
+                            std.log.err("video: audio codec refused {d} consecutive input buffers (last {d}) — giving up", .{ MAX_INPUT_QUEUE_FAILURES, status });
+                            return error.DecodeFailed;
+                        },
                     }
                 }
             } else if (classifyDequeue(in_idx) == .codec_error) {
@@ -272,14 +311,22 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
 // ── Pure PCM accumulation + resampling (host-tested) ──────────────────────
 
 /// Output frames for `in_frames` source frames at `src_rate`, resampled to
-/// 48 kHz and capped at `MAX_FRAMES`. The product is formed in u64: on the
+/// 48 kHz and capped at `max_frames`. The product is formed in u64: on the
 /// 32-bit Android ABIs `usize` is 32 bits and `in_frames * 48000` wraps after
 /// only 89 478 frames (~2 s of audio), trapping in checked builds and sizing
 /// the output wrong in unchecked ones. The u32 parameter makes the widening
 /// the helper's job (a 32-bit product would trap the host test below).
-fn outFrames48k(in_frames: u32, src_rate: u32) usize {
+fn outFrames48k(in_frames: u32, src_rate: u32, max_frames: usize) usize {
     const wide = (@as(u64, in_frames) * @as(u64, OUT_RATE)) / @as(u64, @max(src_rate, 1));
-    return @intCast(@min(wide, @as(u64, MAX_FRAMES)));
+    return @intCast(@min(wide, @as(u64, max_frames)));
+}
+
+/// Source frames at `src_rate` that resample to `out_frames` at 48 kHz —
+/// rounded UP so the last output frame has its source sample, and clamped to
+/// what `outFrames48k`'s u32 frame count can carry.
+fn srcFramesFor(out_frames: usize, src_rate: u32) u32 {
+    const wide = (@as(u64, out_frames) * @as(u64, @max(src_rate, 1)) + OUT_RATE - 1) / OUT_RATE;
+    return @intCast(@min(wide, @as(u64, std.math.maxInt(u32))));
 }
 
 /// Collects the codec's interleaved PCM_16 output buffers as they are emitted.
@@ -287,6 +334,12 @@ fn outFrames48k(in_frames: u32, src_rate: u32) usize {
 /// so a mid-stream `setFormat` (from `OUTPUT_FORMAT_CHANGED`) starts a new
 /// segment instead of misreading earlier samples. `finish` resamples every
 /// segment to 48 kHz stereo, in order, into one `Pcm`.
+///
+/// The accumulation is bounded in OUTPUT frames (`max_frames`, `MAX_FRAMES`
+/// in production, small in tests): the closed segments' output frames plus
+/// the open segment's projection at its rate/channels. A source needing more
+/// than four raw samples per output frame (5.1, 96 kHz…) therefore still
+/// fills the advertised 5 min instead of stopping early.
 const PcmAccumulator = struct {
     const Segment = struct { rate: u32, ch: u32, start: usize, end: usize };
 
@@ -296,9 +349,22 @@ const PcmAccumulator = struct {
     rate: u32,
     ch: u32,
     seg_start: usize = 0,
+    /// Output frames the CLOSED segments will produce (each already capped).
+    closed_out: usize = 0,
+    /// Output-frame cap (`MAX_FRAMES`; tests shrink it).
+    max_frames: usize = MAX_FRAMES,
 
     fn init(rate: u32, ch: u32) PcmAccumulator {
         return .{ .rate = @max(rate, 1), .ch = @max(ch, 1) };
+    }
+
+    /// Raw samples (all channels) the OPEN segment may still take before the
+    /// output cap is reached, at the current rate/channels.
+    fn rawRoom(self: *const PcmAccumulator) usize {
+        const out_left = self.max_frames -| self.closed_out;
+        const seg_cap: usize = @as(usize, srcFramesFor(out_left, self.rate)) * self.ch;
+        const seg_len = self.raw.items.len - self.seg_start;
+        return seg_cap -| seg_len;
     }
 
     fn deinit(self: *PcmAccumulator, allocator: std.mem.Allocator) void {
@@ -319,11 +385,10 @@ const PcmAccumulator = struct {
 
     /// Append one output buffer's bytes: little-endian i16, read unaligned
     /// (`bytesAsSlice(i16, …)` would need i16 alignment the codec's ByteBuffer
-    /// does not guarantee). A trailing odd byte is dropped; past
-    /// `MAX_RAW_SAMPLES` the excess is dropped.
+    /// does not guarantee). A trailing odd byte is dropped; past the output
+    /// cap (`rawRoom`) the excess is dropped.
     fn push(self: *PcmAccumulator, allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!void {
-        const room = MAX_RAW_SAMPLES - self.raw.items.len;
-        const count = @min(bytes.len / 2, room);
+        const count = @min(bytes.len / 2, self.rawRoom());
         try self.raw.ensureUnusedCapacity(allocator, count);
         var i: usize = 0;
         while (i < count) : (i += 1) {
@@ -333,29 +398,31 @@ const PcmAccumulator = struct {
 
     fn closeSegment(self: *PcmAccumulator, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
         if (self.raw.items.len > self.seg_start) {
-            try self.segments.append(allocator, .{ .rate = self.rate, .ch = self.ch, .start = self.seg_start, .end = self.raw.items.len });
+            const s: Segment = .{ .rate = self.rate, .ch = self.ch, .start = self.seg_start, .end = self.raw.items.len };
+            try self.segments.append(allocator, s);
+            self.closed_out = @min(self.closed_out + self.segmentOutFrames(s), self.max_frames);
         }
         self.seg_start = self.raw.items.len;
     }
 
-    fn segmentOutFrames(s: Segment) usize {
-        // `MAX_RAW_SAMPLES <= maxInt(u32)` (asserted at comptime) keeps the
-        // frame count representable.
-        return outFrames48k(@intCast((s.end - s.start) / s.ch), s.rate);
+    fn segmentOutFrames(self: *const PcmAccumulator, s: Segment) usize {
+        // `rawRoom` bounds every segment to `srcFramesFor(…) ≤ maxInt(u32)`
+        // source frames, so the frame count is representable.
+        return outFrames48k(@intCast((s.end - s.start) / s.ch), s.rate, self.max_frames);
     }
 
-    /// Resample every segment to 48 kHz stereo (capped at `MAX_FRAMES` in
+    /// Resample every segment to 48 kHz stereo (capped at `max_frames` in
     /// total). Caller owns the samples. `NoAudioTrack` when nothing decoded.
     fn finish(self: *PcmAccumulator, allocator: std.mem.Allocator) Error!Pcm {
         self.closeSegment(allocator) catch return error.OutOfMemory;
         var total: usize = 0;
-        for (self.segments.items) |s| total = @min(total +| segmentOutFrames(s), MAX_FRAMES);
+        for (self.segments.items) |s| total = @min(total +| self.segmentOutFrames(s), self.max_frames);
         if (total == 0) return error.NoAudioTrack;
         const out = allocator.alloc(i16, total * OUT_CHANNELS) catch return error.OutOfMemory;
         var written: usize = 0;
         for (self.segments.items) |s| {
             if (written == total) break;
-            const frames = @min(segmentOutFrames(s), total - written);
+            const frames = @min(self.segmentOutFrames(s), total - written);
             if (frames == 0) continue;
             resampleInto(out[written * OUT_CHANNELS ..][0 .. frames * OUT_CHANNELS], self.raw.items[s.start..s.end], s.rate, s.ch);
             written += frames;
@@ -424,15 +491,92 @@ test "outFrames48k: the frame product is widened to u64 (overflows u32) and capp
     // here (Debug) or wrap to 505 032 704 / 44 100 = 11 452 (unchecked).
     const in_frames: u32 = 100_000;
     try testing.expect(@as(u64, in_frames) * OUT_RATE > std.math.maxInt(u32));
-    try testing.expectEqual(@as(usize, 108_843), outFrames48k(in_frames, 44_100));
+    try testing.expectEqual(@as(usize, 108_843), outFrames48k(in_frames, 44_100, MAX_FRAMES));
     // The largest 32-bit-sized input the helper accepts.
-    try testing.expectEqual(MAX_FRAMES, outFrames48k(std.math.maxInt(u32), 44_100));
+    try testing.expectEqual(MAX_FRAMES, outFrames48k(std.math.maxInt(u32), 44_100, MAX_FRAMES));
     // Ordinary cases: identity at 48 kHz; halving/doubling.
-    try testing.expectEqual(@as(usize, 480), outFrames48k(480, 48_000));
-    try testing.expectEqual(@as(usize, 480), outFrames48k(240, 24_000));
-    try testing.expectEqual(@as(usize, 240), outFrames48k(480, 96_000));
+    try testing.expectEqual(@as(usize, 480), outFrames48k(480, 48_000, MAX_FRAMES));
+    try testing.expectEqual(@as(usize, 480), outFrames48k(240, 24_000, MAX_FRAMES));
+    try testing.expectEqual(@as(usize, 240), outFrames48k(480, 96_000, MAX_FRAMES));
     // A zero rate is treated as 1 (the caller already clamps ≥ 1).
-    try testing.expectEqual(MAX_FRAMES, outFrames48k(std.math.maxInt(u32), 0));
+    try testing.expectEqual(MAX_FRAMES, outFrames48k(std.math.maxInt(u32), 0, MAX_FRAMES));
+}
+
+test "srcFramesFor: the source frames an output length needs, rounded up, clamped to u32" {
+    try testing.expectEqual(@as(u32, 480), srcFramesFor(480, 48_000));
+    try testing.expectEqual(@as(u32, 441), srcFramesFor(480, 44_100));
+    try testing.expectEqual(@as(u32, 1), srcFramesFor(1, 44_100)); // rounds up, never 0 for a non-empty output
+    try testing.expectEqual(@as(u32, 960), srcFramesFor(480, 96_000));
+    try testing.expectEqual(@as(u32, 13_230_000), srcFramesFor(MAX_FRAMES, 44_100)); // 5 min @ 44.1 kHz
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), srcFramesFor(MAX_FRAMES, std.math.maxInt(u32)));
+}
+
+test "PcmAccumulator: a 48 kHz 6-channel source fills the whole output cap (the fixed raw cap truncated it)" {
+    // A 5.1 source needs 6 raw samples per output frame; the earlier
+    // `MAX_FRAMES * 4` raw cap therefore stopped at 2/3 of the advertised
+    // output. Shrunk cap: 480 output frames (10 ms) — the arithmetic is
+    // identical at 5 min, without a 170 MB test.
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 6);
+    defer acc.deinit(a);
+    acc.max_frames = 480;
+    try testing.expectEqual(@as(usize, 480 * 6), acc.rawRoom());
+    // Feed 600 frames (more than the cap) as a fake buffer sequence: L=7 R=-7
+    // and four surround channels the resampler must skip (not misread as L/R).
+    const pattern = [_]i16{ 7, -7, 100, 200, 300, 400 };
+    const seq = try pcmBytes(a, 600, &pattern);
+    defer a.free(seq);
+    var off: usize = 0;
+    while (off < seq.len) : (off += 1024) try acc.push(a, seq[off..@min(off + 1024, seq.len)]);
+    try testing.expectEqual(@as(usize, 480 * 6), acc.raw.items.len); // 320 × 6 under the old rule
+    try testing.expectEqual(@as(usize, 0), acc.rawRoom());
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 480), pcm.frames);
+    var f: usize = 0;
+    while (f < 480) : (f += 1) {
+        try testing.expectEqual(@as(i16, 7), pcm.samples[f * 2 + 0]);
+        try testing.expectEqual(@as(i16, -7), pcm.samples[f * 2 + 1]);
+    }
+}
+
+test "PcmAccumulator: the output cap spans segments — a high-rate segment after a stereo one still reaches it" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.max_frames = 1000;
+    const seg_a = try pcmBytes(a, 400, &.{ 1, 1 }); // 400 output frames
+    defer a.free(seg_a);
+    try acc.push(a, seg_a);
+    try acc.setFormat(a, 96_000, 6); // 600 output frames left = 1200 source frames × 6 ch
+    try testing.expectEqual(@as(usize, 400), acc.closed_out);
+    try testing.expectEqual(@as(usize, 1200 * 6), acc.rawRoom());
+    const seg_b = try pcmBytes(a, 1500, &.{ 2, 2, 0, 0, 0, 0 }); // more than fits
+    defer a.free(seg_b);
+    try acc.push(a, seg_b);
+    try testing.expectEqual(@as(usize, 400 * 2 + 1200 * 6), acc.raw.items.len);
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 1000), pcm.frames);
+    try testing.expectEqual(@as(i16, 1), pcm.samples[399 * 2]);
+    try testing.expectEqual(@as(i16, 2), pcm.samples[400 * 2]);
+    try testing.expectEqual(@as(i16, 2), pcm.samples[999 * 2 + 1]);
+}
+
+test "InputQueue: a failed queueInputBuffer retries the packet, then fails after the bound; success resets" {
+    var q: InputQueue = .{};
+    try testing.expectEqual(InputQueue.Outcome.queued, q.onQueue(0));
+    var i: u32 = 1;
+    while (i < MAX_INPUT_QUEUE_FAILURES) : (i += 1) {
+        try testing.expectEqual(InputQueue.Outcome.retry, q.onQueue(-10000)); // AMEDIA_ERROR_UNKNOWN
+    }
+    try testing.expectEqual(InputQueue.Outcome.failed, q.onQueue(-10001));
+    // One success clears the count: a transient refusal never accumulates
+    // across the whole track.
+    q = .{};
+    try testing.expectEqual(InputQueue.Outcome.retry, q.onQueue(-10000));
+    try testing.expectEqual(InputQueue.Outcome.queued, q.onQueue(0));
+    try testing.expectEqual(@as(u32, 0), q.failures);
 }
 
 test "PcmAccumulator: a mid-stream rate/channel change re-groups the following buffers" {
