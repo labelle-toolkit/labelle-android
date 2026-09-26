@@ -35,8 +35,23 @@
 //!     `disconnected` stream is stopped, closed and reopened by the same
 //!     `openAndStart` routine `ensureStarted` uses, logging `android: AAudio
 //!     stream disconnected; reopening (result N)`. A failed reopen is an
-//!     ordinary setup failure (one warning per episode) and the thread simply
-//!     waits for the next wake — a later `ensureStarted` retries the open.
+//!     ordinary setup failure (one warning per episode) that the thread then
+//!     **retries on its own** (see below): with no stream there is nothing
+//!     left to wake it, so it must not sleep indefinitely.
+//!
+//! ## Reopen retries
+//! A route change often fails the immediate reopen (the new route is still
+//! settling), and the mixer will not call `ensureStarted` again for a track
+//! already playing. So after a failed reopen the control thread sleeps with a
+//! **timeout** and retries autonomously, backing off exponentially
+//! (`RetryPolicy`: 100 ms doubling to a 5 s cap, ~60 s in total), silently
+//! (same failure episode). When the budget is spent it logs one line
+//! (`android: AAudio stream reopen still failing …; giving up`) and waits
+//! indefinitely again — a later `ensureStarted` retries the open (silently,
+//! still the same episode). A stream opened by `ensureStarted` meanwhile ends
+//! the retry episode. The budget is accounted in *scheduled* wait time, not
+//! wall-clock, so the number of attempts per episode is bounded by the
+//! schedule alone (an early wake just retries early).
 //!
 //! ## Disconnection recovery
 //! Android disconnects an output stream on a route change (headset unplugged,
@@ -62,7 +77,7 @@
 //!
 //! ## Threading
 //!   * `mutex` (an `Io.Mutex`) guards the stream handle and the per-stream
-//!     control state (`warned_setup`, `marker_owed`) between the game thread
+//!     control state (`warned_setup`, `marker_owed`, `retry_*`) between the game thread
 //!     (`ensureStarted` / `stop`) and the control thread (`service`). The
 //!     game-thread calls are never concurrent with each other (labelle-audio's
 //!     `Mixer.ensureInit` contract).
@@ -149,6 +164,27 @@ const NdkApi = struct {
     fn info(comptime fmt: []const u8, args: anytype) void {
         std.log.info(fmt, args);
     }
+
+    const retry: RetryPolicy = .default;
+};
+
+/// How the control thread retries a disconnect reopen that failed (see
+/// "Reopen retries" above). An `Api` carries one as `retry`; the host fake's
+/// is a `var` so tests run the same schedule in milliseconds.
+const RetryPolicy = struct {
+    /// The wait before the first retry; doubles after each failed retry.
+    initial_ns: u64,
+    /// Cap on the doubling.
+    cap_ns: u64,
+    /// Total *scheduled* wait per episode; once it is spent the thread gives
+    /// up (one log line) until the next `ensureStarted`.
+    budget_ns: u64,
+
+    const default: RetryPolicy = .{
+        .initial_ns = 100 * std.time.ns_per_ms,
+        .cap_ns = 5 * std.time.ns_per_s,
+        .budget_ns = 60 * std.time.ns_per_s,
+    };
 };
 
 /// The `Io` the device blocks through (see "Threading" above).
@@ -169,6 +205,14 @@ fn Device(comptime Api: type) type {
         var warned_setup: bool = false;
         /// The current stream's "started" marker has not been logged yet.
         var marker_owed: bool = false;
+        /// A disconnect reopen failed and the control thread is retrying it
+        /// on a timeout (`stream` is null meanwhile). Cleared by a successful
+        /// open (either thread), by giving up, and by `closeStream`.
+        var retry_pending: bool = false;
+        /// The wait scheduled before the next retry (valid while pending).
+        var retry_wait_ns: u64 = 0;
+        /// Scheduled wait spent so far in this retry episode.
+        var retry_spent_ns: u64 = 0;
 
         // ── Game-thread only ──────────────────────────────────────────────
         var control: ?std.Thread = null;
@@ -245,7 +289,8 @@ fn Device(comptime Api: type) type {
         /// only *requests* the start); no-ops gracefully (one warning per
         /// failure episode) when AAudio is unavailable. A stream that is live
         /// — or disconnected and not yet reopened by the control thread — is
-        /// left alone; a stream whose reopen failed is retried here.
+        /// left alone; a stream whose reopen failed is retried here too
+        /// (ending the control thread's retry episode on success).
         pub fn ensureStarted(mix: MixFn) void {
             const io = ioOf();
             mutex.lockUncancelable(io);
@@ -299,6 +344,7 @@ fn Device(comptime Api: type) type {
             }
             stream = opened;
             marker_owed = true;
+            clearRetry();
             return true;
         }
 
@@ -321,26 +367,48 @@ fn Device(comptime Api: type) type {
         /// The control thread. Sleeps on `wake_seq`; every wake runs one
         /// `service` pass. A bump between the `seen` load and the futex wait
         /// makes the wait return immediately, so no wake is ever lost;
-        /// spurious returns just re-run `service`, which is idempotent.
+        /// spurious returns just re-run `service`, which is idempotent (a
+        /// pending retry runs once per pass, so an early return retries
+        /// early, never more often per episode than the schedule allows).
+        /// While a reopen retry is pending the wait is bounded by the
+        /// scheduled backoff: with no stream there is no callback left to
+        /// wake the thread, so an unbounded wait would leave the device
+        /// silent until the next `ensureStarted`.
         fn controlMain() void {
             defer control_exited.store(true, .release);
             const io = ioOf();
             while (true) {
                 const seen = wake_seq.load(.acquire);
                 if (quit.load(.acquire)) return;
-                service();
-                io.futexWaitUncancelable(u32, &wake_seq.raw, seen);
+                if (service()) |wait_ns| {
+                    // A plain `std.Thread` is never cancelled; a `Canceled`
+                    // return is just an early wake.
+                    io.futexWaitTimeout(u32, &wake_seq.raw, seen, .{ .duration = .{
+                        .raw = .fromNanoseconds(@intCast(wait_ns)),
+                        .clock = .awake,
+                    } }) catch {};
+                } else {
+                    io.futexWaitUncancelable(u32, &wake_seq.raw, seen);
+                }
             }
         }
 
-        /// One control pass, under `mutex`: log the started marker for a
-        /// stream observed running (once per start), then recover a
-        /// disconnected stream. Marker first, so a stream that ran and then
-        /// died gets its lines in chronological order.
-        fn service() void {
+        /// One control pass, under `mutex`: run a pending reopen retry (the
+        /// scheduled wait has elapsed), log the started marker for a stream
+        /// observed running (once per start), then recover a disconnected
+        /// stream. Marker before recovery, so a stream that ran and then died
+        /// gets its lines in chronological order. Returns the wait the caller
+        /// must bound its sleep by (a retry is pending), else null.
+        fn service() ?u64 {
             const io = ioOf();
             mutex.lockUncancelable(io);
             defer mutex.unlock(io);
+            if (retry_pending) {
+                // Retry block first: the pass that *schedules* a retry (below)
+                // must not also run it.
+                std.debug.assert(stream == null);
+                if (!openAndStart()) scheduleRetry();
+            }
             if (marker_owed and started_observed.load(.acquire)) {
                 marker_owed = false;
                 // A running stream ends the failure episode.
@@ -352,14 +420,44 @@ fn Device(comptime Api: type) type {
                     Api.warn("android: AAudio stream disconnected; reopening (result {d})", .{disconnect_result.load(.monotonic)});
                     closeStream(s);
                     // A disconnect ends the previous episode: the reopen may
-                    // warn once. If it fails, wait for the next wake — a later
-                    // `ensureStarted` retries the open.
+                    // warn once. If it fails, this thread retries it on a
+                    // timeout (silently: same episode).
                     warned_setup = false;
-                    _ = openAndStart();
+                    if (!openAndStart()) scheduleRetry();
                 } else {
                     disconnected.store(false, .release);
                 }
             }
+            return if (retry_pending) retry_wait_ns else null;
+        }
+
+        /// A reopen attempt failed (caller holds `mutex`): start the retry
+        /// episode, or step its backoff — doubling up to the cap, and giving
+        /// up (one log line) once the scheduled wait spent reaches the
+        /// budget. Only the control thread steps the schedule; a failed
+        /// `ensureStarted` does not (it is the game thread's own attempt).
+        fn scheduleRetry() void {
+            const policy: RetryPolicy = Api.retry;
+            if (!retry_pending) {
+                retry_pending = true;
+                retry_wait_ns = policy.initial_ns;
+                retry_spent_ns = 0;
+                return;
+            }
+            retry_spent_ns +|= retry_wait_ns;
+            if (retry_spent_ns >= policy.budget_ns) {
+                Api.warn("android: AAudio stream reopen still failing after {d} s; giving up until the next audio entry point", .{retry_spent_ns / std.time.ns_per_s});
+                clearRetry();
+                return;
+            }
+            retry_wait_ns = @min(retry_wait_ns *| 2, policy.cap_ns);
+        }
+
+        /// End the retry episode (caller holds `mutex`).
+        fn clearRetry() void {
+            retry_pending = false;
+            retry_wait_ns = 0;
+            retry_spent_ns = 0;
         }
 
         /// Warn once per failure episode; later failures in the same episode
@@ -378,6 +476,7 @@ fn Device(comptime Api: type) type {
             _ = Api.streamClose(s);
             stream = null;
             marker_owed = false;
+            clearRetry();
             started_observed.store(false, .release);
             disconnected.store(false, .release);
         }
@@ -397,6 +496,8 @@ fn Device(comptime Api: type) type {
             mutex.lockUncancelable(io);
             defer mutex.unlock(io);
             if (stream) |s| closeStream(s);
+            // The joined thread may have left a retry episode pending.
+            clearRetry();
         }
 
         pub fn framesMixed() u64 {
@@ -462,16 +563,42 @@ test "the AAudio entry points are analyzed and linked (Android compile-check; sk
 
 /// Scripted stand-in for libaaudio: the host tests drive `Device(FakeApi)`
 /// through the same state machine the Android build runs against `NdkApi`,
-/// real control thread included. Results are scripted per call site; every
+/// real control thread included. Results are scripted per call site
+/// (atomics: a test flips them while the control thread retries); every
 /// AAudio call and log line is counted (atomically: the control thread bumps
-/// them while the test thread reads), and the two callbacks the device
-/// registers are captured so a test can play the AAudio threads.
+/// them while the test thread reads) and appended to an ordered call trace;
+/// the two callbacks the device registers are captured so a test can play
+/// the AAudio threads.
 const FakeApi = struct {
     const Counter = std.atomic.Value(u32);
+    const Result = std.atomic.Value(i32);
 
-    var create_builder_result: i32 = AAUDIO_OK;
-    var open_result: i32 = AAUDIO_OK;
-    var start_result: i32 = AAUDIO_OK;
+    var create_builder_result: Result = .init(AAUDIO_OK);
+    var open_result: Result = .init(AAUDIO_OK);
+    var start_result: Result = .init(AAUDIO_OK);
+    /// The reopen retry schedule under test (milliseconds, per test).
+    var retry: RetryPolicy = .default;
+
+    /// Every `Api` entry point, in call order — what the device did, not
+    /// just how often. There is deliberately no wait/sleep entry: the `Api`
+    /// contract has no blocking call for the device to make.
+    const Call = enum {
+        create_builder,
+        set_format,
+        set_channel_count,
+        set_sample_rate,
+        set_data_callback,
+        set_error_callback,
+        open_stream,
+        builder_delete,
+        request_start,
+        request_stop,
+        close,
+        warn,
+        info,
+    };
+    var trace: [64]Call = undefined;
+    var trace_len: Counter = .init(0);
 
     var open_attempts: Counter = .init(0);
     var opens: Counter = .init(0);
@@ -494,9 +621,11 @@ const FakeApi = struct {
     var stream_storage: [8]u8 = @splat(0);
 
     fn reset() void {
-        create_builder_result = AAUDIO_OK;
-        open_result = AAUDIO_OK;
-        start_result = AAUDIO_OK;
+        create_builder_result.store(AAUDIO_OK, .release);
+        open_result.store(AAUDIO_OK, .release);
+        start_result.store(AAUDIO_OK, .release);
+        retry = .default;
+        trace_len.store(0, .release);
         open_attempts.store(0, .release);
         opens.store(0, .release);
         starts.store(0, .release);
@@ -516,23 +645,45 @@ const FakeApi = struct {
         _ = c.fetchAdd(1, .release);
     }
 
+    /// Append to the call trace (entries past the buffer are counted, not
+    /// kept). A test reads the trace only for calls made on its own thread.
+    fn record(c: Call) void {
+        const i = trace_len.fetchAdd(1, .acq_rel);
+        if (i < trace.len) trace[i] = c;
+    }
+    fn traced() []const Call {
+        return trace[0..@min(trace_len.load(.acquire), trace.len)];
+    }
+
     fn createStreamBuilder(out: *?*AAudioStreamBuilder) i32 {
-        if (create_builder_result != AAUDIO_OK) return create_builder_result;
+        record(.create_builder);
+        const r = create_builder_result.load(.acquire);
+        if (r != AAUDIO_OK) return r;
         out.* = @ptrCast(&builder_storage);
         return AAUDIO_OK;
     }
-    fn builderSetFormat(_: *AAudioStreamBuilder, _: i32) void {}
-    fn builderSetChannelCount(_: *AAudioStreamBuilder, _: i32) void {}
-    fn builderSetSampleRate(_: *AAudioStreamBuilder, _: i32) void {}
+    fn builderSetFormat(_: *AAudioStreamBuilder, _: i32) void {
+        record(.set_format);
+    }
+    fn builderSetChannelCount(_: *AAudioStreamBuilder, _: i32) void {
+        record(.set_channel_count);
+    }
+    fn builderSetSampleRate(_: *AAudioStreamBuilder, _: i32) void {
+        record(.set_sample_rate);
+    }
     fn builderSetDataCallback(_: *AAudioStreamBuilder, cb: DataCallback, _: ?*anyopaque) void {
+        record(.set_data_callback);
         data_cb = cb;
     }
     fn builderSetErrorCallback(_: *AAudioStreamBuilder, cb: ErrorCallback, _: ?*anyopaque) void {
+        record(.set_error_callback);
         error_cb = cb;
     }
     fn builderOpenStream(_: *AAudioStreamBuilder, out: *?*AAudioStream) i32 {
+        record(.open_stream);
         bump(&open_attempts);
-        if (open_result != AAUDIO_OK) return open_result;
+        const r = open_result.load(.acquire);
+        if (r != AAUDIO_OK) return r;
         const n = opens.load(.acquire);
         const s: *AAudioStream = @ptrCast(&stream_storage[n % stream_storage.len]);
         last_stream = s;
@@ -541,29 +692,44 @@ const FakeApi = struct {
         return AAUDIO_OK;
     }
     fn builderDelete(_: *AAudioStreamBuilder) void {
+        record(.builder_delete);
         bump(&builder_deletes);
     }
     fn streamRequestStart(_: *AAudioStream) i32 {
+        record(.request_start);
         bump(&starts);
-        return start_result;
+        return start_result.load(.acquire);
     }
     fn streamRequestStop(_: *AAudioStream) i32 {
+        record(.request_stop);
         bump(&stops);
         return AAUDIO_OK;
     }
     fn streamClose(_: *AAudioStream) i32 {
+        record(.close);
         bump(&closes);
         return AAUDIO_OK;
     }
     fn warn(comptime fmt: []const u8, _: anytype) void {
+        record(.warn);
         last_warn = fmt;
         bump(&warns);
     }
     fn info(comptime fmt: []const u8, _: anytype) void {
+        record(.info);
         last_info = fmt;
         bump(&infos);
     }
 };
+
+/// A test-speed schedule: milliseconds instead of seconds, same shape.
+fn fastRetry(initial_ms: u64, cap_ms: u64, budget_ms: u64) RetryPolicy {
+    return .{
+        .initial_ns = initial_ms * std.time.ns_per_ms,
+        .cap_ns = cap_ms * std.time.ns_per_ms,
+        .budget_ns = budget_ms * std.time.ns_per_ms,
+    };
+}
 
 const Fake = Device(FakeApi);
 
@@ -702,42 +868,121 @@ test "disconnect: the error callback only flags + wakes; the control thread reop
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.warns));
 }
 
-test "disconnect whose reopen fails: one warning, the control thread waits (no spin), a later ensureStarted retries" {
+test "disconnect whose reopen fails: the control thread retries on a timeout and reopens with NO further ensureStarted" {
     freshFake();
+    // 1 ms, then 2, 4, 4, … — the budget is never reached here.
+    FakeApi.retry = fastRetry(1, 4, 10_000);
     Fake.ensureStarted(&TestMix.mix);
     _ = fireDataCallback();
     try waitCount(&FakeApi.infos, 1);
 
-    FakeApi.open_result = -1;
+    FakeApi.open_result.store(-1, .release);
     FakeApi.error_cb.?(FakeApi.last_stream, null, AAUDIO_ERROR_DISCONNECTED);
-    // "disconnected; reopening" + ONE open-failure warning.
+    // "disconnected; reopening" + ONE open-failure warning; the dead stream
+    // is closed and the thread is now retrying on its own.
     try waitCount(&FakeApi.warns, 2);
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
     try std.testing.expect(std.mem.startsWith(u8, FakeApi.last_warn, "android: AAudio stream open failed"));
-    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.open_attempts));
-    // No spin: the control thread made exactly one attempt and went back to
-    // sleep.
+
+    // The route settles: the NEXT scheduled retry succeeds — the game
+    // thread never calls ensureStarted, and the silent retries in between
+    // added no warning.
+    FakeApi.open_result.store(AAUDIO_OK, .release);
+    try waitCount(&FakeApi.opens, 2);
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
+    try std.testing.expect(count(&FakeApi.open_attempts) >= 3); // initial + failed reopen + ≥1 retry
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.starts));
+    // The new stream's marker follows ITS data callback; the SAME control
+    // thread keeps serving, with no retry pending.
+    _ = fireDataCallback();
+    try waitCount(&FakeApi.infos, 2);
+    try std.testing.expect(!Fake.control_exited.load(.acquire));
+    {
+        const io = ioOf();
+        Fake.mutex.lockUncancelable(io);
+        defer Fake.mutex.unlock(io);
+        try std.testing.expect(Fake.stream != null);
+        try std.testing.expect(!Fake.retry_pending);
+    }
+    // Live stream: a later ensureStarted leaves it alone and nothing else
+    // moves.
+    const attempts = count(&FakeApi.open_attempts);
+    Fake.ensureStarted(&TestMix.mix);
     settle();
-    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.open_attempts));
-    try std.testing.expect(Fake.stream == null);
+    try std.testing.expectEqual(attempts, count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.opens));
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
+}
+
+test "reopen keeps failing: bounded backoff, one give-up line, then no spin; a later ensureStarted retries silently" {
+    freshFake();
+    // Scheduled waits 1, 2, 2, 2 ms (spent 1, 3, 5, 7): the 5th
+    // control-thread attempt finds the 6 ms budget spent and gives up. The
+    // budget is accounted in scheduled time, so the attempt count is fixed
+    // by the schedule, not by how fast this host runs.
+    FakeApi.retry = fastRetry(1, 2, 6);
+    Fake.ensureStarted(&TestMix.mix);
+    _ = fireDataCallback();
+    try waitCount(&FakeApi.infos, 1);
+
+    FakeApi.open_result.store(-1, .release);
+    FakeApi.error_cb.?(FakeApi.last_stream, null, AAUDIO_ERROR_DISCONNECTED);
+    // "disconnected; reopening", ONE open-failure warning, ONE give-up line
+    // — the retries in between are silent (same episode).
+    try waitCount(&FakeApi.warns, 3);
+    try std.testing.expect(std.mem.startsWith(u8, FakeApi.last_warn, "android: AAudio stream reopen still failing"));
+    // initial open + immediate reopen + 4 scheduled retries.
+    try std.testing.expectEqual(@as(u32, 6), count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.opens));
+    try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
+    // Gave up: no more attempts, the thread is asleep without a timeout.
+    settle();
+    try std.testing.expectEqual(@as(u32, 6), count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 3), count(&FakeApi.warns));
+    {
+        const io = ioOf();
+        Fake.mutex.lockUncancelable(io);
+        defer Fake.mutex.unlock(io);
+        try std.testing.expect(Fake.stream == null);
+        try std.testing.expect(!Fake.retry_pending);
+    }
 
     // The game thread's later entry points retry, silently — one attempt
-    // per call.
+    // per call, and they do not re-arm the control thread.
     Fake.ensureStarted(&TestMix.mix);
     Fake.ensureStarted(&TestMix.mix);
-    Fake.ensureStarted(&TestMix.mix);
-    try std.testing.expectEqual(@as(u32, 5), count(&FakeApi.open_attempts));
-    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
+    settle();
+    try std.testing.expectEqual(@as(u32, 8), count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 3), count(&FakeApi.warns));
 
     // The route comes back: reopen succeeds, the marker follows its data
     // callback, and the SAME control thread keeps serving.
-    FakeApi.open_result = AAUDIO_OK;
+    FakeApi.open_result.store(AAUDIO_OK, .release);
     Fake.ensureStarted(&TestMix.mix);
     try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.opens));
     _ = fireDataCallback();
     try waitCount(&FakeApi.infos, 2);
-    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
+    try std.testing.expectEqual(@as(u32, 3), count(&FakeApi.warns));
     try std.testing.expect(!Fake.control_exited.load(.acquire));
+}
+
+test "stop during a reopen retry episode joins the thread and clears the schedule" {
+    freshFake();
+    FakeApi.retry = fastRetry(1, 4, 10_000);
+    Fake.ensureStarted(&TestMix.mix);
+    FakeApi.open_result.store(-1, .release);
+    FakeApi.error_cb.?(FakeApi.last_stream, null, AAUDIO_ERROR_DISCONNECTED);
+    try waitCount(&FakeApi.warns, 2);
+    Fake.stop();
+    try std.testing.expect(Fake.control == null);
+    try std.testing.expect(Fake.control_exited.load(.acquire));
+    try std.testing.expect(!Fake.retry_pending);
+    try std.testing.expectEqual(@as(u64, 0), Fake.retry_wait_ns);
+    try std.testing.expectEqual(@as(u64, 0), Fake.retry_spent_ns);
+    const attempts = count(&FakeApi.open_attempts);
+    settle();
+    try std.testing.expectEqual(attempts, count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
 }
 
 test "setup failures warn once per episode; an observed start resets the episode" {
@@ -745,7 +990,7 @@ test "setup failures warn once per episode; an observed start resets the episode
 
     // Builder unavailable: warn once, then silent retries. No stream → no
     // control thread yet.
-    FakeApi.create_builder_result = -1;
+    FakeApi.create_builder_result.store(-1, .release);
     Fake.ensureStarted(&TestMix.mix);
     Fake.ensureStarted(&TestMix.mix);
     Fake.ensureStarted(&TestMix.mix);
@@ -756,8 +1001,8 @@ test "setup failures warn once per episode; an observed start resets the episode
 
     // Same episode, a different failure kind: still silent (one warning per
     // episode, not per kind).
-    FakeApi.create_builder_result = AAUDIO_OK;
-    FakeApi.start_result = -1;
+    FakeApi.create_builder_result.store(AAUDIO_OK, .release);
+    FakeApi.start_result.store(-1, .release);
     Fake.ensureStarted(&TestMix.mix);
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.warns));
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.opens));
@@ -766,7 +1011,7 @@ test "setup failures warn once per episode; an observed start resets the episode
     try std.testing.expect(Fake.control == null);
 
     // Success (the stream is observed running) ends the episode...
-    FakeApi.start_result = AAUDIO_OK;
+    FakeApi.start_result.store(AAUDIO_OK, .release);
     Fake.ensureStarted(&TestMix.mix);
     try std.testing.expect(Fake.control != null);
     _ = fireDataCallback();
@@ -775,7 +1020,7 @@ test "setup failures warn once per episode; an observed start resets the episode
 
     // ...so after an explicit stop, a fresh failure warns once more.
     Fake.stop();
-    FakeApi.open_result = -1;
+    FakeApi.open_result.store(-1, .release);
     Fake.ensureStarted(&TestMix.mix);
     Fake.ensureStarted(&TestMix.mix);
     try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
@@ -857,20 +1102,35 @@ test "stop joins the control thread and leaves no pending work; a later ensureSt
     try std.testing.expect(Fake.control_exited.load(.acquire));
 }
 
-test "ensureStarted returns without blocking on the audio server (no state wait, start only requested)" {
+test "ensureStarted performs exactly open + start and no wait (no state wait, start only requested)" {
     freshFake();
     // The fake never reports STARTED on its own (no data callback fires), the
     // situation in which the old game-thread wait paid its full 250 ms bound.
-    const t0 = nowMs();
+    // Deterministic instrumentation instead of a wall-clock deadline: the
+    // ordered call trace is exactly the builder setup, the open, the start
+    // request and the builder delete — no wait, no sleep, no log line. (The
+    // control thread spawned here makes no Api call: nothing is owed yet.)
     Fake.ensureStarted(&TestMix.mix);
-    const elapsed = nowMs() - t0;
-    try std.testing.expect(elapsed < 100);
+    const expected = [_]FakeApi.Call{
+        .create_builder,
+        .set_format,
+        .set_channel_count,
+        .set_sample_rate,
+        .set_data_callback,
+        .set_error_callback,
+        .open_stream,
+        .request_start,
+        .builder_delete,
+    };
+    try std.testing.expectEqualSlices(FakeApi.Call, &expected, FakeApi.traced());
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.starts));
     try std.testing.expect(Fake.stream != null);
     // Nothing in the Api contract can wait on the server: the device only
     // requests, and observes STARTED through the data callback.
     comptime std.debug.assert(!@hasDecl(NdkApi, "streamWaitForStateChange"));
     comptime std.debug.assert(!@hasDecl(FakeApi, "streamWaitForStateChange"));
+    comptime std.debug.assert(!@hasField(FakeApi.Call, "wait"));
     settle();
     try std.testing.expectEqual(@as(u32, 0), count(&FakeApi.infos));
+    try std.testing.expectEqual(expected.len, FakeApi.traced().len);
 }
