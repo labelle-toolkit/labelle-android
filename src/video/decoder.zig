@@ -160,6 +160,53 @@ fn planeHolds(len: usize, row_stride: u32, pixel_stride: u32, off: usize, w: u32
     return last < len;
 }
 
+// ── Worker end-of-stream bookkeeping (pure; host-tested) ─────────────────
+
+/// What the feed loop does after `AMediaCodec_queueInputBuffer` returned
+/// `status` for a sample (`eos = false`) or for the input-EOS marker.
+const InputQueueStep = enum {
+    /// Sample accepted: advance the extractor to the next one.
+    advance,
+    /// EOS marker accepted: input is done, keep draining output.
+    input_eos,
+    /// The codec refused the buffer: end the stream (`terminalCodecError`).
+    end_stream,
+};
+
+/// Classify a `queueInputBuffer` result. ANY non-OK status is terminal, on
+/// the FIRST failure (unlike `audio_track.InputQueue`, which retries a
+/// bounded number of times under a 30 s deadline):
+///   - a refused buffer stays client-owned and is never handed back, so a
+///     bounded retry burns one input buffer per attempt — with fewer input
+///     buffers in the codec's pool than the retry bound (4 is common) the
+///     dequeue would return TRY_AGAIN forever before the bound is reached;
+///   - the video worker has no overall deadline to fall back on;
+///   - the index is freshly dequeued and the size within its capacity, so
+///     a refusal is a codec state error, not a transient condition.
+/// Before this, a refused sample only `break`-ed the feed loop and the worker
+/// re-fed forever with `input_done`/`eof_seen` false: a play-once clip never
+/// ended (labelle-android#3 round 3). The EOS marker is covered the same way.
+fn inputQueueStep(status: i32, eos: bool) InputQueueStep {
+    if (status != 0) return .end_stream; // != AMEDIA_OK
+    return if (eos) .input_eos else .advance;
+}
+
+/// Mark the stream ended: no more input, codec drained. Returns true only on
+/// the transition, so the caller logs a terminal error once (a stream already
+/// ending — normal EOS or an earlier error — is left alone).
+fn endStream(input_done: *bool, eof_seen: *bool) bool {
+    if (eof_seen.*) return false;
+    input_done.* = true;
+    eof_seen.* = true;
+    return true;
+}
+
+/// `eof()`'s predicate: the codec is done AND every buffered frame — in the
+/// ring and still in the surface handoff (`pending`) — has been presented.
+fn streamFinished(eof_seen: bool, ring_count: usize, pending: usize) bool {
+    return eof_seen and ring_count == 0 and pending == 0;
+}
+
 pub const Error = error{
     Unsupported,
     NoVideoTrack,
@@ -619,7 +666,7 @@ const AndroidVideoDecoder = struct {
         // Finished only once the codec drained AND every buffered frame — in
         // the ring AND still in the surface handoff (`pending`) — has been
         // presented, so a clip's last frames aren't cut.
-        return st.eof_seen and st.ring_count == 0 and st.pending == 0;
+        return streamFinished(st.eof_seen, st.ring_count, st.pending);
     }
 
     /// Ready frames currently in the ring (thread-safe read).
@@ -688,10 +735,9 @@ const AndroidVideoDecoder = struct {
 
             // -- Feed input while the cushion has room. The codec self-regulates:
             // once its input buffers are all queued, dequeueInputBuffer returns
-            // <0 and we stop. State mutates only on a successful queue — a
-            // failed EOS queue retries next iteration, and a failed sample queue
-            // does NOT advance the extractor (the sample retries with a fresh
-            // buffer rather than being silently skipped).
+            // <0 and we stop. The extractor advances / input EOS is marked only
+            // on a successful queue; a refused queue (sample or EOS marker)
+            // ends the stream — `inputQueueStep` says why a retry can't work.
             while (!st.input_done and cushionLoad(st) < RING_SIZE) {
                 const in_idx = AMediaCodec_dequeueInputBuffer(st.codec, 0);
                 if (in_idx <= AMEDIA_ERROR_BASE) {
@@ -703,17 +749,26 @@ const AndroidVideoDecoder = struct {
                 var cap: usize = 0;
                 const buf = AMediaCodec_getInputBuffer(st.codec, idx, &cap) orelse break;
                 const n = AMediaExtractor_readSampleData(st.extractor, buf, cap);
-                if (n < 0) {
-                    if (AMediaCodec_queueInputBuffer(st.codec, idx, 0, 0, 0, FLAG_EOS) == AMEDIA_OK)
-                        st.input_done = true;
-                } else {
+                const eos = n < 0;
+                const status = if (eos)
+                    AMediaCodec_queueInputBuffer(st.codec, idx, 0, 0, 0, FLAG_EOS)
+                else blk: {
                     // Tag the sample with the extractor's current presentation
                     // time (clamped ≥ 0) for PTS accuracy — read BEFORE advance.
                     const sample_us = AMediaExtractor_getSampleTime(st.extractor);
                     const time_us: u64 = @intCast(@max(sample_us, 0));
-                    if (AMediaCodec_queueInputBuffer(st.codec, idx, 0, @intCast(n), time_us, 0) != AMEDIA_OK) break;
-                    _ = AMediaExtractor_advance(st.extractor);
-                    did_work = true;
+                    break :blk AMediaCodec_queueInputBuffer(st.codec, idx, 0, @intCast(n), time_us, 0);
+                };
+                switch (inputQueueStep(status, eos)) {
+                    .advance => {
+                        _ = AMediaExtractor_advance(st.extractor);
+                        did_work = true;
+                    },
+                    .input_eos => st.input_done = true,
+                    .end_stream => {
+                        terminalCodecError(st, if (eos) "input EOS queue" else "input queue", status);
+                        break;
+                    },
                 }
             }
 
@@ -816,14 +871,15 @@ const AndroidVideoDecoder = struct {
     /// reader, not frames the codec still owes, so they can still be acquired
     /// and shown. Any that never surface are written off by the worker's
     /// dry-drain failsafe once `eof_seen` is set, the same as after a normal EOS.
-    /// Also the terminal path for a failed `releaseOutputBuffer(render=true)`.
+    /// Also the terminal path for a failed `releaseOutputBuffer(render=true)`
+    /// and a refused `queueInputBuffer` (`inputQueueStep`).
     fn terminalCodecError(st: *State, what: []const u8, code: anytype) void {
         lock(&st.mutex);
         defer st.mutex.unlock();
-        if (st.eof_seen) return; // already ending (EOS or an earlier error)
-        std.log.err("video: codec error {d} on {s} — ending the stream", .{ code, what });
-        st.input_done = true;
-        st.eof_seen = true;
+        // Only the transition logs: a stream already ending (EOS or an
+        // earlier error) is left alone.
+        if (endStream(&st.input_done, &st.eof_seen))
+            std.log.err("video: codec error {d} on {s} — ending the stream", .{ code, what });
     }
 
     fn imageTimestamp(img: *Image) f64 {
@@ -1091,7 +1147,7 @@ const AndroidVideoDecoder = struct {
     }
 };
 
-// ── Tests (host-runnable — the pure colour / crop helpers) ───────────────
+// ── Tests (host-runnable — the pure colour / crop / end-of-stream helpers) ─
 
 const testing = std.testing;
 
@@ -1163,4 +1219,30 @@ test "planeHolds: the bottom-right sample must lie inside the plane (the check t
     try testing.expect(!planeHolds(2, 4, 2, 0, 2, 1));
     // Degenerate sizes read nothing.
     try testing.expect(planeHolds(0, 4, 1, 0, 0, 0));
+}
+
+test "inputQueueStep: a refused queue (sample or EOS marker) ends the stream on the first failure, and eof() then fires" {
+    // Success paths never touch the end-of-stream flags.
+    try testing.expectEqual(InputQueueStep.advance, inputQueueStep(0, false));
+    try testing.expectEqual(InputQueueStep.input_eos, inputQueueStep(0, true));
+
+    // Mechanism: a refused sample is NOT a retry / skip (the old `break`
+    // re-fed forever) — it takes the terminal branch, first time.
+    try testing.expectEqual(InputQueueStep.end_stream, inputQueueStep(-10000, false)); // AMEDIA_ERROR_UNKNOWN
+    try testing.expectEqual(InputQueueStep.end_stream, inputQueueStep(-10000, true));
+
+    // The terminal branch (`terminalCodecError` → `endStream`) flips the
+    // worker's flags, which is what makes `eof()` true once the ring drains.
+    var input_done = false;
+    var eof_seen = false;
+    try testing.expect(!streamFinished(eof_seen, 0, 0)); // the old hang: never true
+    try testing.expect(endStream(&input_done, &eof_seen)); // transition → logs once
+    try testing.expect(input_done); // the feed loop stops (`while (!st.input_done ...)`)
+    try testing.expect(eof_seen);
+    try testing.expect(!streamFinished(eof_seen, 1, 0)); // buffered frames still play out
+    try testing.expect(!streamFinished(eof_seen, 0, 1));
+    try testing.expect(streamFinished(eof_seen, 0, 0));
+
+    // A later error on an already-ending stream is not a new transition.
+    try testing.expect(!endStream(&input_done, &eof_seen));
 }
