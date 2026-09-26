@@ -90,7 +90,9 @@ pub fn findBuildTools(a: std.mem.Allocator, io: std.Io, sdk_home: []const u8) !?
     var best_version: u128 = 0;
     var it = dir.iterate();
     entries: while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
+        // A symlinked revision (SDK symlink farms) is a candidate too; the
+        // tool probes below decide whether it is usable.
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
         const v = parseVersion(entry.name);
         if (best != null and v <= best_version) continue;
         const candidate = try std.fs.path.join(a, &.{ root, entry.name });
@@ -125,7 +127,7 @@ pub fn findNdkRoot(a: std.mem.Allocator, io: std.Io, env: *const Env, sdk_home: 
     var best_version: u128 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
         const root = try std.fs.path.join(a, &.{ ndk_dir, entry.name });
         if (!isDir(io, try sysrootOf(a, root))) continue;
         const v = parseVersion(entry.name);

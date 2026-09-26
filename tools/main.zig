@@ -213,7 +213,7 @@ test "routes mirror plugin.labelle" {
     // No hooks declared until their implementation lands.
     try std.testing.expect(std.mem.indexOf(u8, manifest, ".hooks") == null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"bin/labelle-android\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, ".command_contract = \">=1.2.0 <1.3.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, ".command_contract = \">=1.2.0 <1.2.1\"") != null);
 }
 
 test "the vendored decoder is contract 1.2.0 and accepts its own fixtures" {
