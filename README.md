@@ -4,7 +4,7 @@ Android platform package for the Labelle toolkit.
 
 ## Status
 
-**Phase 1a/1b/1c of the runtime extraction ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)) — unreleased (no tag yet).** The package ships one Zig module, `labelle_android`, with four services the bgfx and sokol backends used to carry as per-backend copies:
+**Phase 1a–1d of the runtime extraction ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)) — unreleased (no tag yet).** The package ships one Zig module, `labelle_android`, with five services the bgfx and sokol backends used to carry as per-backend copies:
 
 | Namespace | Service | Origin |
 |-----------|---------|--------|
@@ -12,10 +12,11 @@ Android platform package for the Labelle toolkit.
 | `debuggable` | `isDebuggable(activity)`: is the running apk `android:debuggable`? Process-cached, fail-closed | assembler #737 |
 | `relayout` | `forceWindowRelayout(activity)`: re-apply the window attributes so a stuck 1x1 restored window relayouts (UI thread only) | bgfx #127 |
 | `aaudio` | the AAudio output device (`ensureStarted` / `stop` / `framesMixed`): the `labelle-audio` `DeviceSink` a backend's PCM mixer drives; PCM_I16 stereo 48 kHz. `ensureStarted` opens the stream and only *requests* the start — it never blocks on the audio server (no `AAudioStream_waitForStateChange`). A device-owned control thread logs `android: AAudio stream started (…)` once per start, on the stream's **first mixer pull** (its first data callback) — which may precede AAudio's own STARTED state flip (the legacy AudioTrack path pre-fills first), and never on `requestStart` alone. A device disconnect (headset / Bluetooth route change) is reported by the error callback and the control thread closes and reopens the stream **itself**, with no further `ensureStarted`, logging `android: AAudio stream disconnected; reopening`; a reopen that fails is retried on the control thread with exponential backoff (100 ms doubling to 5 s, ~60 s in total), then given up (one `giving up` line) until the next `ensureStarted`. Setup failures warn once per failure episode and otherwise retry silently. Pure NDK C API, links `libaaudio` | bgfx #306 |
+| `video` | MediaCodec decode: `VideoDecoder` (AMediaExtractor + AMediaCodec → AImageReader YUV_420_888 on a worker thread, a ring of tightened Y/U/V planes for the backend's GPU-YUV upload) and `decodeTrack` (the mp4's audio track → 48 kHz stereo i16 `Pcm`), plus the pure, host-tested `yuv` (CPU YUV→RGBA; `Matrix` BT.601/BT.709, limited/full range — the decoder picks it from the stream's `ColorSpace`) and `planes` (row de-pad / NV12 de-interleave) helpers the desktop decoders share; pure NDK C API, links `libmediandk` | bgfx `src/video/{android,android_audio,yuv,planes}.zig` (FP #549) |
 
 Every JNI service takes the running `ANativeActivity*` as an opaque pointer; the JNI walks (`src/jni/*.c`) read `->vm` / `->clazz` through the NDK's own header, so both backends pass what they already hold. `aaudio` declares its `MixCallback` structurally (`*const fn (out: []i16, channels: u8) void`) so the package has no dependency on labelle-audio; the consumer asserts equality at comptime. `build.zig` also exports `addAndroidSysroot` / `resolveNdk` / `nativeAppGlueDir` / `isAndroidTarget` for consumers' build scripts.
 
-Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b and 1c). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging, asset access and provider commands are still not implemented; runtime acceptance is on-device (SM-T505), not cross-compilation alone.
+Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b, 1c and 1d). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging, asset access and provider commands are still not implemented; runtime acceptance is on-device (SM-T505), not cross-compilation alone.
 
 ### Naming
 
@@ -25,7 +26,7 @@ Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b and 1c). labell
 ### Build and test
 
 ```bash
-zig build test --summary all                                  # host: intent allow-list / decision, AAudio state machine (against a scripted fake), NDK-selection tests
+zig build test --summary all                                  # host: intent allow-list / decision, AAudio state machine (against a scripted fake), video yuv/planes/audio_track helpers, NDK-selection tests
 zig build test -Dtarget=aarch64-linux-android --summary all   # Android compile-check (needs ANDROID_NDK_HOME or ANDROID_HOME)
 ```
 

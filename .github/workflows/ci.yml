@@ -22,8 +22,8 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # The intent allow-list / decision tests and the NDK-selection rule run
-      # on the host; no JNI or NDK needed.
+      # The intent allow-list / decision tests, the video `yuv`/`planes`
+      # helpers and the NDK-selection rule run on the host; no JNI or NDK needed.
       - name: Run unit tests
         run: zig build test --summary all
 
@@ -44,7 +44,8 @@ jobs:
         with:
           ndk-version: r27c
       # Compiles the three JNI C TUs against the NDK sysroot and the module's
-      # `extern "c"` / AAudio bindings for aarch64 (object emission; nothing runs).
+      # `extern "c"` / AAudio / MediaCodec bindings for aarch64 (object
+      # emission; nothing runs).
       - name: Cross-build for Android
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

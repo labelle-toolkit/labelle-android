@@ -103,8 +103,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         // libc `setenv`/`getenv` + the JNI C below. Off Android nothing in the
-        // module references libc (nor the AAudio externs: `aaudio.zig`'s
-        // `ensureStarted`/`stop` are only reachable from an Android consumer).
+        // module references libc (nor the AAudio/MediaCodec externs:
+        // `aaudio.zig`'s `ensureStarted`/`stop` and `video/*`'s decoders are
+        // comptime-gated stubs off Android).
         .link_libc = is_android,
     });
     if (is_android) {
@@ -124,13 +125,19 @@ pub fn build(b: *std.Build) void {
         // against libaaudio (API 26+); the link propagates to any consumer
         // module that imports `labelle_android`.
         mod.linkSystemLibrary("aaudio", .{});
+        // `video/decoder.zig` + `video/audio_track.zig` (MediaCodec video and
+        // audio-track decode, phase 1d) are pure `extern fn` against
+        // libmediandk (AMediaExtractor / AMediaCodec / AImageReader, API 28+
+        // for the `*64` fd variants); the link propagates the same way.
+        mod.linkSystemLibrary("mediandk", .{});
     }
 
     const test_step = b.step("test", "Run labelle-android unit tests");
 
-    // Host-run tests (pure Zig: the intent allow-list / decision), pinned to
-    // the host so `-Dtarget=aarch64-linux-android` never tries to execute a
-    // foreign binary.
+    // Host-run tests (pure Zig: the intent allow-list / decision, the video
+    // `yuv`/`planes` helpers), pinned to the host so
+    // `-Dtarget=aarch64-linux-android` never tries to execute a foreign
+    // binary.
     const host = b.resolveTargetQuery(.{});
     const host_tests = b.addTest(.{
         .root_module = b.createModule(.{
