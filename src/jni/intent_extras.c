@@ -16,6 +16,7 @@
 // this is an empty TU; `build.zig` only compiles it for Android anyway.
 #ifdef __ANDROID__
 
+#include <android/log.h>
 #include <android/native_activity.h>
 #include <jni.h>
 #include <stddef.h>
@@ -136,7 +137,10 @@ int labelle_android_read_intent_extras(const void *activity_ptr, const char *con
         }
         (*env)->PopLocalFrame(env, NULL);
     } else if ((*env)->ExceptionCheck(env)) {
+        // PushLocalFrame failed (OutOfMemoryError pending): clear it so the
+        // caller's thread is not poisoned; `ok` stays 0.
         (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_WARN, "labelle-android", "intent extras: PushLocalFrame failed; exception cleared, intent not read");
     }
 
     if (!ok) {
