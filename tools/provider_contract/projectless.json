@@ -1,0 +1,13 @@
+{
+  "contract_version": "1.0.0",
+  "invocation": {"kind": "command", "id": "doctor", "step": null, "phase": null},
+  "package_dir": "/provider",
+  "project_dir": null,
+  "target": null,
+  "lock_file": null,
+  "config_file": null,
+  "output_dir": "/output",
+  "zig_executable": "/tools/zig",
+  "optimize": "Debug",
+  "progress": "json"
+}

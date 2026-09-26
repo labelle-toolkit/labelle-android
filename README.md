@@ -16,12 +16,12 @@ Android platform package for the Labelle toolkit.
 
 Every JNI service takes the running `ANativeActivity*` as an opaque pointer; the JNI walks (`src/jni/*.c`) read `->vm` / `->clazz` through the NDK's own header, so both backends pass what they already hold. `aaudio` declares its `MixCallback` structurally (`*const fn (out: []i16, channels: u8) void`) so the package has no dependency on labelle-audio; the consumer asserts equality at comptime. `build.zig` also exports `addAndroidSysroot` / `resolveNdk` / `nativeAppGlueDir` / `isAndroidTarget` for consumers' build scripts.
 
-Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b, 1c and 1d). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging, asset access and provider commands are still not implemented; runtime acceptance is on-device (SM-T505), not cross-compilation alone.
+Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b, 1c and 1d). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging and asset access are still not implemented (the provider below ships `doctor` only so far); runtime acceptance is on-device (SM-T505), not cross-compilation alone.
 
 ### Naming
 
 - Zig package `.name = .labelle_android`; the one module is `labelle_android`.
-- `plugin.labelle` `.name = "android"`: the assembler derives a plugin's module alias as `labelle_<name>` (`deps_linker.zig`, `build_files/build_zig.zig`), so `android` is the name that yields `labelle_android` with no `b.modules.put` alias. `manifest_version = 1` (the shipping CLI parses nothing higher); no commands or hooks yet — the `android` command namespace (CLI #406) is reserved for this package pending the contract decisions (CLI #411).
+- `plugin.labelle` `.name = "android"`: the assembler derives a plugin's module alias as `labelle_<name>` (`deps_linker.zig`, `build_files/build_zig.zig`), so `android` is the name that yields `labelle_android` with no `b.modules.put` alias. `manifest_version = 2`: the package is also the `android` CLI provider (see below). The `.plugins` name, the registry package and `.provider_config .package` must all be `android`.
 
 ### Build and test
 
@@ -32,7 +32,77 @@ zig build test -Dtarget=aarch64-linux-android --summary all   # Android compile-
 
 **Supported ABIs: 64-bit only** — `arm64-v8a` (`aarch64-linux-android`) and `x86_64` (`x86_64-linux-android`, emulator). 32-bit `armeabi-v7a` (`arm-linux-androideabi`) and `x86` (`i686`) are not supported: the labelle CLI builds and packages only `arm64-v8a` / `x86_64` (`AbiArch`, `--all-abis`), the bgfx/sokol backends accept only `-Dandroid_arch=arm64|x86_64`, and shipped APKs carry only `lib/arm64-v8a`. A 32-bit Android target fails the build with a clear "supports 64-bit Android only" message (`build.zig` for this package's own steps, a `@compileError` in `src/root.zig` for consumers) rather than the 64-bit-atomics errors `aaudio` would otherwise raise ([#10](https://github.com/labelle-toolkit/labelle-android/issues/10)); CI asserts that failure mode.
 
+```bash
+zig build test-provider --summary all       # provider host tool: wire decoder + vendored fixtures, settings schema, invocation matrix, doctor against a fake ANDROID_HOME
+zig build install-provider                  # zig-out/bin/labelle-android
+```
+
 The Android compile-check compiles and links every AAudio entry point (`ensureStarted`, `stop`, the data and error callbacks) through an Android-only, never-executed harness test in `src/aaudio.zig`; on the host that test is skipped and the same state machine runs against a scripted fake API.
+
+## CLI provider
+
+`plugin.labelle` declares the `android` provider for labelle-cli's provider contract ([CLI #405](https://github.com/labelle-toolkit/labelle-cli/issues/405)): namespace `android`, target `android`, `command_contract = ">=1.2.0 <1.2.1"` (exactly the wire versions the vendored decoder accepts). Every command and hook runs one host executable, `bin/labelle-android` (`tools/main.zig`, built by `zig build install-provider`), which strictly decodes the context the CLI passes in `LABELLE_CONTEXT` (`tools/contract.zig`, vendored from the CLI with its fixtures) and dispatches on `(kind, id, step, phase)`. Any combination the manifest does not declare is refused. The CLI builds the tool with `zig build --system`, which disables dependency fetching, so `tools/` uses `std` only.
+
+| Command | What it does |
+|---|---|
+| `labelle android doctor` | Checks the Android SDK (adb, build-tools `aapt`/`zipalign`/`apksigner`, `android.jar` for the configured target SDK), the NDK (sysroot, `llvm-strip`) and the JDK (`jar`, `keytool`). Exits non-zero when a required tool is missing. |
+
+**Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase). The packaging hooks (`package` after `build`, `deploy` replacing `run`, `bundle` replacing `bundle`) and the `run`/`deploy` commands arrive in the next release; until then `labelle bundle --platform=android` reports that no provider replaces the bundle step.
+
+Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440), on `development`) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). CI drives the real CLI through `tests/provider/e2e.py`; until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
+
+### Project setup
+
+No release carries the provider yet, so pin a local checkout for development:
+
+```zig
+// project.labelle
+.plugins = .{
+    .{ .name = "android", .repo = "local:../labelle-android" },
+},
+.provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
+```
+
+After the first release that ships the provider, pin the released version instead (`<version>` is that release's tag):
+
+```zig
+.{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "<version>" },
+```
+
+### `providers/android.json` (schema v1)
+
+```json
+{
+  "schema_version": 1,
+  "package_name": "com.labelle.flying_platform",
+  "app_name": "Flying Platform",
+  "min_sdk_version": 28,
+  "target_sdk_version": 34,
+  "orientation": "landscape",
+  "debuggable": false,
+  "version_name": "1.0",
+  "abis": ["arm64-v8a"],
+  "signing": { "keystore": "keys/release.jks", "store_password": "env:FP_KS_PASS",
+               "key_alias": "labelle-release", "key_password": "env:FP_KEY_PASS" },
+  "deploy": { "repo": "owner/name", "channel": "stable" }
+}
+```
+
+| Key | Required | Default | Rule |
+|---|---|---|---|
+| `schema_version` | yes | | `1` |
+| `package_name` | yes | | `[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+` |
+| `app_name` | no | project `.title` | non-empty, no control characters |
+| `min_sdk_version` | no | `28` | at least 28 (the runtime module uses API 28 MediaCodec entry points) |
+| `target_sdk_version` | no | `34` | at least `min_sdk_version` |
+| `orientation` | no | `"all"` | `portrait`, `landscape`, `sensor_landscape`, `all` |
+| `debuggable` | no | `false` | on-device verification only; never ship it |
+| `version_name` | no | `"1.0"` | non-empty; `versionCode` comes from `labelle bundle --build-number` |
+| `abis` | no | `["arm64-v8a"]` | exactly `["arm64-v8a"]` in v1 |
+| `signing` | no | debug keystore | `store_password`/`key_password` must be `env:VAR` or `file:PATH` (apksigner's forms); a `pass:` literal is rejected so no secret is committed |
+| `deploy` | no | | `repo` is `owner/name`; `channel` is `stable`, `staging`, `preview` or `internal` |
+
+The parse is strict: unknown keys, duplicate keys and wrong types are errors, and the file is validated before the provider does anything. `immersive_mode` and `load_assets_from_apk` are rejected here: the assembler reads them at generate time, so they stay in `project.labelle .android`. There is no `studio` block: `labelle android studio` is not part of this release.
 
 ## Planned responsibilities
 
@@ -51,6 +121,6 @@ The existing `labelle-android-gamepad` remains a separate package unless its own
 - [Contract decisions before implementation: CLI #411](https://github.com/labelle-toolkit/labelle-cli/issues/411)
 - [APK-loaded assets: assembler #759](https://github.com/labelle-toolkit/labelle-assembler/issues/759)
 
-Migration is breaking: consumers explicitly adopt the package and update configuration. No compatibility shims or implicit provider injection. The package manifest ships now at `manifest_version = 1` with no commands or hooks; its command/hook surface waits for the contract decisions.
+Migration is breaking: consumers explicitly adopt the package and update configuration. No compatibility shims or implicit provider injection.
 
 Device validation must cover bgfx and sokol cold launch, background/resume, rotation, and asset access; cross-compilation alone is not runtime acceptance.
