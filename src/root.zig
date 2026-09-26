@@ -11,6 +11,9 @@
 //!     (labelle-bgfx#127).
 //!   * `aaudio` — the AAudio output device (labelle-bgfx#306): the
 //!     `labelle-audio` `DeviceSink` a backend's mixer drives on Android.
+//!   * `video` — the MediaCodec H.264 decoder + audio-track decode
+//!     (`VideoDecoder`, `decodeTrack`) and the pure `yuv`/`planes` helpers the
+//!     desktop decoders share (FP#549; links `libmediandk`).
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
@@ -26,6 +29,7 @@ pub const launch_intent = @import("launch_intent.zig");
 pub const debuggable = @import("debuggable.zig");
 pub const relayout = @import("relayout.zig");
 pub const aaudio = @import("aaudio.zig");
+pub const video = @import("video.zig");
 
 test {
     // Explicit refs: a lazily-referenced file's tests are otherwise never
@@ -35,4 +39,5 @@ test {
     _ = debuggable;
     _ = relayout;
     _ = aaudio;
+    _ = video;
 }
