@@ -50,3 +50,20 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: zig build test -Dtarget=aarch64-linux-android --summary all
+      # labelle-android#10: 32-bit Android (armeabi-v7a) is unsupported. The
+      # build must fail with the clear 64-bit-only message, not atomics errors.
+      - name: 32-bit Android fails with the unsupported-ABI message
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          if zig build test -Dtarget=arm-linux-androideabi --summary all > armv7.log 2>&1; then
+            cat armv7.log
+            echo "expected the 32-bit Android build to fail"
+            exit 1
+          fi
+          cat armv7.log
+          grep -q "supports 64-bit Android only" armv7.log
+          if grep -q "expected 32-bit integer type or smaller" armv7.log; then
+            echo "atomics errors leaked past the unsupported-ABI guard"
+            exit 1
+          fi

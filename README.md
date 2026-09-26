@@ -30,6 +30,8 @@ zig build test --summary all                                  # host: intent all
 zig build test -Dtarget=aarch64-linux-android --summary all   # Android compile-check (needs ANDROID_NDK_HOME or ANDROID_HOME)
 ```
 
+**Supported ABIs: 64-bit only** — `arm64-v8a` (`aarch64-linux-android`) and `x86_64` (`x86_64-linux-android`, emulator). 32-bit `armeabi-v7a` (`arm-linux-androideabi`) and `x86` (`i686`) are not supported: the labelle CLI builds and packages only `arm64-v8a` / `x86_64` (`AbiArch`, `--all-abis`), the bgfx/sokol backends accept only `-Dandroid_arch=arm64|x86_64`, and shipped APKs carry only `lib/arm64-v8a`. A 32-bit Android target fails the build with a clear "supports 64-bit Android only" message (`build.zig` for this package's own steps, a `@compileError` in `src/root.zig` for consumers) rather than the 64-bit-atomics errors `aaudio` would otherwise raise ([#10](https://github.com/labelle-toolkit/labelle-android/issues/10)); CI asserts that failure mode.
+
 The Android compile-check compiles and links every AAudio entry point (`ensureStarted`, `stop`, the data and error callbacks) through an Android-only, never-executed harness test in `src/aaudio.zig`; on the host that test is skipped and the same state machine runs against a scripted fake API.
 
 ## Planned responsibilities
