@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      # The intent allow-list / decision tests and the NDK-selection rule run
+      # on the host; no JNI or NDK needed.
+      - name: Run unit tests
+        run: zig build test --summary all
+
+  android-compile-check:
+    name: Android compile-check (aarch64-linux-android, NDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      # Compiles the three JNI C TUs against the NDK sysroot and the module's
+      # `extern "c"` bindings for aarch64 (object emission; nothing runs).
+      - name: Cross-build for Android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: zig build test -Dtarget=aarch64-linux-android --summary all

@@ -1,0 +1,14 @@
+.{
+    .fingerprint = 0x1ba3596142e04ab0,
+    .name = .labelle_android,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "plugin.labelle",
+        "README.md",
+        "src",
+    },
+}
