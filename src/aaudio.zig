@@ -49,9 +49,14 @@
 //! (`android: AAudio stream reopen still failing …; giving up`) and waits
 //! indefinitely again — a later `ensureStarted` retries the open (silently,
 //! still the same episode). A stream opened by `ensureStarted` meanwhile ends
-//! the retry episode. The budget is accounted in *scheduled* wait time, not
-//! wall-clock, so the number of attempts per episode is bounded by the
-//! schedule alone (an early wake just retries early).
+//! the retry episode. Each retry is due at an **absolute deadline** on the
+//! monotonic (`.awake`) clock: an early return from the timed wait (a wake
+//! that raced the wait, a spurious or `Canceled` return) does not retry — the
+//! thread re-waits for the time remaining. So a retry runs only once its
+//! scheduled wait has really elapsed, and the budget is charged the scheduled
+//! wait of each retry that ran: never more than the time actually waited, and
+//! the number of attempts per episode is fixed by the schedule alone (early
+//! wakes cost nothing).
 //!
 //! ## Disconnection recovery
 //! Android disconnects an output stream on a route change (headset unplugged,
@@ -211,6 +216,9 @@ fn Device(comptime Api: type) type {
         var retry_pending: bool = false;
         /// The wait scheduled before the next retry (valid while pending).
         var retry_wait_ns: u64 = 0;
+        /// When the next retry is due, on the `.awake` clock (valid while
+        /// pending): scheduling time + `retry_wait_ns`.
+        var retry_deadline: Io.Timestamp = .zero;
         /// Scheduled wait spent so far in this retry episode.
         var retry_spent_ns: u64 = 0;
 
@@ -240,6 +248,10 @@ fn Device(comptime Api: type) type {
         /// Set by the control thread as it returns (so `stop` can be checked
         /// to have really joined it).
         var control_exited: std.atomic.Value(bool) = .init(false);
+        /// Completed `service` passes (bumped under `mutex`, as the pass
+        /// ends). Test instrumentation: lets a host test wait for the control
+        /// thread to have handled a wake without a wall-clock guess.
+        var service_passes: std.atomic.Value(u32) = .init(0);
 
         /// Wake the control thread: bump the event word, then one futex wake.
         /// Lock-free and allocation-free (a single non-blocking syscall) —
@@ -367,43 +379,47 @@ fn Device(comptime Api: type) type {
         /// The control thread. Sleeps on `wake_seq`; every wake runs one
         /// `service` pass. A bump between the `seen` load and the futex wait
         /// makes the wait return immediately, so no wake is ever lost;
-        /// spurious returns just re-run `service`, which is idempotent (a
-        /// pending retry runs once per pass, so an early return retries
-        /// early, never more often per episode than the schedule allows).
-        /// While a reopen retry is pending the wait is bounded by the
-        /// scheduled backoff: with no stream there is no callback left to
+        /// spurious returns just re-run `service`, which is idempotent.
+        /// While a reopen retry is pending the wait is bounded by the retry's
+        /// absolute deadline: with no stream there is no callback left to
         /// wake the thread, so an unbounded wait would leave the device
-        /// silent until the next `ensureStarted`.
+        /// silent until the next `ensureStarted`. A return before the
+        /// deadline (early wake, `Canceled`) makes `service` skip the retry
+        /// and hand back the same deadline, so the thread re-waits for the
+        /// remaining time only.
         fn controlMain() void {
             defer control_exited.store(true, .release);
             const io = ioOf();
             while (true) {
                 const seen = wake_seq.load(.acquire);
                 if (quit.load(.acquire)) return;
-                if (service()) |wait_ns| {
+                if (service()) |deadline| {
                     // A plain `std.Thread` is never cancelled; a `Canceled`
-                    // return is just an early wake.
-                    io.futexWaitTimeout(u32, &wake_seq.raw, seen, .{ .duration = .{
-                        .raw = .fromNanoseconds(@intCast(wait_ns)),
-                        .clock = .awake,
-                    } }) catch {};
+                    // return is just an early wake (see above).
+                    io.futexWaitTimeout(u32, &wake_seq.raw, seen, .{
+                        .deadline = deadline.withClock(.awake),
+                    }) catch {};
                 } else {
                     io.futexWaitUncancelable(u32, &wake_seq.raw, seen);
                 }
             }
         }
 
-        /// One control pass, under `mutex`: run a pending reopen retry (the
-        /// scheduled wait has elapsed), log the started marker for a stream
+        /// One control pass, under `mutex`: run a pending reopen retry whose
+        /// deadline has passed (one still in the future is left alone — this
+        /// pass is an early wake), log the started marker for a stream
         /// observed running (once per start), then recover a disconnected
         /// stream. Marker before recovery, so a stream that ran and then died
-        /// gets its lines in chronological order. Returns the wait the caller
-        /// must bound its sleep by (a retry is pending), else null.
-        fn service() ?u64 {
+        /// gets its lines in chronological order. Returns the deadline the
+        /// caller must bound its sleep by (a retry is pending), else null.
+        fn service() ?Io.Timestamp {
             const io = ioOf();
             mutex.lockUncancelable(io);
             defer mutex.unlock(io);
-            if (retry_pending) {
+            // Runs before the unlock above (defers are LIFO): a test that
+            // observes the bump and then takes `mutex` sees the whole pass.
+            defer _ = service_passes.fetchAdd(1, .release);
+            if (retry_pending and now().nanoseconds >= retry_deadline.nanoseconds) {
                 // Retry block first: the pass that *schedules* a retry (below)
                 // must not also run it.
                 std.debug.assert(stream == null);
@@ -428,29 +444,33 @@ fn Device(comptime Api: type) type {
                     disconnected.store(false, .release);
                 }
             }
-            return if (retry_pending) retry_wait_ns else null;
+            return if (retry_pending) retry_deadline else null;
         }
 
         /// A reopen attempt failed (caller holds `mutex`): start the retry
         /// episode, or step its backoff — doubling up to the cap, and giving
         /// up (one log line) once the scheduled wait spent reaches the
-        /// budget. Only the control thread steps the schedule; a failed
-        /// `ensureStarted` does not (it is the game thread's own attempt).
+        /// budget — and set the next retry's deadline. A retry only runs
+        /// once its deadline has passed, so the wait charged here was
+        /// actually waited. Only the control thread steps the schedule; a
+        /// failed `ensureStarted` does not (it is the game thread's own
+        /// attempt).
         fn scheduleRetry() void {
             const policy: RetryPolicy = Api.retry;
             if (!retry_pending) {
                 retry_pending = true;
                 retry_wait_ns = policy.initial_ns;
                 retry_spent_ns = 0;
-                return;
+            } else {
+                retry_spent_ns +|= retry_wait_ns;
+                if (retry_spent_ns >= policy.budget_ns) {
+                    Api.warn("android: AAudio stream reopen still failing after {d} s; giving up until the next audio entry point", .{retry_spent_ns / std.time.ns_per_s});
+                    clearRetry();
+                    return;
+                }
+                retry_wait_ns = @min(retry_wait_ns *| 2, policy.cap_ns);
             }
-            retry_spent_ns +|= retry_wait_ns;
-            if (retry_spent_ns >= policy.budget_ns) {
-                Api.warn("android: AAudio stream reopen still failing after {d} s; giving up until the next audio entry point", .{retry_spent_ns / std.time.ns_per_s});
-                clearRetry();
-                return;
-            }
-            retry_wait_ns = @min(retry_wait_ns *| 2, policy.cap_ns);
+            retry_deadline = now().addDuration(.fromNanoseconds(retry_wait_ns));
         }
 
         /// End the retry episode (caller holds `mutex`).
@@ -458,6 +478,13 @@ fn Device(comptime Api: type) type {
             retry_pending = false;
             retry_wait_ns = 0;
             retry_spent_ns = 0;
+            retry_deadline = .zero;
+        }
+
+        /// The monotonic clock retry deadlines are kept on (the same
+        /// `.awake` clock the timed wait uses).
+        fn now() Io.Timestamp {
+            return Io.Clock.now(.awake, ioOf());
         }
 
         /// Warn once per failure episode; later failures in the same episode
@@ -514,6 +541,7 @@ fn Device(comptime Api: type) type {
             warned_setup = false;
             warned_control = false;
             control_exited.store(false, .release);
+            service_passes.store(0, .release);
         }
     };
 }
@@ -761,16 +789,44 @@ fn nowMs() i64 {
     return Io.Clock.now(.awake, ioOf()).toMilliseconds();
 }
 
-/// Wait (bounded, 2 s) for the control thread to bring `c` to `want`.
+/// Wait for the control thread to bring `c` to `want`. The 10 s bound is only
+/// a hang guard (a failure, never the thing asserted), generous so a loaded
+/// host cannot trip it.
 fn waitCount(c: *const FakeApi.Counter, want: u32) !void {
-    const deadline = nowMs() + 2000;
-    while (count(c) != want) {
+    return waitUntil(c, want, .exactly);
+}
+
+/// Like `waitCount`, for a counter that may overshoot `want` (e.g.
+/// `service_passes`: a stale wake can add a pass of its own).
+fn waitAtLeast(c: *const FakeApi.Counter, want: u32) !void {
+    return waitUntil(c, want, .at_least);
+}
+
+fn waitUntil(c: *const FakeApi.Counter, want: u32, mode: enum { exactly, at_least }) !void {
+    const deadline = nowMs() + 10_000;
+    while (switch (mode) {
+        .exactly => count(c) != want,
+        .at_least => count(c) < want,
+    }) {
         if (nowMs() > deadline) {
             std.debug.print("waitCount: wanted {d}, still {d}\n", .{ want, count(c) });
             return error.ControlThreadTimeout;
         }
         std.Thread.yield() catch {};
     }
+}
+
+/// Wait for the control-thread pass that produced an observed effect to
+/// finish. Every Api call the control thread makes happens inside `service`,
+/// under the device mutex; so once a test has observed one of those calls
+/// (e.g. `opens` reaching N), taking the mutex blocks until the rest of that
+/// pass — `request_start`, `builder_delete`, the retry bookkeeping — is done.
+/// Deterministic, unlike asserting the later calls right away (`opens` is
+/// bumped mid-`openAndStart`, before the start request).
+fn syncControl() void {
+    const io = ioOf();
+    Fake.mutex.lockUncancelable(io);
+    Fake.mutex.unlock(io);
 }
 
 /// Give the control thread a slice of real time to do something it must NOT
@@ -848,6 +904,7 @@ test "disconnect: the error callback only flags + wakes; the control thread reop
     // "disconnected; reopening" line and opens a NEW stream — the game
     // thread never called ensureStarted again.
     try waitCount(&FakeApi.opens, 2);
+    syncControl(); // the reopen pass is complete (start requested, flags reset)
     try waitCount(&FakeApi.warns, 1);
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.stops));
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
@@ -889,6 +946,7 @@ test "disconnect whose reopen fails: the control thread retries on a timeout and
     // added no warning.
     FakeApi.open_result.store(AAUDIO_OK, .release);
     try waitCount(&FakeApi.opens, 2);
+    syncControl(); // the successful retry pass is complete
     try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
     try std.testing.expect(count(&FakeApi.open_attempts) >= 3); // initial + failed reopen + ≥1 retry
     try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.starts));
@@ -979,10 +1037,61 @@ test "stop during a reopen retry episode joins the thread and clears the schedul
     try std.testing.expect(!Fake.retry_pending);
     try std.testing.expectEqual(@as(u64, 0), Fake.retry_wait_ns);
     try std.testing.expectEqual(@as(u64, 0), Fake.retry_spent_ns);
+    try std.testing.expectEqual(Io.Timestamp.zero, Fake.retry_deadline);
     const attempts = count(&FakeApi.open_attempts);
     settle();
     try std.testing.expectEqual(attempts, count(&FakeApi.open_attempts));
     try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
+}
+
+test "early wakes before the retry deadline re-wait: no extra open_stream, no budget charged (#4)" {
+    freshFake();
+    // A 10 s first wait: no retry can come due during this test, so every
+    // control pass below is an early wake by construction.
+    FakeApi.retry = fastRetry(10_000, 10_000, 60_000);
+    Fake.ensureStarted(&TestMix.mix);
+    FakeApi.open_result.store(-1, .release);
+    FakeApi.error_cb.?(FakeApi.last_stream, null, AAUDIO_ERROR_DISCONNECTED);
+    try waitCount(&FakeApi.warns, 2);
+    syncControl();
+    // Initial open + the failed immediate reopen; the retry is scheduled.
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.open_attempts));
+    const deadline = blk: {
+        const io = ioOf();
+        Fake.mutex.lockUncancelable(io);
+        defer Fake.mutex.unlock(io);
+        try std.testing.expect(Fake.retry_pending);
+        try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), Fake.retry_wait_ns);
+        try std.testing.expectEqual(@as(u64, 0), Fake.retry_spent_ns);
+        break :blk Fake.retry_deadline;
+    };
+
+    // Wake the thread early, repeatedly — what a wake racing the wait, or a
+    // spurious / `Canceled` futex return, does. Each wake provably runs a
+    // control pass (the mechanism under test is exercised, not skipped)...
+    for (0..5) |_| {
+        const passes = count(&Fake.service_passes);
+        Fake.wake();
+        try waitAtLeast(&Fake.service_passes, passes + 1);
+    }
+    syncControl();
+    // ...and none of those passes ran the retry: no extra open_stream, the
+    // schedule, its deadline and the budget are untouched (the thread went
+    // back to waiting for the remaining time).
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.open_attempts));
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.warns));
+    {
+        const io = ioOf();
+        Fake.mutex.lockUncancelable(io);
+        defer Fake.mutex.unlock(io);
+        try std.testing.expect(Fake.retry_pending);
+        try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), Fake.retry_wait_ns);
+        try std.testing.expectEqual(@as(u64, 0), Fake.retry_spent_ns);
+        try std.testing.expectEqual(deadline, Fake.retry_deadline);
+    }
+    Fake.stop();
+    try std.testing.expect(Fake.control_exited.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 2), count(&FakeApi.open_attempts));
 }
 
 test "setup failures warn once per episode; an observed start resets the episode" {
@@ -1083,13 +1192,18 @@ test "stop joins the control thread and leaves no pending work; a later ensureSt
     try std.testing.expect(!Fake.marker_owed);
     try std.testing.expect(!Fake.disconnected.load(.acquire));
     try std.testing.expect(!Fake.started_observed.load(.acquire));
-    // Exactly one stop+close (ours or the thread's, never both), and nothing
-    // moves afterwards: the thread is gone.
-    try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
+    // Whether the woken thread got one last pass in before `stop` raised
+    // `quit` is a scheduling race (if it did, it closed the dead stream and
+    // reopened, and `stop` closed the reopened one). Either way every stream
+    // opened was stopped + closed exactly once, and nothing moves afterwards:
+    // the thread is gone.
     const opens_after_stop = count(&FakeApi.opens);
+    try std.testing.expect(opens_after_stop == 1 or opens_after_stop == 2);
+    try std.testing.expectEqual(opens_after_stop, count(&FakeApi.closes));
+    try std.testing.expectEqual(opens_after_stop, count(&FakeApi.stops));
     settle();
     try std.testing.expectEqual(opens_after_stop, count(&FakeApi.opens));
-    try std.testing.expectEqual(@as(u32, 1), count(&FakeApi.closes));
+    try std.testing.expectEqual(opens_after_stop, count(&FakeApi.closes));
 
     // Start over: a new stream and a new control thread that serves it.
     Fake.ensureStarted(&TestMix.mix);
