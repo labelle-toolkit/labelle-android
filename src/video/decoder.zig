@@ -207,6 +207,99 @@ fn streamFinished(eof_seen: bool, ring_count: usize, pending: usize) bool {
     return eof_seen and ring_count == 0 and pending == 0;
 }
 
+/// Decoded-frame ring size — the jitter cushion (~130 ms at 30 fps). Bounds
+/// the ring AND the surface handoff: the worker renders only while
+/// `ring_count + pending < RING_SIZE`, so `pending ≤ RING_SIZE` always.
+const RING_SIZE = 4;
+
+/// What the feed loop does with the result of `AMediaCodec_getInputBuffer`
+/// for a freshly dequeued input index.
+const InputBufferStep = enum { fill, end_stream };
+
+/// A null input buffer is TERMINAL, exactly like a refused
+/// `queueInputBuffer` (`inputQueueStep`): the dequeued index stays
+/// client-owned and is never handed back, so skipping it (the old `break`)
+/// leaked one input buffer per attempt until `dequeueInputBuffer` returned
+/// TRY_AGAIN forever — `input_done`/`eof_seen` stayed false and a play-once
+/// clip never ended (labelle-android#5).
+fn inputBufferStep(have_buffer: bool) InputBufferStep {
+    return if (have_buffer) .fill else .end_stream;
+}
+
+/// Frames released to the reader's surface (render=true) but not yet
+/// acquired — the async surface handoff — each with the colour space in force
+/// when it was RELEASED. Stamping the colour at acquire instead (the old
+/// `st.color` read in `publishOne`) gave frames released before an
+/// `OUTPUT_FORMAT_CHANGED` but acquired after it the NEW format's matrix.
+/// FIFO: the reader is acquired in order (`acquireNextImage`).
+const Handoff = struct {
+    colors: [RING_SIZE]ColorSpace = @splat(.{}),
+    head: usize = 0,
+    count: usize = 0,
+
+    fn push(self: *Handoff, color: ColorSpace) void {
+        std.debug.assert(self.count < RING_SIZE); // the render loop's bound
+        self.colors[(self.head + self.count) % RING_SIZE] = color;
+        self.count += 1;
+    }
+
+    /// The oldest in-flight frame's colour; null when nothing is pending.
+    fn pop(self: *Handoff) ?ColorSpace {
+        if (self.count == 0) return null;
+        const c = self.colors[self.head];
+        self.head = (self.head + 1) % RING_SIZE;
+        self.count -= 1;
+        return c;
+    }
+
+    /// The dry-drain failsafe: the pending frames will never surface.
+    fn writeOff(self: *Handoff) void {
+        self.head = 0;
+        self.count = 0;
+    }
+};
+
+/// Apply one output buffer the worker has released (zero-size, or rendered
+/// with an OK status) to the shared end-of-stream state. The caller holds the
+/// mutex for the WHOLE call: the frame's `pending` count and `eof_seen` move
+/// in ONE critical section. Some decoders tag the LAST FRAME itself
+/// `FLAG_EOS` (`info.size > 0`); setting `eof_seen` under one lock and
+/// bumping `pending` under a later one let a render thread checking `eof()`
+/// in between see `eof_seen` with an empty ring and `pending == 0`, and end
+/// the clip one frame early (labelle-android#5).
+fn recordRelease(handoff: *Handoff, eof_seen: *bool, has_frame: bool, eos: bool, color: ColorSpace) void {
+    if (has_frame) handoff.push(color);
+    if (eos) eof_seen.* = true;
+}
+
+/// Idle-iteration bounds for the dry-drain write-off (each idle iteration
+/// sleeps ≥ 2 ms): ~100 ms after EOS (the clip is over; only the hand-off
+/// waits), ~2 s before it.
+const WRITE_OFF_AFTER_EOS: u32 = 50;
+const WRITE_OFF_BEFORE_EOS: u32 = 1000;
+
+/// After how many consecutive idle worker iterations are the pending handoff
+/// frames written off as DROPPED by the reader (a release with no acquire,
+/// ever)? Null when the state is not a stall.
+///   - After EOS: a lost frame pins `pending` > 0 and holds `eof()` false.
+///   - Before EOS, once the cushion is full (`ring_count + pending ≥
+///     RING_SIZE`): the worker neither feeds nor dequeues output, so the EOS
+///     buffer is never dequeued and `eof_seen` never set — gating on it alone
+///     froze the stream for good after a few drops (Codex on #3). The bound
+///     is LONG here: on the SM-T505 frames released during the intro's
+///     startup GPU stall (a 409 ms frame) surfaced > 100 ms late, and a
+///     100 ms write-off mistook them for drops (each premature write-off
+///     then resurfaced as a stale `pending` at EOS). A true pre-EOS drop is a
+///     permanent freeze, so a 2 s recovery still fixes it.
+/// Never while the RING is full: that is the render thread not consuming
+/// (a paused game), not a lost frame.
+fn handoffWriteOffAfter(eof_seen: bool, ring_count: usize, pending: usize) ?u32 {
+    if (pending == 0 or ring_count >= RING_SIZE) return null;
+    if (eof_seen) return WRITE_OFF_AFTER_EOS;
+    if (ring_count + pending >= RING_SIZE) return WRITE_OFF_BEFORE_EOS;
+    return null;
+}
+
 pub const Error = error{
     Unsupported,
     NoVideoTrack,
@@ -345,7 +438,7 @@ const AndroidVideoDecoder = struct {
     // render thread; on it, every advanced frame blew the 16.6 ms budget and
     // judddered. The render thread (`decodeFramePlanes`) just memcpys a ready
     // slot out of cached RAM (~1–2 ms).
-    const RING_SIZE = 4; // decoded-frame cushion (~130 ms at 30 fps)
+    // `RING_SIZE` (file scope) is the decoded-frame cushion.
     // Reader slots: frames rendered but not yet acquired by the worker, plus
     // headroom. The worker acquires (and releases) promptly, so this stays small.
     const READER_MAX_IMAGES = 8;
@@ -364,8 +457,8 @@ const AndroidVideoDecoder = struct {
     /// thread must reference stable heap memory, never the outer struct.
     ///
     /// Threading contract: `extractor`/`codec`/`reader`/`input_done` are
-    /// worker-only after `openFd` returns. `ring_head`/`ring_count`/`eof_seen`
-    /// are shared and guarded by `mutex`. Slot CONTENT is safely accessed
+    /// worker-only after `openFd` returns. `ring_head`/`ring_count`/`handoff`/
+    /// `eof_seen` are shared and guarded by `mutex`. Slot CONTENT is safely accessed
     /// unlocked by exactly one side at a time: the worker writes only the tail
     /// slot (invisible until `ring_count` is bumped), the render thread reads
     /// only the head slot (the worker can't touch it while `ring_count` ≥ 1,
@@ -390,12 +483,13 @@ const AndroidVideoDecoder = struct {
         ring_count: usize, // ready frames in the ring
         // Frames released to the reader's surface (render=true) but not yet
         // acquired — the async surface handoff can lag a release by a beat.
-        // Bounding the render loop on `ring_count + pending` (not just
-        // ring_count) keeps the worker from rendering more frames than the
-        // cushion can hold when acquires lag, which would overflow the reader
-        // and DROP frames; `eof()` also counts it so the last frames of a clip
-        // aren't cut while still in the handoff.
-        pending: usize,
+        // `handoff.count` is "pending". Bounding the render loop on
+        // `ring_count + pending` (not just ring_count) keeps the worker from
+        // rendering more frames than the cushion can hold when acquires lag,
+        // which would overflow the reader and DROP frames; `eof()` also
+        // counts it so the last frames of a clip aren't cut while still in
+        // the handoff. Each entry carries its release-time colour space.
+        handoff: Handoff,
         // Output-side end-of-stream: set (under mutex) when AMediaCodec tags an
         // output buffer FLAG_EOS. `eof()` combines it with an empty ring so every
         // buffered frame is presented before the game hands off.
@@ -512,7 +606,7 @@ const AndroidVideoDecoder = struct {
             .ring = ring,
             .ring_head = 0,
             .ring_count = 0,
-            .pending = 0,
+            .handoff = .{},
             .eof_seen = false,
             .color = .{},
             .last_color = .{},
@@ -666,7 +760,7 @@ const AndroidVideoDecoder = struct {
         // Finished only once the codec drained AND every buffered frame — in
         // the ring AND still in the surface handoff (`pending`) — has been
         // presented, so a clip's last frames aren't cut.
-        return streamFinished(st.eof_seen, st.ring_count, st.pending);
+        return streamFinished(st.eof_seen, st.ring_count, st.handoff.count);
     }
 
     /// Ready frames currently in the ring (thread-safe read).
@@ -681,7 +775,7 @@ const AndroidVideoDecoder = struct {
     fn cushionLoad(st: *State) usize {
         lock(&st.mutex);
         defer st.mutex.unlock();
-        return st.ring_count + st.pending;
+        return st.ring_count + st.handoff.count;
     }
 
     /// Try to move ONE rendered frame from the reader into the ring: acquire
@@ -694,7 +788,7 @@ const AndroidVideoDecoder = struct {
         {
             lock(&st.mutex);
             defer st.mutex.unlock();
-            if (st.pending == 0 or st.ring_count >= RING_SIZE) return false;
+            if (st.handoff.count == 0 or st.ring_count >= RING_SIZE) return false;
         }
         var img_opt: ?*Image = null;
         if (AImageReader_acquireNextImage(st.reader, &img_opt) != AMEDIA_OK) return false;
@@ -707,11 +801,13 @@ const AndroidVideoDecoder = struct {
         const filled = fillPlanes(st, img, slot.y, slot.u, slot.v);
         if (filled) slot.pts = imageTimestamp(img);
         lock(&st.mutex);
+        // The colour the frame was RELEASED under (`Handoff`), not the
+        // codec's current one.
+        const released_color = st.handoff.pop() orelse st.color;
         if (filled) {
-            slot.color = st.color;
+            slot.color = released_color;
             st.ring_count += 1;
         }
-        if (st.pending > 0) st.pending -= 1;
         st.mutex.unlock();
         return true;
     }
@@ -747,7 +843,14 @@ const AndroidVideoDecoder = struct {
                 if (in_idx < 0) break; // no free input buffer right now
                 const idx: usize = @intCast(in_idx);
                 var cap: usize = 0;
-                const buf = AMediaCodec_getInputBuffer(st.codec, idx, &cap) orelse break;
+                const buf_opt = AMediaCodec_getInputBuffer(st.codec, idx, &cap);
+                const buf = switch (inputBufferStep(buf_opt != null)) {
+                    .fill => buf_opt.?,
+                    .end_stream => {
+                        terminalCodecError(st, "null input buffer (index)", in_idx);
+                        break;
+                    },
+                };
                 const n = AMediaExtractor_readSampleData(st.extractor, buf, cap);
                 const eos = n < 0;
                 const status = if (eos)
@@ -798,19 +901,14 @@ const AndroidVideoDecoder = struct {
                     break;
                 }
                 if (out_idx < 0) break; // no decoded output ready right now
-                if (info.flags & FLAG_EOS != 0) {
-                    lock(&st.mutex);
-                    st.eof_seen = true;
-                    st.mutex.unlock();
-                }
+                const eos = info.flags & FLAG_EOS != 0;
                 // Only a non-empty buffer produces a frame in the reader (the
                 // EOS carrier is typically zero-size); render and count it as
                 // pending only then, or `pending` would never drain and `eof()`
                 // would never fire.
                 const has_frame = info.size > 0;
                 const rc = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), has_frame);
-                if (!has_frame) continue;
-                if (rc != AMEDIA_OK) {
+                if (has_frame and rc != AMEDIA_OK) {
                     // The frame was NOT handed to the reader, so it must not
                     // be counted as pending: RING_SIZE such failures would
                     // fill the cushion, stop every further dequeue (the EOS
@@ -822,9 +920,13 @@ const AndroidVideoDecoder = struct {
                     terminalCodecError(st, "output release", rc);
                     break;
                 }
+                // `pending` and `eof_seen` in ONE critical section — an EOS
+                // tag on the last frame must not be visible before that
+                // frame is counted (`recordRelease`).
                 lock(&st.mutex);
-                st.pending += 1;
+                recordRelease(&st.handoff, &st.eof_seen, has_frame, eos, st.color);
                 st.mutex.unlock();
+                if (!has_frame) continue;
                 did_work = true;
                 // Common case: the frame is already acquirable — publish now.
                 _ = publishOne(st);
@@ -835,24 +937,29 @@ const AndroidVideoDecoder = struct {
             // internally (async/mailbox semantics under load) — a release with
             // no matching acquire, ever. After EOS that would pin `pending` > 0
             // and hold `eof()` false forever: the intro freezes on its last
-            // frame and never hands off (observed on-device). If the stream is
-            // done and ~100 ms of drain attempts surface nothing, the remaining
-            // pending frames are gone — write them off so eof() can fire. A
-            // genuinely in-flight frame arrives within a couple of iterations,
-            // so the timeout only triggers on true drops.
+            // frame and never hands off (observed on-device). Before EOS,
+            // enough drops fill the cushion and stop every output dequeue, so
+            // EOS is never reached either. If ~100 ms (after EOS) / ~2 s
+            // (before it) of drain attempts surface nothing, the remaining
+            // pending frames are gone — write them off so the stream moves
+            // again (`handoffWriteOffAfter`).
             if (!did_work) {
-                var stuck = false;
+                var bound: ?u32 = null;
                 {
                     lock(&st.mutex);
                     defer st.mutex.unlock();
-                    stuck = st.eof_seen and st.pending > 0;
+                    bound = handoffWriteOffAfter(st.eof_seen, st.ring_count, st.handoff.count);
                 }
-                if (stuck) {
+                if (bound) |limit| {
                     pending_dry += 1;
-                    if (pending_dry >= 50) { // ~100 ms of consecutive dry drains
+                    if (pending_dry >= limit) { // consecutive dry drains
                         lock(&st.mutex);
-                        st.pending = 0;
+                        const lost = st.handoff.count;
+                        st.handoff.writeOff();
+                        const at_eos = st.eof_seen;
                         st.mutex.unlock();
+                        std.log.warn("video: {d} released frame(s) never surfaced from the reader — written off ({s})", .{ lost, if (at_eos) "after EOS" else "cushion stalled before EOS" });
+                        pending_dry = 0;
                     }
                 } else pending_dry = 0;
                 _ = usleep(2000); // idle: back off briefly
@@ -872,7 +979,8 @@ const AndroidVideoDecoder = struct {
     /// and shown. Any that never surface are written off by the worker's
     /// dry-drain failsafe once `eof_seen` is set, the same as after a normal EOS.
     /// Also the terminal path for a failed `releaseOutputBuffer(render=true)`
-    /// and a refused `queueInputBuffer` (`inputQueueStep`).
+    /// a refused `queueInputBuffer` (`inputQueueStep`) and a null
+    /// `getInputBuffer` (`inputBufferStep`).
     fn terminalCodecError(st: *State, what: []const u8, code: anytype) void {
         lock(&st.mutex);
         defer st.mutex.unlock();
@@ -1245,4 +1353,93 @@ test "inputQueueStep: a refused queue (sample or EOS marker) ends the stream on 
 
     // A later error on an already-ending stream is not a new transition.
     try testing.expect(!endStream(&input_done, &eof_seen));
+}
+
+test "inputBufferStep: a null input buffer ends the stream (same terminal path as a refused queue)" {
+    try testing.expectEqual(InputBufferStep.fill, inputBufferStep(true));
+    // Mechanism (#5): null is NOT a skip-and-retry (the old `break` leaked
+    // the dequeued index each time) — it is terminal, first time.
+    try testing.expectEqual(InputBufferStep.end_stream, inputBufferStep(false));
+    // …and the terminal path makes `eof()` reachable, as for a refused queue.
+    var input_done = false;
+    var eof_seen = false;
+    try testing.expect(endStream(&input_done, &eof_seen));
+    try testing.expect(input_done and eof_seen);
+    try testing.expect(streamFinished(eof_seen, 0, 0));
+}
+
+test "recordRelease: an EOS-tagged LAST FRAME is counted pending in the same step that sets eof_seen" {
+    var h: Handoff = .{};
+    var eof_seen = false;
+    // The frame-carrying EOS buffer (`info.size > 0`, FLAG_EOS).
+    recordRelease(&h, &eof_seen, true, true, .{});
+    // Mechanism (#5): one call (one critical section) moves BOTH — there is
+    // no state with `eof_seen` set and the frame not yet pending.
+    try testing.expect(eof_seen);
+    try testing.expectEqual(@as(usize, 1), h.count);
+    try testing.expect(!streamFinished(eof_seen, 0, h.count)); // not one frame early
+    // The old two-step order exposed exactly this state to `eof()`:
+    try testing.expect(streamFinished(true, 0, 0));
+    // Once the frame is acquired (and then presented), eof() fires.
+    _ = h.pop();
+    try testing.expect(streamFinished(eof_seen, 0, h.count));
+
+    // Zero-size EOS carrier: no frame counted, eof_seen set.
+    var h2: Handoff = .{};
+    var eof2 = false;
+    recordRelease(&h2, &eof2, false, true, .{});
+    try testing.expect(eof2);
+    try testing.expectEqual(@as(usize, 0), h2.count);
+    // Ordinary frame: counted, eof untouched.
+    recordRelease(&h2, &eof2, true, false, .{});
+    try testing.expectEqual(@as(usize, 1), h2.count);
+}
+
+test "Handoff: each pending frame keeps the colour it was released under (FIFO)" {
+    var h: Handoff = .{};
+    const old: ColorSpace = .{ .standard = .bt601_ntsc };
+    const new: ColorSpace = .{ .standard = .bt709, .range = .full };
+    var eof_seen = false;
+    recordRelease(&h, &eof_seen, true, false, old);
+    recordRelease(&h, &eof_seen, true, false, old);
+    // OUTPUT_FORMAT_CHANGED lands while both are still in the handoff…
+    recordRelease(&h, &eof_seen, true, false, new);
+    // …the pre-change frames still come out with the OLD colour.
+    try testing.expectEqual(old, h.pop().?);
+    try testing.expectEqual(old, h.pop().?);
+    try testing.expectEqual(new, h.pop().?);
+    try testing.expectEqual(@as(?ColorSpace, null), h.pop());
+    // Wraps around the ring.
+    var i: usize = 0;
+    while (i < 3 * RING_SIZE) : (i += 1) {
+        const c: ColorSpace = if (i % 2 == 0) old else new;
+        h.push(c);
+        try testing.expectEqual(c, h.pop().?);
+    }
+    h.push(new);
+    h.writeOff();
+    try testing.expectEqual(@as(usize, 0), h.count);
+    try testing.expectEqual(@as(?ColorSpace, null), h.pop());
+}
+
+test "handoffWriteOffAfter: dropped frames that fill the cushion BEFORE EOS are written off, on a long bound" {
+    // Nothing pending: never a stall.
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(true, 0, 0));
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, 0, 0));
+    // After EOS any pending frame that never surfaces is a stall (~100 ms, as before).
+    try testing.expectEqual(@as(?u32, WRITE_OFF_AFTER_EOS), handoffWriteOffAfter(true, 0, 1));
+    try testing.expectEqual(@as(?u32, WRITE_OFF_AFTER_EOS), handoffWriteOffAfter(true, 2, 1));
+    // Mechanism (Codex on #3): before EOS, a cushion filled by lost handoffs
+    // stops every output dequeue — EOS can never arrive, so this is a stall
+    // too (the old `eof_seen and pending > 0` gate never fired here)…
+    try testing.expectEqual(@as(?u32, WRITE_OFF_BEFORE_EOS), handoffWriteOffAfter(false, 0, RING_SIZE));
+    try testing.expectEqual(@as(?u32, WRITE_OFF_BEFORE_EOS), handoffWriteOffAfter(false, 1, RING_SIZE - 1));
+    // …on a bound far longer than after EOS: late (not lost) frames
+    // during a startup GPU stall must not be written off (seen on-device).
+    try testing.expect(WRITE_OFF_BEFORE_EOS >= 10 * WRITE_OFF_AFTER_EOS);
+    // Before EOS with cushion room left the worker still dequeues output.
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, 1, 1));
+    // A full RING is the render thread not consuming — never a stall.
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, RING_SIZE, 0));
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(true, RING_SIZE, 0));
 }
