@@ -272,19 +272,32 @@ fn recordRelease(handoff: *Handoff, eof_seen: *bool, has_frame: bool, eos: bool,
     if (eos) eof_seen.* = true;
 }
 
-/// Is this idle worker iteration evidence that the pending handoff frames
-/// were DROPPED by the reader (a release with no acquire, ever)? The worker
-/// counts consecutive such iterations and writes `pending` off after ~100 ms.
+/// Idle-iteration bounds for the dry-drain write-off (each idle iteration
+/// sleeps ≥ 2 ms): ~100 ms after EOS (the clip is over; only the hand-off
+/// waits), ~2 s before it.
+const WRITE_OFF_AFTER_EOS: u32 = 50;
+const WRITE_OFF_BEFORE_EOS: u32 = 1000;
+
+/// After how many consecutive idle worker iterations are the pending handoff
+/// frames written off as DROPPED by the reader (a release with no acquire,
+/// ever)? Null when the state is not a stall.
 ///   - After EOS: a lost frame pins `pending` > 0 and holds `eof()` false.
 ///   - Before EOS, once the cushion is full (`ring_count + pending ≥
 ///     RING_SIZE`): the worker neither feeds nor dequeues output, so the EOS
 ///     buffer is never dequeued and `eof_seen` never set — gating on it alone
-///     froze the stream for good after a few drops (Codex on #3).
+///     froze the stream for good after a few drops (Codex on #3). The bound
+///     is LONG here: on the SM-T505 frames released during the intro's
+///     startup GPU stall (a 409 ms frame) surfaced > 100 ms late, and a
+///     100 ms write-off mistook them for drops (each premature write-off
+///     then resurfaced as a stale `pending` at EOS). A true pre-EOS drop is a
+///     permanent freeze, so a 2 s recovery still fixes it.
 /// Never while the RING is full: that is the render thread not consuming
 /// (a paused game), not a lost frame.
-fn handoffStalled(eof_seen: bool, ring_count: usize, pending: usize) bool {
-    if (pending == 0 or ring_count >= RING_SIZE) return false;
-    return eof_seen or ring_count + pending >= RING_SIZE;
+fn handoffWriteOffAfter(eof_seen: bool, ring_count: usize, pending: usize) ?u32 {
+    if (pending == 0 or ring_count >= RING_SIZE) return null;
+    if (eof_seen) return WRITE_OFF_AFTER_EOS;
+    if (ring_count + pending >= RING_SIZE) return WRITE_OFF_BEFORE_EOS;
+    return null;
 }
 
 pub const Error = error{
@@ -926,21 +939,20 @@ const AndroidVideoDecoder = struct {
             // and hold `eof()` false forever: the intro freezes on its last
             // frame and never hands off (observed on-device). Before EOS,
             // enough drops fill the cushion and stop every output dequeue, so
-            // EOS is never reached either (`handoffStalled`). If ~100 ms of
-            // drain attempts surface nothing, the remaining pending frames are
-            // gone — write them off so the stream moves again. A genuinely
-            // in-flight frame arrives within a couple of iterations, so the
-            // timeout only triggers on true drops.
+            // EOS is never reached either. If ~100 ms (after EOS) / ~2 s
+            // (before it) of drain attempts surface nothing, the remaining
+            // pending frames are gone — write them off so the stream moves
+            // again (`handoffWriteOffAfter`).
             if (!did_work) {
-                var stuck = false;
+                var bound: ?u32 = null;
                 {
                     lock(&st.mutex);
                     defer st.mutex.unlock();
-                    stuck = handoffStalled(st.eof_seen, st.ring_count, st.handoff.count);
+                    bound = handoffWriteOffAfter(st.eof_seen, st.ring_count, st.handoff.count);
                 }
-                if (stuck) {
+                if (bound) |limit| {
                     pending_dry += 1;
-                    if (pending_dry >= 50) { // ~100 ms of consecutive dry drains
+                    if (pending_dry >= limit) { // consecutive dry drains
                         lock(&st.mutex);
                         const lost = st.handoff.count;
                         st.handoff.writeOff();
@@ -1410,22 +1422,24 @@ test "Handoff: each pending frame keeps the colour it was released under (FIFO)"
     try testing.expectEqual(@as(?ColorSpace, null), h.pop());
 }
 
-test "handoffStalled: dropped frames that fill the cushion BEFORE EOS count toward the write-off" {
-    // Nothing pending: never stalled.
-    try testing.expect(!handoffStalled(true, 0, 0));
-    try testing.expect(!handoffStalled(false, 0, 0));
-    // After EOS any pending frame that never surfaces is a stall (as before).
-    try testing.expect(handoffStalled(true, 0, 1));
-    try testing.expect(handoffStalled(true, 2, 1));
+test "handoffWriteOffAfter: dropped frames that fill the cushion BEFORE EOS are written off, on a long bound" {
+    // Nothing pending: never a stall.
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(true, 0, 0));
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, 0, 0));
+    // After EOS any pending frame that never surfaces is a stall (~100 ms, as before).
+    try testing.expectEqual(@as(?u32, WRITE_OFF_AFTER_EOS), handoffWriteOffAfter(true, 0, 1));
+    try testing.expectEqual(@as(?u32, WRITE_OFF_AFTER_EOS), handoffWriteOffAfter(true, 2, 1));
     // Mechanism (Codex on #3): before EOS, a cushion filled by lost handoffs
-    // stops every output dequeue — EOS can never arrive, so this must count
-    // too (the old `eof_seen and pending > 0` gate never fired here).
-    try testing.expect(handoffStalled(false, 0, RING_SIZE));
-    try testing.expect(handoffStalled(false, 1, RING_SIZE - 1));
-    // Before EOS with cushion room left the worker still dequeues output:
-    // not (yet) a stall.
-    try testing.expect(!handoffStalled(false, 1, 1));
+    // stops every output dequeue — EOS can never arrive, so this is a stall
+    // too (the old `eof_seen and pending > 0` gate never fired here)…
+    try testing.expectEqual(@as(?u32, WRITE_OFF_BEFORE_EOS), handoffWriteOffAfter(false, 0, RING_SIZE));
+    try testing.expectEqual(@as(?u32, WRITE_OFF_BEFORE_EOS), handoffWriteOffAfter(false, 1, RING_SIZE - 1));
+    // …on a bound far longer than after EOS: late (not lost) frames
+    // during a startup GPU stall must not be written off (seen on-device).
+    try testing.expect(WRITE_OFF_BEFORE_EOS >= 10 * WRITE_OFF_AFTER_EOS);
+    // Before EOS with cushion room left the worker still dequeues output.
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, 1, 1));
     // A full RING is the render thread not consuming — never a stall.
-    try testing.expect(!handoffStalled(false, RING_SIZE, 0));
-    try testing.expect(!handoffStalled(true, RING_SIZE, 0));
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(false, RING_SIZE, 0));
+    try testing.expectEqual(@as(?u32, null), handoffWriteOffAfter(true, RING_SIZE, 0));
 }
