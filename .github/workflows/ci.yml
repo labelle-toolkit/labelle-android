@@ -3,7 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+  # PRs into `main` and into stacked feature bases (e.g. `feat/services-video`
+  # → `feat/services-aaudio`). NOTE: GitHub skips `pull_request` runs while a
+  # PR conflicts with its base (no merge ref) — the usual reason a stacked PR
+  # shows no CI after its base moves.
   pull_request:
+    branches: [main, 'feat/**']
 
 permissions:
   contents: read
@@ -22,8 +27,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # The intent allow-list / decision tests, the video `yuv`/`planes`
-      # helpers and the NDK-selection rule run on the host; no JNI or NDK needed.
+      # The intent allow-list / decision tests, the AAudio state machine, the
+      # video `yuv`/`planes`/decoder/audio-track helpers and the NDK-selection
+      # rule run on the host; no JNI or NDK needed.
       - name: Run unit tests
         run: zig build test --summary all
 
