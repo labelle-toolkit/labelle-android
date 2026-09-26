@@ -41,7 +41,7 @@ The Android compile-check compiles and links every AAudio entry point (`ensureSt
 
 ## CLI provider
 
-`plugin.labelle` declares the `android` provider for labelle-cli's provider contract ([CLI #405](https://github.com/labelle-toolkit/labelle-cli/issues/405)): namespace `android`, target `android`, `command_contract = ">=1.2.0 <1.3.0"`. Every command and hook runs one host executable, `bin/labelle-android` (`tools/main.zig`, built by `zig build install-provider`), which strictly decodes the context the CLI passes in `LABELLE_CONTEXT` (`tools/contract.zig`, vendored from the CLI with its fixtures) and dispatches on `(kind, id, step, phase)`. Any combination the manifest does not declare is refused. The CLI builds the tool with `zig build --system`, which disables dependency fetching, so `tools/` uses `std` only.
+`plugin.labelle` declares the `android` provider for labelle-cli's provider contract ([CLI #405](https://github.com/labelle-toolkit/labelle-cli/issues/405)): namespace `android`, target `android`, `command_contract = ">=1.2.0 <1.2.1"` (exactly the wire versions the vendored decoder accepts). Every command and hook runs one host executable, `bin/labelle-android` (`tools/main.zig`, built by `zig build install-provider`), which strictly decodes the context the CLI passes in `LABELLE_CONTEXT` (`tools/contract.zig`, vendored from the CLI with its fixtures) and dispatches on `(kind, id, step, phase)`. Any combination the manifest does not declare is refused. The CLI builds the tool with `zig build --system`, which disables dependency fetching, so `tools/` uses `std` only.
 
 | Command | What it does |
 |---|---|

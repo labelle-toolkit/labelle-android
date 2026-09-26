@@ -259,3 +259,22 @@ test "doctor: tools found on PATH when the SDK and JAVA_HOME lack them" {
     try std.testing.expectEqual(@as(usize, 0), summary.failures);
     try expectContains(out.written(), try fake.abs("bin"));
 }
+
+test "doctor: a symlinked build-tools revision is a candidate" {
+    // Creating symlinks needs extra privileges on Windows.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    // The real revision lives outside build-tools; build-tools/37.0.0 is a
+    // symlink to it (an SDK assembled as a symlink farm).
+    for ([_][]const u8{ "aapt", "zipalign" }) |name| try fake.tool("store/bt-37", name, .native_exe);
+    try fake.tool("store/bt-37", "apksigner", .script);
+    try fake.tmp.dir.symLink(std.testing.io, try fake.abs("store/bt-37"), "sdk/build-tools/37.0.0", .{ .is_directory = true });
+    const bt = (try sdk.findBuildTools(fake.arena.allocator(), std.testing.io, try fake.abs("sdk"))).?;
+    try std.testing.expectEqualStrings("37.0.0", bt.version);
+    // A dangling symlink with a higher version is skipped by the tool probes.
+    try fake.tmp.dir.symLink(std.testing.io, try fake.abs("store/missing"), "sdk/build-tools/99.0.0", .{ .is_directory = true });
+    const again = (try sdk.findBuildTools(fake.arena.allocator(), std.testing.io, try fake.abs("sdk"))).?;
+    try std.testing.expectEqualStrings("37.0.0", again.version);
+}

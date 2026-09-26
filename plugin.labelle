@@ -10,8 +10,9 @@
 //
 // Every command runs the one host tool `bin/labelle-android`
 // (`tools/main.zig`, built by `zig build install-provider`), which dispatches
-// on the invocation. `command_contract` is capped at the newest minor its
-// strict decoder (`tools/contract.zig`) understands.
+// on the invocation. `command_contract` admits exactly the wire versions its
+// strict decoder (`tools/contract.zig` `supported_versions`) accepts: a
+// future 1.2.x patch is not admitted until the decoder learns it.
 //
 // Commands (`labelle android <cmd>`) act on already-built output; building
 // happens through `labelle build|run|bundle --platform=android`, whose
@@ -25,7 +26,7 @@
 .{
     .name = "android",
     .manifest_version = 2,
-    .command_contract = ">=1.2.0 <1.3.0",
+    .command_contract = ">=1.2.0 <1.2.1",
     .namespace = "android",
     .targets = .{"android"},
     .commands = .{
