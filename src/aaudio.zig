@@ -50,11 +50,15 @@
 //! ## The "stream started" marker
 //! `AAudioStream_requestStart` only *accepts* the request: an `AAUDIO_OK`
 //! means the client state is STARTING, not that the device is running. The
-//! marker is emitted only after the stream's data callback has actually run —
-//! the audio server pulled a buffer, which happens only once the stream is
-//! STARTED — so it is never a false positive, and `ensureStarted` never waits
-//! for it (no `AAudioStream_waitForStateChange` anywhere: it blocked the game
-//! thread up to 250 ms on the legacy AudioTrack path).
+//! marker is emitted only after the stream's data callback has actually run,
+//! i.e. the audio server pulled its first buffer from the engine mixer: the
+//! device is driving the mixer, which is what the marker attests. Note it is
+//! NOT the client-state STARTED flip: on the SM-T505's legacy AudioTrack path
+//! the first pull is the track pre-fill, measured 1 ms after `requestStart`
+//! returned and ~150 ms BEFORE AAudio's own `setState 3 → 4` line (MMAP
+//! streams pull only once running). `ensureStarted` never waits for any of
+//! it (no `AAudioStream_waitForStateChange` anywhere: it blocked the game
+//! thread up to 250 ms on that legacy path).
 //!
 //! ## Threading
 //!   * `mutex` (an `Io.Mutex`) guards the stream handle and the per-stream
@@ -216,8 +220,9 @@ fn Device(comptime Api: type) type {
             if (mix_fn) |m| m(out[0..samples], 2) else @memset(out[0..samples], 0);
             _ = frames_mixed.fetchAdd(frames, .monotonic);
             if (!started_observed.load(.monotonic)) {
-                // The server pulled a buffer: the stream is running. Only the
-                // run that flips the flag wakes the control thread.
+                // The server pulled its first buffer (the mixer is being
+                // driven). Only the run that flips the flag wakes the control
+                // thread.
                 if (started_observed.cmpxchgStrong(false, true, .release, .monotonic) == null) wake();
             }
             return AAUDIO_CALLBACK_RESULT_CONTINUE;
