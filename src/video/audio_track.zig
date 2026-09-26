@@ -150,6 +150,18 @@ fn afterOutputBuffer(release_status: i32, eos: bool, cap_full: bool) OutputStep 
 /// value that is not one of the three `AMEDIACODEC_INFO_*` constants is a
 /// real codec error (`AMEDIA_ERROR_*` are ≤ -10000): the codec will never
 /// produce EOS after one, so the drive loop must fail instead of polling on.
+/// What the drive loop does when the decode deadline passes (pure;
+/// host-tested). A track with a negative start offset spends decode time on
+/// PCM the trim discards — however long the lead, only decode time, never
+/// memory — so a pathological pre-roll (an hour before media time 0) may
+/// outlast the deadline: it FINISHES with whatever was kept after time 0
+/// (`finish` → `NoAudioTrack` when the trim never completed). Any other
+/// overrun is a codec that never reached EOS: it FAILS as before.
+const DeadlineStep = enum { finish, fail };
+fn afterDeadline(acc: *const PcmAccumulator) DeadlineStep {
+    return if (acc.lead < 0) .finish else .fail;
+}
+
 fn classifyDequeue(r: isize) DequeueResult {
     if (r >= 0) return .buffer;
     return switch (r) {
@@ -277,7 +289,6 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
             if (acc.lead >= 0) "padding" else "skipping",
             @abs(acc.lead),
         });
-        if (acc.trimmed_all) std.log.warn("video: audio start offset trims more than the 5 min cap — no audio", .{});
     }
     var input_done = false;
     var input_queue: InputQueue = .{};
@@ -286,10 +297,20 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
     // output surfaced within this poll: the decoder still owes the delayed tail
     // of the track (and a short or slow-to-start decode owes all of it).
     while (true) {
-        if (X.monotonicNs() - t_start > DECODE_DEADLINE_NS) {
-            std.log.err("video: audio decode overran {d} s without output EOS — giving up", .{@divTrunc(DECODE_DEADLINE_NS, std.time.ns_per_s)});
-            return error.DecodeFailed;
-        }
+        if (X.monotonicNs() - t_start > DECODE_DEADLINE_NS) switch (afterDeadline(&acc)) {
+            // A long pre-roll (negative start offset) is decoded and
+            // discarded before anything is kept: an hour-long lead can
+            // outlast the deadline. Give up with what was kept after media
+            // time 0 (`NoAudioTrack` if the trim never finished).
+            .finish => {
+                std.log.warn("video: audio decode overran {d} s while skipping a {d}-frame pre-roll — keeping what was decoded", .{ @divTrunc(DECODE_DEADLINE_NS, std.time.ns_per_s), @abs(acc.lead) });
+                break;
+            },
+            .fail => {
+                std.log.err("video: audio decode overran {d} s without output EOS — giving up", .{@divTrunc(DECODE_DEADLINE_NS, std.time.ns_per_s)});
+                return error.DecodeFailed;
+            },
+        };
         if (!input_done) {
             const in_idx = X.AMediaCodec_dequeueInputBuffer(codec, POLL_US);
             if (in_idx >= 0) {
@@ -408,15 +429,17 @@ fn outFrames48k(in_frames: u64, src_rate: u32, max_frames: usize) usize {
 /// `in_frames` source frames at `src_rate` as 48 kHz frames, rounded down,
 /// in u64 (see `outFrames48k`).
 fn out48k(in_frames: u64, src_rate: u32) u64 {
-    return (in_frames * OUT_RATE) / @max(src_rate, 1);
+    return (in_frames *| OUT_RATE) / @max(src_rate, 1);
 }
 
 /// Source frames at `src_rate` that resample to `out_frames` at 48 kHz —
 /// rounded UP so the last output frame has its source sample. u64 throughout:
 /// the 5-min cap plus a 5-min trim at a high rate (`2 · MAX_FRAMES ·
-/// 192 kHz` ≈ 5.5e12) is far past u32.
+/// 192 kHz` ≈ 5.5e12) is far past u32. Saturating: the trim is uncapped (a
+/// metadata start time near `minInt(i64)` µs is ~4.4e17 frames), and a
+/// saturated count only means "more than will ever be decoded".
 fn srcFramesCeil(out_frames: u64, src_rate: u32) u64 {
-    return (out_frames * @max(src_rate, 1) + OUT_RATE - 1) / OUT_RATE;
+    return ((out_frames *| @max(src_rate, 1)) +| (OUT_RATE - 1)) / OUT_RATE;
 }
 
 /// Source frames at `src_rate` the first `out_frames` 48 kHz output frames
@@ -424,7 +447,7 @@ fn srcFramesCeil(out_frames: u64, src_rate: u32) u64 {
 /// interpolates from source frame `srcFramesFloor(out_frames)`, so only the
 /// frames before it can be discarded. u64 like `srcFramesCeil`.
 fn srcFramesFloor(out_frames: u64, src_rate: u32) u64 {
-    return (out_frames * @max(src_rate, 1)) / OUT_RATE;
+    return (out_frames *| @max(src_rate, 1)) / OUT_RATE;
 }
 
 /// Signed 48 kHz output-frame lead for an audio track whose first sample is
@@ -454,8 +477,10 @@ fn leadFrames(first_us: i64) i64 {
 /// still fills the advertised 5 min instead of stopping early. Padded
 /// silence counts against the cap. Trimmed frames are decoded but NEVER
 /// retained: `push` discards them as they arrive, so the retained PCM stays
-/// within the cap however long the trim; a trim longer than the cap itself
-/// is treated as trimming the whole track (`trimmed_all` → `NoAudioTrack`).
+/// within the cap however long the trim. The cap bounds KEPT output only, so
+/// the trim itself is uncapped: a track starting 301 s early that runs 10 min
+/// still keeps the audio after media time 0. A very long lead costs decode
+/// time, which the drive loop's deadline bounds (`afterDeadline`).
 const PcmAccumulator = struct {
     /// A closed segment's retained samples `raw[start..end]` (source frame
     /// `src_off` onward) and the output frames it contributes: frames
@@ -485,26 +510,19 @@ const PcmAccumulator = struct {
     lead: i64 = 0,
     /// Output frames still to trim at the open segment's start.
     skip_left: u64 = 0,
-    /// The lead trims more than the whole cap: nothing is kept.
-    trimmed_all: bool = false,
 
     fn init(rate: u32, ch: u32) PcmAccumulator {
         return .{ .rate = @max(rate, 1), .ch = @max(ch, 1) };
     }
 
     /// The audio track's first presentation time on the media (= video)
-    /// timeline. Set before the first `push` (and after `max_frames`). A
-    /// trim longer than the cap duration marks the track fully trimmed: its
-    /// head would be dropped past everything the cap keeps anyway, and
-    /// accepting it would only spend decode time on discarded PCM.
+    /// timeline. Set before the first `push` (and after `max_frames`). The
+    /// trim is NOT bounded by the cap (which bounds kept output, not how much
+    /// pre-zero audio may be discarded): trimmed PCM is discarded as it
+    /// arrives, so any lead costs decode time only.
     fn setStartOffsetUs(self: *PcmAccumulator, first_us: i64) void {
         self.lead = leadFrames(first_us);
-        self.skip_left = 0;
-        self.trimmed_all = false;
-        if (self.lead < 0) {
-            const s: u64 = @abs(self.lead);
-            if (s > self.max_frames) self.trimmed_all = true else self.skip_left = s;
-        }
+        self.skip_left = if (self.lead < 0) @abs(self.lead) else 0;
     }
 
     /// Silence frames `finish` prepends (never more than the whole cap).
@@ -513,16 +531,14 @@ const PcmAccumulator = struct {
         return @intCast(@min(@as(u64, @intCast(self.lead)), @as(u64, self.max_frames)));
     }
 
-    /// Decoded frames the lead drops from the head (0 once `trimmed_all`:
-    /// nothing is decoded at all).
-    fn skipFrames(self: *const PcmAccumulator) usize {
-        if (self.lead >= 0 or self.trimmed_all) return 0;
-        return @intCast(@abs(self.lead)); // ≤ max_frames
+    /// Decoded 48 kHz frames the lead drops from the head (uncapped, u64).
+    fn skipFrames(self: *const PcmAccumulator) u64 {
+        if (self.lead >= 0) return 0;
+        return @abs(self.lead);
     }
 
     /// KEPT output frames that fit: the cap less the padded silence.
     fn budget(self: *const PcmAccumulator) usize {
-        if (self.trimmed_all) return 0;
         return self.max_frames - self.padFrames();
     }
 
@@ -542,7 +558,7 @@ const PcmAccumulator = struct {
     fn rawRoom(self: *const PcmAccumulator) usize {
         const out_left: u64 = self.budget() -| self.closed_out;
         if (out_left == 0) return 0;
-        const seg_cap = srcFramesCeil(self.skip_left + out_left, self.rate) * self.ch;
+        const seg_cap = srcFramesCeil(self.skip_left +| out_left, self.rate) *| self.ch;
         return @intCast(@min(seg_cap -| self.seg_in, std.math.maxInt(usize)));
     }
 
@@ -892,8 +908,8 @@ test "sample-count helpers: the 32-bit-overflowing products are formed in u64" {
     try testing.expectEqual(@as(u64, 28_800_000), out48k(115_200_000, 192_000));
     // `trimTarget` at the same sizes (8 ch, 192 kHz, a whole-cap trim).
     var acc = PcmAccumulator.init(192_000, 8);
-    acc.setStartOffsetUs(-300_000_000); // exactly the cap: accepted
-    try testing.expect(!acc.trimmed_all);
+    acc.setStartOffsetUs(-300_000_000); // a whole-cap trim
+    try testing.expectEqual(@as(u64, MAX_FRAMES), acc.skip_left);
     try testing.expectEqual(@as(u64, 57_600_000 * 8), acc.trimTarget(115_200_000 * 8));
     // `rawRoom` saturates to usize instead of overflowing on 32-bit targets.
     const room: u64 = acc.rawRoom();
@@ -1247,7 +1263,7 @@ test "start offset > 0: a track that starts late is padded with silence up to it
     defer acc.deinit(a);
     acc.setStartOffsetUs(10_000); // first audio sample at 10 ms
     try testing.expectEqual(@as(usize, 480), acc.padFrames());
-    try testing.expectEqual(@as(usize, 0), acc.skipFrames());
+    try testing.expectEqual(@as(u64, 0), acc.skipFrames());
     const bytes = try rampBytes(a, 1000);
     defer a.free(bytes);
     try acc.push(a, bytes);
@@ -1267,7 +1283,7 @@ test "start offset < 0: a track that starts early has its head skipped (resample
     defer acc.deinit(a);
     acc.setStartOffsetUs(-3_125); // 150 frames before media time 0
     try testing.expectEqual(@as(usize, 0), acc.padFrames());
-    try testing.expectEqual(@as(usize, 150), acc.skipFrames());
+    try testing.expectEqual(@as(u64, 150), acc.skipFrames());
     // Segment A: 100 stereo frames @ 48 kHz — skipped whole.
     const seg_a = try rampBytes(a, 100);
     defer a.free(seg_a);
@@ -1322,27 +1338,112 @@ test "start offset: padding counts against the cap, skipped frames do not; all-s
     }
 }
 
-test "start offset: a one-hour negative lead is fully trimmed — nothing retained, full at once, NoAudioTrack" {
+test "start offset: a lead past the cap still keeps the audio after time 0 (−301 s start, 10-min track, scaled)" {
+    // Codex #9 round 2: a lead longer than the cap used to mark the track
+    // wholly trimmed (`rawRoom` 0 → `NoAudioTrack`). Scaled ×1/1000 via
+    // `max_frames`: a 300 ms cap, a track starting 301 ms early.
+    const a = testing.allocator;
+    const cap: usize = 300 * 48; // 14 400 frames
+    const lead: u64 = 301 * 48; // 14 448 frames before media time 0
+    // Long enough that a full cap's worth follows time 0.
+    const track = try rampBytes(a, 30_000); // ramp: frame i = i + 1
+    defer a.free(track);
+    {
+        var acc = PcmAccumulator.init(48_000, 2);
+        defer acc.deinit(a);
+        acc.max_frames = cap;
+        acc.setStartOffsetUs(-301_000);
+        try testing.expectEqual(lead, acc.skip_left);
+        try testing.expect(!acc.full()); // mechanism: decoding continues
+        var off: usize = 0;
+        while (!acc.full() and off < track.len) : (off += 997 * 4) {
+            try acc.push(a, track[off..@min(off + 997 * 4, track.len)]);
+            // Retained PCM stays within the cap (+ the one-frame look-behind).
+            try testing.expect(acc.raw.items.len <= (cap + 1) * 2);
+        }
+        try testing.expect(acc.full()); // the cap, not the track end, stopped it
+        var pcm = try acc.finish(a);
+        defer pcm.deinit(a);
+        try testing.expectEqual(@as(u32, cap), pcm.frames); // exactly the cap
+        // Output frame 0 is media time 0 = source frame 14 448 (value 14 449).
+        try testing.expectEqual(@as(i16, lead + 1), pcm.samples[0]);
+        try testing.expectEqual(@as(i16, lead + cap), pcm.samples[(cap - 1) * 2]);
+    }
+    {
+        // The literal 10-min shape (600 ms here): 299 ms follow time 0, all kept.
+        var acc = PcmAccumulator.init(48_000, 2);
+        defer acc.deinit(a);
+        acc.max_frames = cap;
+        acc.setStartOffsetUs(-301_000);
+        try acc.push(a, track[0 .. 600 * 48 * 4]);
+        try testing.expect(!acc.full());
+        var pcm = try acc.finish(a);
+        defer pcm.deinit(a);
+        try testing.expectEqual(@as(u32, 299 * 48), pcm.frames);
+        try testing.expectEqual(@as(i16, lead + 1), pcm.samples[0]);
+    }
+    // Production cap: a −301 s lead is accepted, not wholly trimmed.
+    var prod = PcmAccumulator.init(48_000, 2);
+    prod.setStartOffsetUs(-301_000_000);
+    try testing.expectEqual(@as(u64, 301 * 48_000), prod.skipFrames());
+    try testing.expect(!prod.full());
+}
+
+test "start offset: a one-hour lead retains nothing while trimming; the deadline ends it (NoAudioTrack)" {
     const a = testing.allocator;
     var acc = PcmAccumulator.init(48_000, 2);
     defer acc.deinit(a);
     acc.setStartOffsetUs(-3_600_000_000); // production cap (5 min) < 1 h
-    try testing.expect(acc.trimmed_all);
-    // Before the fix the budget grew by the whole hour (~691 MB of raw PCM).
-    try testing.expectEqual(@as(usize, 0), acc.rawRoom());
-    try testing.expect(acc.full()); // the drive loop finishes on the first buffer
+    try testing.expectEqual(@as(u64, 3600 * 48_000), acc.skip_left);
+    // The trim is no longer cut off: the decode keeps going…
+    try testing.expect(!acc.full());
     const bytes = try rampBytes(a, 4096);
     defer a.free(bytes);
-    for (0..50) |_| {
+    for (0..200) |_| {
         try acc.push(a, bytes);
-        try testing.expectEqual(@as(usize, 0), acc.raw.items.len);
+        // …but retains only the resampler's one-frame look-behind (before
+        // round 1 the hour of trimmed PCM, ~691 MB, was held).
+        try testing.expect(acc.raw.items.len <= 2);
     }
+    try testing.expect(!acc.full());
+    // The 30 s deadline passes mid-trim: the drive loop FINISHES (does not
+    // fail) with what was kept after time 0 — nothing — so NoAudioTrack.
+    try testing.expectEqual(DeadlineStep.finish, afterDeadline(&acc));
     try testing.expectError(error.NoAudioTrack, acc.finish(a));
-    // Exactly the cap is still accepted (the boundary is inclusive).
-    var at_cap = PcmAccumulator.init(48_000, 2);
-    at_cap.setStartOffsetUs(-300_000_000);
-    try testing.expect(!at_cap.trimmed_all);
-    try testing.expectEqual(MAX_FRAMES, at_cap.skipFrames());
+}
+
+test "afterDeadline: a trimming decode finishes with what was kept; any other overrun fails" {
+    const a = testing.allocator;
+    // No start offset / a late start: an overrun is a stuck codec.
+    var none = PcmAccumulator.init(48_000, 2);
+    try testing.expectEqual(DeadlineStep.fail, afterDeadline(&none));
+    var late = PcmAccumulator.init(48_000, 2);
+    late.setStartOffsetUs(10_000);
+    try testing.expectEqual(DeadlineStep.fail, afterDeadline(&late));
+    // A negative lead whose trim completed before the deadline: the kept
+    // audio after time 0 survives.
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.setStartOffsetUs(-3_125); // 150 frames
+    const bytes = try rampBytes(a, 400);
+    defer a.free(bytes);
+    try acc.push(a, bytes);
+    try testing.expectEqual(DeadlineStep.finish, afterDeadline(&acc));
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 250), pcm.frames);
+    try testing.expectEqual(@as(i16, 151), pcm.samples[0]);
+}
+
+test "sample-count helpers saturate on an extreme (metadata) lead instead of overflowing u64" {
+    var acc = PcmAccumulator.init(192_000, 8);
+    acc.setStartOffsetUs(std.math.minInt(i64));
+    try testing.expect(acc.skip_left > std.math.maxInt(u64) / 192_000);
+    // srcFramesCeil saturated (maxInt(u64) / 48 000 frames), then clamped
+    // to usize on 32-bit targets.
+    const room: u64 = acc.rawRoom();
+    try testing.expectEqual(@min(@as(u64, std.math.maxInt(u64) / 48_000 * 8), @as(u64, std.math.maxInt(usize))), room);
+    try testing.expect(!acc.full());
 }
 
 test "start offset: a trim as long as the cap never retains more than the cap while pushing" {
@@ -1351,7 +1452,6 @@ test "start offset: a trim as long as the cap never retains more than the cap wh
     defer acc.deinit(a);
     acc.max_frames = 4800; // 100 ms
     acc.setStartOffsetUs(-100_000); // 4800 frames: the whole cap, trimmed
-    try testing.expect(!acc.trimmed_all);
     const limit = (srcFramesCeil(acc.max_frames, 44_100) + 1) * 2; // cap-derived, samples
     const buf = try rampBytes(a, 997); // odd size: pushes straddle every boundary
     defer a.free(buf);
