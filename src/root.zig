@@ -9,6 +9,8 @@
 //!     (labelle-assembler#737; gates the knob file and the screenshot extras.)
 //!   * `relayout` — force a stuck 1x1 restored window to relayout
 //!     (labelle-bgfx#127).
+//!   * `aaudio` — the AAudio output device (labelle-bgfx#306): the
+//!     `labelle-audio` `DeviceSink` a backend's mixer drives on Android.
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
@@ -23,6 +25,7 @@ pub const intent_env = @import("intent_env.zig");
 pub const launch_intent = @import("launch_intent.zig");
 pub const debuggable = @import("debuggable.zig");
 pub const relayout = @import("relayout.zig");
+pub const aaudio = @import("aaudio.zig");
 
 test {
     // Explicit refs: a lazily-referenced file's tests are otherwise never
@@ -31,4 +34,5 @@ test {
     _ = launch_intent;
     _ = debuggable;
     _ = relayout;
+    _ = aaudio;
 }

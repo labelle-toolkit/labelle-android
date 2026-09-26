@@ -103,7 +103,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         // libc `setenv`/`getenv` + the JNI C below. Off Android nothing in the
-        // module references libc.
+        // module references libc (nor the AAudio externs: `aaudio.zig`'s
+        // `ensureStarted`/`stop` are only reachable from an Android consumer).
         .link_libc = is_android,
     });
     if (is_android) {
@@ -119,6 +120,10 @@ pub fn build(b: *std.Build) void {
         });
         mod.linkSystemLibrary("android", .{});
         mod.linkSystemLibrary("log", .{});
+        // `aaudio.zig` (the AAudio output device, phase 1c) is pure `extern fn`
+        // against libaaudio (API 26+); the link propagates to any consumer
+        // module that imports `labelle_android`.
+        mod.linkSystemLibrary("aaudio", .{});
     }
 
     const test_step = b.step("test", "Run labelle-android unit tests");
