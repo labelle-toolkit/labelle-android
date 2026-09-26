@@ -1,19 +1,28 @@
-// labelle-android package manifest. Runtime services only: no commands, no
-// hooks, no convention directories yet.
+// labelle-android package manifest (manifest v2, labelle-cli provider
+// contract): runtime services plus the `android` provider (labelle-cli#405).
 //
 // `.name = "android"` because the assembler derives a plugin's module alias
 // as `labelle_<name>` (labelle-assembler `deps_linker.zig` /
 // `build_files/build_zig.zig`), and this package's one module is
 // `labelle_android` — the same name its `build.zig.zon` declares, so no
-// `b.modules.put` alias is needed. Short plugin names are the convention
-// (`fsm`, `spine`, `pathfinder`); the repo name stays `labelle-android`.
+// `b.modules.put` alias is needed. The CLI also requires the `.plugins` entry,
+// the registry package and `.provider_config .package` to use this name.
 //
-// `manifest_version = 1`: the shipping labelle-cli parses only v1 (anything
-// higher is error E5 "upgrade labelle-cli"). The `android` command namespace
-// (labelle-cli#406) is reserved for this package and will be declared here
-// once the package-manifest contract (labelle-cli#411) lands.
+// Every command runs the one host tool `bin/labelle-android`
+// (`tools/main.zig`, built by `zig build install-provider`), which dispatches
+// on the invocation. `command_contract` is capped at the newest minor its
+// strict decoder (`tools/contract.zig`) understands.
+//
+// This is the provider skeleton: `doctor` only. The packaging hooks
+// (`package` after build, `deploy` replacing run, `bundle` replacing bundle)
+// and the `run`/`deploy` commands arrive with their implementation.
 .{
     .name = "android",
-    .manifest_version = 1,
-    .convention_dirs = .{},
+    .manifest_version = 2,
+    .command_contract = ">=1.2.0 <1.3.0",
+    .namespace = "android",
+    .targets = .{"android"},
+    .commands = .{
+        .{ .name = "doctor", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Check the Android SDK/NDK/JDK", .needs_project = false },
+    },
 }

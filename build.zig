@@ -187,6 +187,27 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(build_tests).step);
 
+    // ── Provider host tool (labelle-cli#405) ──────────────────────────────
+    // `bin/labelle-android`, the one executable every command/hook in
+    // `plugin.labelle` names. The CLI builds it with `zig build --system
+    // <cache> install-provider`, which disables dependency fetching, so it
+    // must stay dependency-free (std only). Always built for the host,
+    // whatever `-Dtarget` says.
+    const provider_module = b.createModule(.{
+        .root_source_file = b.path("tools/main.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    // `tools/main.zig`'s test checks its routing table against the manifest.
+    provider_module.addAnonymousImport("plugin.labelle", .{ .root_source_file = b.path("plugin.labelle") });
+    const provider = b.addExecutable(.{ .name = "labelle-android", .root_module = provider_module });
+    b.step("install-provider", "Install the labelle-cli provider tool (bin/labelle-android)")
+        .dependOn(&b.addInstallArtifact(provider, .{}).step);
+    const provider_tests = b.addRunArtifact(b.addTest(.{ .root_module = provider_module }));
+    b.step("test-provider", "Run the provider host-tool tests (wire contract, settings, doctor)")
+        .dependOn(&provider_tests.step);
+    test_step.dependOn(&provider_tests.step);
+
     // Android compile-check (object emission, as labelle-bgfx's
     // `android_app_tests` does): proves the JNI C and the `extern "c"`
     // bindings compile against the NDK. Depends on the compile step, never a

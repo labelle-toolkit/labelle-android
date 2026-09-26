@@ -10,5 +10,6 @@
         "plugin.labelle",
         "README.md",
         "src",
+        "tools",
     },
 }

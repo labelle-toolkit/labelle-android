@@ -11,8 +11,9 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -22,9 +23,18 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: zig fmt --check
+        run: zig fmt --check .
+      # The provider host tool (labelle-cli#405): the vendored wire decoder
+      # and its fixtures, the providers/android.json schema, the invocation
+      # matrix and doctor against a fake ANDROID_HOME. Windows included: the
+      # tool names SDK tools `.exe`/`.bat` there.
+      - name: Build and test the provider tool
+        run: zig build install-provider test-provider --summary all
       # The intent allow-list / decision tests, the video `yuv`/`planes`
       # helpers and the NDK-selection rule run on the host; no JNI or NDK needed.
       - name: Run unit tests
+        if: runner.os != 'Windows'
         run: zig build test --summary all
 
   android-compile-check:
@@ -67,3 +77,37 @@ jobs:
             echo "atomics errors leaked past the unsupported-ABI guard"
             exit 1
           fi
+
+  # The provider through the real labelle-cli: discovery from a fixture
+  # project's `local:` pin, the `zig build --system install-provider` build,
+  # the contract 1.2.0 context and `labelle android doctor` / `labelle help`.
+  provider:
+    name: Provider dispatch (real labelle-cli)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # labelle-cli PR #440 (contract 1.2.0), head of `feat/contract-1.2.0`.
+      # Move the pin to `development` once #440 and #405 PR 3 merge.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-cli
+          ref: cc2fce95cc26303a0e95267488570cc3b0f4ab96
+          path: .test-cli
+          persist-credentials: false
+      # Until #405 PR 3, the CLI reserves the `android` namespace for its
+      # legacy subcommand; this makes exactly those two edits (see the script).
+      - name: Unreserve the android namespace in the pinned CLI
+        run: tests/provider/unreserve-android.sh .test-cli
+      - run: zig build
+        working-directory: .test-cli
+      - name: Exercise discovery, build and dispatch
+        run: python3 tests/provider/e2e.py --cli .test-cli/zig-out/bin/labelle --zig "$(command -v zig)"
