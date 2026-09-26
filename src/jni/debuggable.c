@@ -13,6 +13,7 @@
 // JNI vtables. Off Android this is an empty TU.
 #ifdef __ANDROID__
 
+#include <android/log.h>
 #include <android/native_activity.h>
 #include <jni.h>
 #include <stddef.h>
@@ -63,7 +64,10 @@ int labelle_android_app_is_debuggable(const void *activity_ptr) {
         }
         (*env)->PopLocalFrame(env, NULL);
     } else if ((*env)->ExceptionCheck(env)) {
+        // PushLocalFrame failed (OutOfMemoryError pending): clear it so the
+        // caller's thread is not poisoned; fail closed (`debuggable` stays 0).
         (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_WARN, "labelle-android", "debuggable: PushLocalFrame failed; exception cleared, answering not-debuggable");
     }
 
     if (we_attached) (*vm)->DetachCurrentThread(vm);

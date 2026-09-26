@@ -17,6 +17,7 @@
 // vtables. Off Android this is an empty TU.
 #ifdef __ANDROID__
 
+#include <android/log.h>
 #include <android/native_activity.h>
 #include <jni.h>
 #include <stddef.h>
@@ -53,6 +54,12 @@ int labelle_android_force_window_relayout(const void *activity_ptr) {
             ok = 0;
         }
         (*env)->PopLocalFrame(env, NULL);
+    } else if ((*env)->ExceptionCheck(env)) {
+        // PushLocalFrame failed (OutOfMemoryError pending). This is the UI
+        // thread: a pending exception left here would poison its next JNI
+        // call, so clear it like every other failure above.
+        (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_WARN, "labelle-android", "window relayout: PushLocalFrame failed; exception cleared, relayout not requested");
     }
     return ok;
 }
