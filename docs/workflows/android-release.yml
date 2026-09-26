@@ -1,0 +1,147 @@
+# Reference GitHub Actions workflow for a labelle game that ships Android
+# through the `android` provider (labelle-android).
+#
+# Copy this file into your game repository as
+# `.github/workflows/android-release.yml`. On every `v*` tag push it:
+#
+#   1. installs Zig, a JDK and the Android SDK / NDK / build-tools;
+#   2. installs the labelle CLI;
+#   3. restores the release keystore from repository secrets;
+#   4. runs `labelle bundle --platform=android --optimize=ReleaseFast
+#      --build-number=<run number>`: the core build produces `libgame.so`
+#      and the provider's `bundle` hook packages the signed release APK
+#      (`versionCode` = the build number) into `zig-out/bundle/android/`;
+#   5. runs `labelle android deploy --tag <tag>`, which publishes that APK as
+#      a GitHub Release, so Obtainium (https://github.com/ImranR98/Obtainium)
+#      picks it up.
+#
+# ── Project setup ───────────────────────────────────────────────────
+#
+# project.labelle pins the provider and names its settings file:
+#
+#   .plugins = .{ .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "<version>" } },
+#   .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
+#
+# providers/android.json names the keystore and WHERE its passwords come
+# from. The passwords themselves never appear in the repository, the
+# workflow's command lines or the logs: apksigner reads them from the
+# environment variables below (a `pass:` literal is rejected).
+#
+#   {
+#     "schema_version": 1,
+#     "package_name": "com.studio.game",
+#     "version_name": "1.4",
+#     "signing": {
+#       "keystore": "release.jks",
+#       "store_password": "env:ANDROID_KEYSTORE_PASS",
+#       "key_alias": "labelle-release",
+#       "key_password": "env:ANDROID_KEY_PASS"
+#     },
+#     "deploy": { "repo": "studio/game", "channel": "stable" }
+#   }
+#
+# `release.jks` is restored from a secret at build time; keep it out of git
+# (add it to .gitignore).
+#
+# ── Required repository secrets ────────────────────────────────────
+#
+#   ANDROID_KEYSTORE_BASE64   single-line base64 of the JKS/PKCS12 keystore.
+#                             macOS:  base64 -i release.jks | tr -d '\n' | pbcopy
+#                             Linux:  base64 -w0 release.jks | xclip -selection clipboard
+#   ANDROID_KEYSTORE_PASS     password for the keystore
+#   ANDROID_KEY_PASS          password for the key (often the same)
+#
+# Generate a keystore once with:
+#   keytool -genkey -v -keystore release.jks -alias labelle-release \
+#     -keyalg RSA -keysize 2048 -validity 10000
+#
+# ── Things you may want to change ──────────────────────────────────
+#
+#   - `ZIG_VERSION`: the `.zig_version` your project.labelle declares.
+#   - The CLI: the installer always installs the latest release. Android
+#     through the provider needs labelle-cli 2.0.0 or newer (the release
+#     that removed the CLI's built-in Android packager).
+#   - The build number: `github.run_number` grows with every run of this
+#     workflow, which is what Android's `versionCode` needs (it must
+#     increase with every release a device installs over).
+
+name: Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # `labelle android deploy` creates the GitHub Release
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out game repository
+        uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Set up JDK (jar, keytool, apksigner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, build-tools and NDK
+        run: |
+          sdkmanager --install \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;27.2.12479018"
+          # setup-android exports ANDROID_SDK_ROOT; the provider reads either.
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Install the labelle CLI
+        run: |
+          curl -fsSL https://labelle.games/install.sh | bash
+          # The installer edits ~/.bashrc, which later steps do not source.
+          echo "$HOME/.labelle/bin" >> "$GITHUB_PATH"
+
+      - name: Show the labelle CLI version
+        run: labelle version
+
+      - name: Check the Android toolchain
+        run: labelle android doctor
+
+      - name: Restore release keystore
+        # Read through `env:` + `printf`, never `${{ secrets.* }}` inside the
+        # script, so a shell metacharacter in the blob cannot break it.
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: printf '%s' "$KEYSTORE_B64" | base64 --decode > release.jks
+
+      - name: Bundle the signed release APK
+        env:
+          # Named by providers/android.json (`env:ANDROID_KEYSTORE_PASS`, ...);
+          # apksigner reads them, nothing else does.
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: labelle bundle --platform=android --optimize=ReleaseFast --build-number=${{ github.run_number }}
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: labelle android deploy --tag "${GITHUB_REF_NAME}"
+
+      - name: Keep the unstripped library for crash symbolication
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-symbols-${{ github.ref_name }}
+          path: .labelle/*_android/zig-out/bundle/android/*-symbols/

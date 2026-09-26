@@ -16,7 +16,7 @@ Android platform package for the Labelle toolkit.
 
 Every JNI service takes the running `ANativeActivity*` as an opaque pointer; the JNI walks (`src/jni/*.c`) read `->vm` / `->clazz` through the NDK's own header, so both backends pass what they already hold. `aaudio` declares its `MixCallback` structurally (`*const fn (out: []i16, channels: u8) void`) so the package has no dependency on labelle-audio; the consumer asserts equality at comptime. `build.zig` also exports `addAndroidSysroot` / `resolveNdk` / `nativeAppGlueDir` / `isAndroidTarget` for consumers' build scripts.
 
-Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b, 1c and 1d). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging and asset access are still not implemented (the provider below ships `doctor` only so far); runtime acceptance is on-device (SM-T505), not cross-compilation alone.
+Consumers: labelle-bgfx (from the PRs that land #149 phase 1a/1b, 1c and 1d). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. APK packaging moved here from the CLI (the provider below); APK asset access is still not implemented. Runtime acceptance is on-device (SM-T505), not cross-compilation alone.
 
 ### Naming
 
@@ -33,7 +33,7 @@ zig build test -Dtarget=aarch64-linux-android --summary all   # Android compile-
 **Supported ABIs: 64-bit only** — `arm64-v8a` (`aarch64-linux-android`) and `x86_64` (`x86_64-linux-android`, emulator). 32-bit `armeabi-v7a` (`arm-linux-androideabi`) and `x86` (`i686`) are not supported: the labelle CLI builds and packages only `arm64-v8a` / `x86_64` (`AbiArch`, `--all-abis`), the bgfx/sokol backends accept only `-Dandroid_arch=arm64|x86_64`, and shipped APKs carry only `lib/arm64-v8a`. A 32-bit Android target fails the build with a clear "supports 64-bit Android only" message (`build.zig` for this package's own steps, a `@compileError` in `src/root.zig` for consumers) rather than the 64-bit-atomics errors `aaudio` would otherwise raise ([#10](https://github.com/labelle-toolkit/labelle-android/issues/10)); CI asserts that failure mode.
 
 ```bash
-zig build test-provider --summary all       # provider host tool: wire decoder + vendored fixtures, settings schema, invocation matrix, doctor against a fake ANDROID_HOME
+zig build test-provider --summary all       # provider host tool: wire decoder + fixtures, settings, invocation matrix, doctor, packager (manifest, strip/assets/size report, icon, signing), adb launch args
 zig build install-provider                  # zig-out/bin/labelle-android
 ```
 
@@ -46,10 +46,37 @@ The Android compile-check compiles and links every AAudio entry point (`ensureSt
 | Command | What it does |
 |---|---|
 | `labelle android doctor` | Checks the Android SDK (adb, build-tools `aapt`/`zipalign`/`apksigner`, `android.jar` for the configured target SDK), the NDK (sysroot, `llvm-strip`) and the JDK (`jar`, `keytool`). Exits non-zero when a required tool is missing. |
+| `labelle android run [--device <serial>] [--apk <path>]` | Installs and launches the APK the last `labelle build --platform=android` packaged (checked against the `libgame.so` it was packaged from), on `--device` or adb's default (`ANDROID_SERIAL`). Builds nothing. |
+| `labelle android deploy --tag <tag> [--channel <c>] [--notes-file <f>] [--apk <path>]` | Publishes the APK `labelle bundle --platform=android` produced as a GitHub Release (`gh release create`, `--repo` from `deploy.repo`; a non-`stable` channel is a pre-release). Builds nothing. See [`docs/workflows/android-release.yml`](docs/workflows/android-release.yml). |
 
-**Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase). The packaging hooks (`package` after `build`, `deploy` replacing `run`, `bundle` replacing `bundle`) and the `run`/`deploy` commands arrive in the next release; until then `labelle bundle --platform=android` reports that no provider replaces the bundle step.
+| Hook | When | What it does |
+|---|---|---|
+| `package` | after `build` (target `android`) | Packages `zig-out/apk/game.apk` from the core build's `libgame.so`, so `labelle build --platform=android` yields an installable APK. |
+| `deploy` | replaces `run` | Installs that APK (`adb install -r`) and launches it with `am start -S -n <package>/android.app.NativeActivity`, turning the run options (`--scene`, `--profile`, `--screenshot`, `--after`) into `--es LABELLE_*` launch extras. Returns once `am start` does; the arguments after `--` and `--timeout` do not apply on a device. |
+| `bundle` | replaces `bundle` | Packages the release APK into the bundle output directory (`zig-out/bundle/android/`, or `--output`): `<package_name>-<version_name>.apk`, with `versionCode` = `--build-number` (default 1), its size report and the unstripped library. |
 
-Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440), on `development`) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). CI drives the real CLI through `tests/provider/e2e.py`; until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
+The packager is the CLI's, moved (labelle-cli#405): the same APK layout and size.
+
+- **Native library.** Release optimize modes stage `libgame.so` through the NDK's `llvm-strip --strip-unneeded` and keep the unstripped library under `symbols/arm64-v8a/` (for `ndk-stack -sym`); Debug stages it as built. A missing or failing `llvm-strip` packages the library unstripped, with a warning.
+- **Assets.** `assets/` is staged without the texture packer's `raw/` sources, the files the generated `main.zig` `@embedFile`s, and the PNG of an embedded ASTC. Videos always ship.
+- **APK.** `aapt package -f -M -I -F [-A assets] [-S res -0 arsc]`, then `jar --update --no-compress` (so `lib/` is stored), `zipalign -f 4` and `apksigner sign`. The launcher icon (`app_icon`, else the assembler's `default_icon.png`) is downscaled to the five mipmap densities.
+- **Signing.** With `signing` in the settings, that keystore signs, its passwords handed to apksigner as `env:`/`file:` sources (never in argv or logs). Without it, the debug keystore at `<LABELLE_HOME or ~/.labelle>/android-debug.keystore` signs (generated with `keytool` on first use), the path the CLI always used, so `adb install -r` keeps updating an installed CLI-built APK. A relative `LABELLE_HOME` is resolved against the project directory; export an absolute one if you run labelle from elsewhere.
+- **Failures leave no APK.** Everything is staged under `zig-out/apk/.staging-<pid>/` and the signed APK is renamed into place only after every tool succeeded; the previous `zig-out/apk/` is removed first. `zig-out/apk/package.json` records the `libgame.so` digest the APK was packaged from.
+- **Not yet:** `load_assets_from_apk` (a non-empty `apk_assets.json` is refused, [assembler #759](https://github.com/labelle-toolkit/labelle-assembler/issues/759)), fat APKs and the emulator ABI (`abis` is arm64 only), and `labelle android studio`. The manifest is the backend-neutral NativeActivity (`android.app.lib_name = game`); only bgfx is verified through this packager.
+
+Outputs, under the generated target directory `.labelle/<backend>_android/`:
+
+```
+zig-out/lib/libgame.so                       core build (input)
+zig-out/apk/game.apk                         `package` hook
+zig-out/apk/symbols/arm64-v8a/libgame.so     release builds: unstripped
+zig-out/apk/package.json                     what game.apk was packaged from
+zig-out/bundle/android/<pkg>-<ver>.apk       `bundle` hook (+ .size.txt, -symbols/)
+```
+
+**Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase).
+
+Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440), on `development`) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). Until PR 3, that CLI also still packages its own `<target>/game.apk` on `labelle build --platform=android`, beside this provider's `zig-out/apk/game.apk` (on `run` the provider's `deploy` hook replaces the CLI's launch, so only the provider packages). CI drives the real CLI through `tests/provider/e2e.py` (fake SDK, every host) and `tests/provider/ndk_e2e.py` (a real bgfx APK); until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
 
 ### Project setup
 
@@ -102,7 +129,7 @@ After the first release that ships the provider, pin the released version instea
 | `signing` | no | debug keystore | `store_password`/`key_password` must be `env:VAR` or `file:PATH` (apksigner's forms); a `pass:` literal is rejected so no secret is committed |
 | `deploy` | no | | `repo` is `owner/name`; `channel` is `stable`, `staging`, `preview` or `internal` |
 
-The parse is strict: unknown keys, duplicate keys and wrong types are errors, and the file is validated before the provider does anything. `immersive_mode` and `load_assets_from_apk` are rejected here: the assembler reads them at generate time, so they stay in `project.labelle .android`. There is no `studio` block: `labelle android studio` is not part of this release.
+The parse is strict: unknown keys, duplicate keys and wrong types are errors, and the file is validated before the provider does anything. `immersive_mode` and `load_assets_from_apk` are rejected here: the assembler reads them at generate time, so they stay in `project.labelle .android`. There is no `studio` block: `labelle android studio` is not part of this release. `version_name` names the bundle and stamps `android:versionName`; `versionCode` is `labelle bundle --build-number` (1 for `labelle build`).
 
 ## Planned responsibilities
 
