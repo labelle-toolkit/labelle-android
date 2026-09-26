@@ -277,6 +277,7 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
             if (acc.lead >= 0) "padding" else "skipping",
             @abs(acc.lead),
         });
+        if (acc.trimmed_all) std.log.warn("video: audio start offset trims more than the 5 min cap — no audio", .{});
     }
     var input_done = false;
     var input_queue: InputQueue = .{};
@@ -399,19 +400,31 @@ fn decodeTrackAndroid(allocator: std.mem.Allocator, fd: c_int, offset: i64, leng
 /// 48 kHz and capped at `max_frames`. The product is formed in u64: on the
 /// 32-bit Android ABIs `usize` is 32 bits and `in_frames * 48000` wraps after
 /// only 89 478 frames (~2 s of audio), trapping in checked builds and sizing
-/// the output wrong in unchecked ones. The u32 parameter makes the widening
-/// the helper's job (a 32-bit product would trap the host test below).
-fn outFrames48k(in_frames: u32, src_rate: u32, max_frames: usize) usize {
-    const wide = (@as(u64, in_frames) * @as(u64, OUT_RATE)) / @as(u64, @max(src_rate, 1));
-    return @intCast(@min(wide, @as(u64, max_frames)));
+/// the output wrong in unchecked ones.
+fn outFrames48k(in_frames: u64, src_rate: u32, max_frames: usize) usize {
+    return @intCast(@min(out48k(in_frames, src_rate), @as(u64, max_frames)));
+}
+
+/// `in_frames` source frames at `src_rate` as 48 kHz frames, rounded down,
+/// in u64 (see `outFrames48k`).
+fn out48k(in_frames: u64, src_rate: u32) u64 {
+    return (in_frames * OUT_RATE) / @max(src_rate, 1);
 }
 
 /// Source frames at `src_rate` that resample to `out_frames` at 48 kHz —
-/// rounded UP so the last output frame has its source sample, and clamped to
-/// what `outFrames48k`'s u32 frame count can carry.
-fn srcFramesFor(out_frames: usize, src_rate: u32) u32 {
-    const wide = (@as(u64, out_frames) * @as(u64, @max(src_rate, 1)) + OUT_RATE - 1) / OUT_RATE;
-    return @intCast(@min(wide, @as(u64, std.math.maxInt(u32))));
+/// rounded UP so the last output frame has its source sample. u64 throughout:
+/// the 5-min cap plus a 5-min trim at a high rate (`2 · MAX_FRAMES ·
+/// 192 kHz` ≈ 5.5e12) is far past u32.
+fn srcFramesCeil(out_frames: u64, src_rate: u32) u64 {
+    return (out_frames * @max(src_rate, 1) + OUT_RATE - 1) / OUT_RATE;
+}
+
+/// Source frames at `src_rate` the first `out_frames` 48 kHz output frames
+/// have fully moved past — rounded DOWN: output frame `out_frames` still
+/// interpolates from source frame `srcFramesFloor(out_frames)`, so only the
+/// frames before it can be discarded. u64 like `srcFramesCeil`.
+fn srcFramesFloor(out_frames: u64, src_rate: u32) u64 {
+    return (out_frames * @max(src_rate, 1)) / OUT_RATE;
 }
 
 /// Signed 48 kHz output-frame lead for an audio track whose first sample is
@@ -435,14 +448,19 @@ fn leadFrames(first_us: i64) i64 {
 /// early (labelle-android#8).
 ///
 /// The accumulation is bounded in OUTPUT frames (`max_frames`, `MAX_FRAMES`
-/// in production, small in tests): the closed segments' output frames plus
-/// the open segment's projection at its rate/channels. A source needing more
-/// than four raw samples per output frame (5.1, 96 kHz…) therefore still
-/// fills the advertised 5 min instead of stopping early. The lead shifts that
-/// budget (`budget`): padded silence counts against the cap, trimmed frames
-/// do not.
+/// in production, small in tests): the closed segments' kept output frames
+/// plus the open segment's projection at its rate/channels. A source needing
+/// more than four raw samples per output frame (5.1, 96 kHz…) therefore
+/// still fills the advertised 5 min instead of stopping early. Padded
+/// silence counts against the cap. Trimmed frames are decoded but NEVER
+/// retained: `push` discards them as they arrive, so the retained PCM stays
+/// within the cap however long the trim; a trim longer than the cap itself
+/// is treated as trimming the whole track (`trimmed_all` → `NoAudioTrack`).
 const PcmAccumulator = struct {
-    const Segment = struct { rate: u32, ch: u32, mask: u32, start: usize, end: usize };
+    /// A closed segment's retained samples `raw[start..end]` (source frame
+    /// `src_off` onward) and the output frames it contributes: frames
+    /// `first .. first + keep` of the segment's own 48 kHz timeline.
+    const Segment = struct { rate: u32, ch: u32, mask: u32, start: usize, end: usize, src_off: u64, first: u64, keep: usize };
 
     raw: std.ArrayList(i16) = .empty,
     segments: std.ArrayList(Segment) = .empty,
@@ -452,24 +470,41 @@ const PcmAccumulator = struct {
     /// The format's `channel-mask` (Android `AudioFormat.CHANNEL_OUT_*`
     /// bits), 0 when not reported. See `Downmix.forLayout`.
     mask: u32 = 0,
+    /// Where the open segment's RETAINED samples start in `raw`.
     seg_start: usize = 0,
-    /// DECODED output frames the closed segments will produce (each already
-    /// capped at `budget`).
+    /// Samples the open segment has accepted (discarded trim included).
+    seg_in: u64 = 0,
+    /// Leading samples of the open segment discarded by the trim.
+    seg_src_off: u64 = 0,
+    /// KEPT output frames the closed segments will produce.
     closed_out: usize = 0,
     /// Output-frame cap (`MAX_FRAMES`; tests shrink it).
     max_frames: usize = MAX_FRAMES,
     /// Start-offset lead in 48 kHz output frames (`leadFrames`): > 0 pads
     /// silence before the first decoded frame, < 0 drops decoded frames.
     lead: i64 = 0,
+    /// Output frames still to trim at the open segment's start.
+    skip_left: u64 = 0,
+    /// The lead trims more than the whole cap: nothing is kept.
+    trimmed_all: bool = false,
 
     fn init(rate: u32, ch: u32) PcmAccumulator {
         return .{ .rate = @max(rate, 1), .ch = @max(ch, 1) };
     }
 
     /// The audio track's first presentation time on the media (= video)
-    /// timeline. Set before the first `push`.
+    /// timeline. Set before the first `push` (and after `max_frames`). A
+    /// trim longer than the cap duration marks the track fully trimmed: its
+    /// head would be dropped past everything the cap keeps anyway, and
+    /// accepting it would only spend decode time on discarded PCM.
     fn setStartOffsetUs(self: *PcmAccumulator, first_us: i64) void {
         self.lead = leadFrames(first_us);
+        self.skip_left = 0;
+        self.trimmed_all = false;
+        if (self.lead < 0) {
+            const s: u64 = @abs(self.lead);
+            if (s > self.max_frames) self.trimmed_all = true else self.skip_left = s;
+        }
     }
 
     /// Silence frames `finish` prepends (never more than the whole cap).
@@ -478,25 +513,37 @@ const PcmAccumulator = struct {
         return @intCast(@min(@as(u64, @intCast(self.lead)), @as(u64, self.max_frames)));
     }
 
-    /// Decoded frames `finish` drops from the head.
+    /// Decoded frames the lead drops from the head (0 once `trimmed_all`:
+    /// nothing is decoded at all).
     fn skipFrames(self: *const PcmAccumulator) usize {
-        if (self.lead >= 0) return 0;
-        return @intCast(@min(@as(u64, @abs(self.lead)), @as(u64, std.math.maxInt(u32))));
+        if (self.lead >= 0 or self.trimmed_all) return 0;
+        return @intCast(@abs(self.lead)); // ≤ max_frames
     }
 
-    /// DECODED output frames that fit: the cap less the padded silence, plus
-    /// the frames the lead trims (those are decoded, then dropped).
+    /// KEPT output frames that fit: the cap less the padded silence.
     fn budget(self: *const PcmAccumulator) usize {
-        return (self.max_frames - self.padFrames()) +| self.skipFrames();
+        if (self.trimmed_all) return 0;
+        return self.max_frames - self.padFrames();
     }
 
-    /// Raw samples (all channels) the OPEN segment may still take before the
-    /// output cap is reached, at the current rate/channels.
+    /// The open segment's source samples still to be trimmed at `in`
+    /// accepted samples: every sample before the first source frame the
+    /// first kept output frame interpolates from. Monotonic in `in`, a
+    /// whole number of frames, and ≤ `in`.
+    fn trimTarget(self: *const PcmAccumulator, in: u64) u64 {
+        const seg_skip = @min(self.skip_left, out48k(in / self.ch, self.rate));
+        return srcFramesFloor(seg_skip, self.rate) * self.ch;
+    }
+
+    /// Samples (all channels, trimmed ones included) the OPEN segment may
+    /// still accept before the output cap is reached, at the current
+    /// rate/channels: enough source to finish the trim plus the cap's
+    /// remaining output.
     fn rawRoom(self: *const PcmAccumulator) usize {
-        const out_left = self.budget() -| self.closed_out;
-        const seg_cap: usize = @as(usize, srcFramesFor(out_left, self.rate)) * self.ch;
-        const seg_len = self.raw.items.len - self.seg_start;
-        return seg_cap -| seg_len;
+        const out_left: u64 = self.budget() -| self.closed_out;
+        if (out_left == 0) return 0;
+        const seg_cap = srcFramesCeil(self.skip_left + out_left, self.rate) * self.ch;
+        return @intCast(@min(seg_cap -| self.seg_in, std.math.maxInt(usize)));
     }
 
     /// The output cap is reached: every further `push` would be dropped, so
@@ -526,29 +573,59 @@ const PcmAccumulator = struct {
     /// Append one output buffer's bytes: little-endian i16, read unaligned
     /// (`bytesAsSlice(i16, …)` would need i16 alignment the codec's ByteBuffer
     /// does not guarantee). A trailing odd byte is dropped; past the output
-    /// cap (`rawRoom`) the excess is dropped.
+    /// cap (`rawRoom`) the excess is dropped. Samples the start-offset trim
+    /// covers are discarded here — the ones already retained from earlier
+    /// buffers first, then the new buffer's head is never appended — so
+    /// trimmed PCM never accumulates.
     fn push(self: *PcmAccumulator, allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!void {
         const count = @min(bytes.len / 2, self.rawRoom());
-        try self.raw.ensureUnusedCapacity(allocator, count);
-        var i: usize = 0;
+        const new_in = self.seg_in + count;
+        const target = self.trimTarget(new_in);
+        // Retained samples of earlier buffers the trim now covers.
+        const retained = self.seg_in - self.seg_src_off;
+        const drop_old: usize = @intCast(@min(target -| self.seg_src_off, retained));
+        if (drop_old > 0) {
+            const seg = self.raw.items[self.seg_start..];
+            std.mem.copyForwards(i16, seg, seg[drop_old..]);
+            self.raw.shrinkRetainingCapacity(self.raw.items.len - drop_old);
+        }
+        // This buffer's samples the trim covers (index seg_in + i < target).
+        const drop_new: usize = @intCast(@min(target -| self.seg_in, count));
+        self.seg_src_off += drop_old + drop_new; // = target
+        self.seg_in = new_in;
+        try self.raw.ensureUnusedCapacity(allocator, count - drop_new);
+        var i: usize = drop_new;
         while (i < count) : (i += 1) {
             self.raw.appendAssumeCapacity(std.mem.readInt(i16, bytes[i * 2 ..][0..2], .little));
         }
     }
 
     fn closeSegment(self: *PcmAccumulator, allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
-        if (self.raw.items.len > self.seg_start) {
-            const s: Segment = .{ .rate = self.rate, .ch = self.ch, .mask = self.mask, .start = self.seg_start, .end = self.raw.items.len };
-            try self.segments.append(allocator, s);
-            self.closed_out = @min(self.closed_out + self.segmentOutFrames(s), self.budget());
+        if (self.seg_in > 0) {
+            const seg_out = out48k(self.seg_in / self.ch, self.rate);
+            const seg_skip = @min(self.skip_left, seg_out);
+            const keep: usize = @intCast(@min(seg_out - seg_skip, @as(u64, self.budget() -| self.closed_out)));
+            if (keep > 0) {
+                try self.segments.append(allocator, .{
+                    .rate = self.rate,
+                    .ch = self.ch,
+                    .mask = self.mask,
+                    .start = self.seg_start,
+                    .end = self.raw.items.len,
+                    .src_off = self.seg_src_off / self.ch,
+                    .first = seg_skip,
+                    .keep = keep,
+                });
+                self.closed_out += keep;
+            } else {
+                // Wholly trimmed (or past the cap): nothing to keep.
+                self.raw.shrinkRetainingCapacity(self.seg_start);
+            }
+            self.skip_left -= seg_skip;
         }
         self.seg_start = self.raw.items.len;
-    }
-
-    fn segmentOutFrames(self: *const PcmAccumulator, s: Segment) usize {
-        // `rawRoom` bounds every segment to `srcFramesFor(…) ≤ maxInt(u32)`
-        // source frames, so the frame count is representable.
-        return outFrames48k(@intCast((s.end - s.start) / s.ch), s.rate, self.budget());
+        self.seg_in = 0;
+        self.seg_src_off = 0;
     }
 
     /// Resample + downmix every segment to 48 kHz stereo after the lead
@@ -557,27 +634,15 @@ const PcmAccumulator = struct {
     /// survives the trim.
     fn finish(self: *PcmAccumulator, allocator: std.mem.Allocator) Error!Pcm {
         self.closeSegment(allocator) catch return error.OutOfMemory;
-        const cap = self.budget();
-        var decoded: usize = 0;
-        for (self.segments.items) |s| decoded = @min(decoded +| self.segmentOutFrames(s), cap);
-        const skip = self.skipFrames();
-        if (decoded <= skip) return error.NoAudioTrack;
+        if (self.closed_out == 0) return error.NoAudioTrack;
         const pad = self.padFrames();
-        const total = pad + (decoded - skip); // ≤ max_frames by `budget`
+        const total = pad + self.closed_out; // ≤ max_frames by `budget`
         const out = allocator.alloc(i16, total * OUT_CHANNELS) catch return error.OutOfMemory;
         @memset(out[0 .. pad * OUT_CHANNELS], 0);
         var written: usize = pad; // output frames filled (silence included)
-        var seen: usize = 0; // decoded frames consumed (dropped ones included)
         for (self.segments.items) |s| {
-            if (seen == decoded) break;
-            const frames = @min(self.segmentOutFrames(s), decoded - seen);
-            // The part of this segment the lead trims, then what is kept.
-            const drop = @min(skip -| seen, frames);
-            const keep = frames - drop;
-            seen += frames;
-            if (keep == 0) continue;
-            resampleInto(out[written * OUT_CHANNELS ..][0 .. keep * OUT_CHANNELS], self.raw.items[s.start..s.end], s.rate, s.ch, Downmix.forLayout(s.ch, s.mask), drop);
-            written += keep;
+            resampleInto(out[written * OUT_CHANNELS ..][0 .. s.keep * OUT_CHANNELS], self.raw.items[s.start..s.end], s.rate, s.ch, Downmix.forLayout(s.ch, s.mask), s.first, s.src_off);
+            written += s.keep;
         }
         std.debug.assert(written == total);
         return .{ .samples = out, .frames = @intCast(total) };
@@ -623,13 +688,15 @@ const Speaker = struct {
     const lfe = LFE | LFE2;
 
     /// The layout MediaCodec means by a bare channel count (the
-    /// `AudioFormat` defaults: 5.1 = FL FR FC LFE BL BR, 7.1 adds SL SR).
-    /// 0 for a count with no standard layout.
+    /// `AudioFormat` defaults: 5.1 = FL FR FC LFE BL BR, 7.1 adds SL SR,
+    /// and 3 channels are 2.1 = FL FR LFE, whose LFE the downmix drops, so
+    /// L/R pass through un-normalised). 0 for a count with no standard
+    /// layout.
     fn defaultMask(ch: u32) u32 {
         return switch (ch) {
             1 => FC,
             2 => FL | FR,
-            3 => FL | FR | FC,
+            3 => FL | FR | LFE, // 2.1 (`CHANNEL_OUT_2POINT1`), not 3.0
             4 => FL | FR | BL | BR, // quad
             5 => FL | FR | FC | BL | BR, // 5.0
             6 => FL | FR | FC | LFE | BL | BR, // 5.1
@@ -727,20 +794,27 @@ const Downmix = struct {
 /// to 48 kHz stereo into `out` (`out.len / 2` frames). Output frame `i` is
 /// the segment's frame `first + i` — `first` > 0 when the start-offset lead
 /// trims the head — and `first + out frames` is at most `outFrames48k`, so
-/// every source index stays in range. The mixer plays at the device rate
+/// every source index stays in range. `src` holds the segment's source
+/// frames from `src_off` on (the trimmed head was discarded while decoding;
+/// `PcmAccumulator.trimTarget`). The mixer plays at the device rate
 /// without resampling, so this matches the desktop ffmpeg `-ar 48000 -ac 2`
 /// path.
-fn resampleInto(out: []i16, src: []const i16, src_rate: u32, src_ch: u32, dm: Downmix, first: usize) void {
+fn resampleInto(out: []i16, src: []const i16, src_rate: u32, src_ch: u32, dm: Downmix, first: u64, src_off: u64) void {
     const in_frames = src.len / src_ch;
     const out_frames = out.len / OUT_CHANNELS;
     std.debug.assert(in_frames > 0);
+    const last: u64 = src_off + in_frames - 1; // last source frame held, absolute
     var i: usize = 0;
     while (i < out_frames) : (i += 1) {
-        // Source position (fractional) for this output frame.
+        // Source position (fractional, on the segment's whole source
+        // timeline) for this output frame.
         const pos = (@as(f64, @floatFromInt(first + i)) * @as(f64, @floatFromInt(src_rate))) / @as(f64, @floatFromInt(OUT_RATE));
-        const idx0: usize = @min(@as(usize, @intFromFloat(pos)), in_frames - 1);
+        const abs0: u64 = @min(@as(u64, @intFromFloat(pos)), last);
+        // `src` starts at source frame `src_off`: the trim discarded only
+        // frames before the first kept output frame's `floor(pos)`.
+        const idx0: usize = @intCast(abs0 -| src_off);
         const idx1: usize = @min(idx0 + 1, in_frames - 1);
-        const frac: f32 = @floatCast(pos - @as(f64, @floatFromInt(idx0)));
+        const frac: f32 = @floatCast(pos - @as(f64, @floatFromInt(abs0)));
         // Downmix both neighbours, then interpolate (linear: same result as
         // interpolating each channel first).
         const a = dm.frame(src, idx0, src_ch);
@@ -796,13 +870,34 @@ test "outFrames48k: the frame product is widened to u64 (overflows u32) and capp
     try testing.expectEqual(MAX_FRAMES, outFrames48k(std.math.maxInt(u32), 0, MAX_FRAMES));
 }
 
-test "srcFramesFor: the source frames an output length needs, rounded up, clamped to u32" {
-    try testing.expectEqual(@as(u32, 480), srcFramesFor(480, 48_000));
-    try testing.expectEqual(@as(u32, 441), srcFramesFor(480, 44_100));
-    try testing.expectEqual(@as(u32, 1), srcFramesFor(1, 44_100)); // rounds up, never 0 for a non-empty output
-    try testing.expectEqual(@as(u32, 960), srcFramesFor(480, 96_000));
-    try testing.expectEqual(@as(u32, 13_230_000), srcFramesFor(MAX_FRAMES, 44_100)); // 5 min @ 44.1 kHz
-    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), srcFramesFor(MAX_FRAMES, std.math.maxInt(u32)));
+test "srcFramesCeil/Floor: source frames for an output length, rounded up / down" {
+    try testing.expectEqual(@as(u64, 480), srcFramesCeil(480, 48_000));
+    try testing.expectEqual(@as(u64, 441), srcFramesCeil(480, 44_100));
+    try testing.expectEqual(@as(u64, 1), srcFramesCeil(1, 44_100)); // rounds up, never 0 for a non-empty output
+    try testing.expectEqual(@as(u64, 0), srcFramesFloor(1, 44_100));
+    try testing.expectEqual(@as(u64, 960), srcFramesCeil(480, 96_000));
+    try testing.expectEqual(@as(u64, 13_230_000), srcFramesCeil(MAX_FRAMES, 44_100)); // 5 min @ 44.1 kHz
+    try testing.expectEqual(@as(u64, 13_230_000), srcFramesFloor(MAX_FRAMES, 44_100));
+}
+
+test "sample-count helpers: the 32-bit-overflowing products are formed in u64" {
+    // The largest accepted trim (a whole cap) plus the cap, at 192 kHz: the
+    // frame × rate product is ~5.5e12, far past a 32-bit `usize` (Android
+    // armeabi-v7a), and the resulting sample count × 8 channels too.
+    const out: u64 = 2 * MAX_FRAMES;
+    try testing.expect(out * 192_000 > std.math.maxInt(u32));
+    try testing.expectEqual(u64, @TypeOf(srcFramesCeil(out, 192_000)));
+    try testing.expectEqual(@as(u64, 115_200_000), srcFramesCeil(out, 192_000));
+    try testing.expectEqual(@as(u64, 115_200_000), srcFramesFloor(out, 192_000));
+    try testing.expectEqual(@as(u64, 28_800_000), out48k(115_200_000, 192_000));
+    // `trimTarget` at the same sizes (8 ch, 192 kHz, a whole-cap trim).
+    var acc = PcmAccumulator.init(192_000, 8);
+    acc.setStartOffsetUs(-300_000_000); // exactly the cap: accepted
+    try testing.expect(!acc.trimmed_all);
+    try testing.expectEqual(@as(u64, 57_600_000 * 8), acc.trimTarget(115_200_000 * 8));
+    // `rawRoom` saturates to usize instead of overflowing on 32-bit targets.
+    const room: u64 = acc.rawRoom();
+    try testing.expectEqual(@min(@as(u64, 115_200_000 * 8), std.math.maxInt(usize)), room);
 }
 
 test "PcmAccumulator: a 48 kHz 6-channel source fills the whole output cap (the fixed raw cap truncated it)" {
@@ -1006,7 +1101,7 @@ test "resampleInto: mono is duplicated to both channels and a ramp is interpolat
     // 4 mono frames @ 24 kHz: 0, 100, 200, 300 → 8 stereo frames @ 48 kHz.
     const src = [_]i16{ 0, 100, 200, 300 };
     var out: [8 * 2]i16 = undefined;
-    resampleInto(&out, &src, 24_000, 1, Downmix.forLayout(1, 0), 0);
+    resampleInto(&out, &src, 24_000, 1, Downmix.forLayout(1, 0), 0, 0);
     const expect = [_]i16{ 0, 0, 50, 50, 100, 100, 150, 150, 200, 200, 250, 250, 300, 300, 300, 300 };
     try testing.expectEqualSlices(i16, &expect, &out);
 }
@@ -1088,8 +1183,15 @@ test "downmix: stereo is the identity and mono is duplicated (no normalisation)"
 
 test "downmix: every count MediaCodec reports maps to its default layout" {
     const k: f64 = 0.70710678;
-    // 3.0 FL FR FC: norm 1 + k.
-    try testing.expectEqual([2]i16{ @intFromFloat(@round((1000 + k * 2000) / (1 + k))), @intFromFloat(@round((3000 + k * 2000) / (1 + k))) }, try mixOneFrame(3, 0, &.{ 1000, 3000, 2000 }));
+    // 3 channels, no mask: 2.1 FL FR LFE (Android's CHANNEL_OUT_2POINT1),
+    // not 3.0 — the LFE is dropped and L/R pass through un-attenuated.
+    try testing.expectEqual(Speaker.FL | Speaker.FR | Speaker.LFE, Speaker.defaultMask(3));
+    try testing.expectEqual(Downmix.Kind.count_default, Downmix.forLayout(3, 0).kind);
+    try testing.expectEqual([2]i16{ 1000, 3000 }, try mixOneFrame(3, 0, &.{ 1000, 3000, 2000 }));
+    try testing.expectEqual([2]i16{ 1000, 3000 }, try mixOneFrame(3, 0, &.{ 1000, 3000, -32_768 }));
+    // An explicit 3.0 mask still mixes the centre in: norm 1 + k.
+    const m30 = Speaker.FL | Speaker.FR | Speaker.FC;
+    try testing.expectEqual([2]i16{ @intFromFloat(@round((1000 + k * 2000) / (1 + k))), @intFromFloat(@round((3000 + k * 2000) / (1 + k))) }, try mixOneFrame(3, m30, &.{ 1000, 3000, 2000 }));
     // Quad FL FR BL BR: no centre.
     try testing.expectEqual([2]i16{ @intFromFloat(@round((1000 + k * 500) / (1 + k))), @intFromFloat(@round((-1000 + k * 300) / (1 + k))) }, try mixOneFrame(4, 0, &.{ 1000, -1000, 500, 300 }));
     // 5.0 FL FR FC BL BR = 5.1 without the LFE slot.
@@ -1218,4 +1320,96 @@ test "start offset: padding counts against the cap, skipped frames do not; all-s
         try acc.push(a, bytes);
         try testing.expectError(error.NoAudioTrack, acc.finish(a));
     }
+}
+
+test "start offset: a one-hour negative lead is fully trimmed — nothing retained, full at once, NoAudioTrack" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.setStartOffsetUs(-3_600_000_000); // production cap (5 min) < 1 h
+    try testing.expect(acc.trimmed_all);
+    // Before the fix the budget grew by the whole hour (~691 MB of raw PCM).
+    try testing.expectEqual(@as(usize, 0), acc.rawRoom());
+    try testing.expect(acc.full()); // the drive loop finishes on the first buffer
+    const bytes = try rampBytes(a, 4096);
+    defer a.free(bytes);
+    for (0..50) |_| {
+        try acc.push(a, bytes);
+        try testing.expectEqual(@as(usize, 0), acc.raw.items.len);
+    }
+    try testing.expectError(error.NoAudioTrack, acc.finish(a));
+    // Exactly the cap is still accepted (the boundary is inclusive).
+    var at_cap = PcmAccumulator.init(48_000, 2);
+    at_cap.setStartOffsetUs(-300_000_000);
+    try testing.expect(!at_cap.trimmed_all);
+    try testing.expectEqual(MAX_FRAMES, at_cap.skipFrames());
+}
+
+test "start offset: a trim as long as the cap never retains more than the cap while pushing" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(44_100, 2);
+    defer acc.deinit(a);
+    acc.max_frames = 4800; // 100 ms
+    acc.setStartOffsetUs(-100_000); // 4800 frames: the whole cap, trimmed
+    try testing.expect(!acc.trimmed_all);
+    const limit = (srcFramesCeil(acc.max_frames, 44_100) + 1) * 2; // cap-derived, samples
+    const buf = try rampBytes(a, 997); // odd size: pushes straddle every boundary
+    defer a.free(buf);
+    var pushes: usize = 0;
+    var max_retained: usize = 0;
+    while (!acc.full()) : (pushes += 1) {
+        try acc.push(a, buf);
+        max_retained = @max(max_retained, acc.raw.items.len);
+        try testing.expect(acc.raw.items.len <= limit);
+        // While the trim is still running nothing but the resampler's
+        // one-frame look-behind is held.
+        if (acc.trimTarget(acc.seg_in) < srcFramesFloor(acc.skip_left, 44_100) * 2)
+            try testing.expect(acc.raw.items.len <= 2 * 2);
+        try testing.expect(pushes < 100);
+    }
+    try testing.expect(pushes >= 9); // the trim + the cap took many buffers
+    try testing.expect(max_retained > 0);
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 4800), pcm.frames);
+    // Output frame 0 = source position 4800 · 44.1/48 = 4410 exactly: the
+    // ramp's frame 4410 (value (4410 mod 997) + 1, the buffer repeats).
+    try testing.expectEqual(@as(i16, @intCast(4410 % 997 + 1)), pcm.samples[0]);
+    try testing.expectEqual(-@as(i16, @intCast(4410 % 997 + 1)), pcm.samples[1]);
+}
+
+test "start offset < 0: a trim spanning many pushes and a format change lands on the right first sample" {
+    const a = testing.allocator;
+    var acc = PcmAccumulator.init(48_000, 2);
+    defer acc.deinit(a);
+    acc.setStartOffsetUs(-3_125); // 150 frames before media time 0
+    // Segment A: 100 stereo frames @ 48 kHz in 7-frame pushes — trimmed whole
+    // and never retained beyond the look-behind.
+    const seg_a = try rampBytes(a, 100);
+    defer a.free(seg_a);
+    var off: usize = 0;
+    while (off < seg_a.len) : (off += 7 * 4) {
+        try acc.push(a, seg_a[off..@min(off + 7 * 4, seg_a.len)]);
+        try testing.expect(acc.raw.items.len <= 2);
+    }
+    // Segment B: a mono ramp @ 24 kHz (0, 10, 20, …) in 3-frame pushes — 200
+    // output frames, of which the first 50 finish the trim.
+    try acc.setFormat(a, 24_000, 1, 0);
+    try testing.expectEqual(@as(usize, 0), acc.raw.items.len); // A dropped whole
+    try testing.expectEqual(@as(u64, 50), acc.skip_left);
+    var mono: [100]i16 = undefined;
+    for (&mono, 0..) |*v, i| v.* = @intCast(i * 10);
+    const mb = std.mem.sliceAsBytes(&mono);
+    off = 0;
+    while (off < mb.len) : (off += 3 * 2) try acc.push(a, mb[off..@min(off + 3 * 2, mb.len)]);
+    // Mechanism: the 25 source frames under the trim were discarded, not kept.
+    try testing.expectEqual(@as(u64, 25), acc.seg_src_off);
+    try testing.expectEqual(@as(usize, 75), acc.raw.items.len);
+    var pcm = try acc.finish(a);
+    defer pcm.deinit(a);
+    try testing.expectEqual(@as(u32, 150), pcm.frames);
+    // Output frame 0 = segment B's output frame 50 = source position 25.0.
+    try testing.expectEqual([2]i16{ 250, 250 }, [2]i16{ pcm.samples[0], pcm.samples[1] });
+    try testing.expectEqual(@as(i16, 255), pcm.samples[2]); // position 25.5
+    try testing.expectEqual(@as(i16, 990), pcm.samples[149 * 2]); // position 99.5 → last frame held
 }
