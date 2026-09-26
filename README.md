@@ -4,7 +4,29 @@ Android platform package for the Labelle toolkit.
 
 ## Status
 
-Repository scaffold only. Runtime extraction, packaging, and provider commands are not implemented or released yet. Do not add this repository as a working game dependency until the first usable release.
+**Phase 1a/1b of the runtime extraction ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)) — unreleased (no tag yet).** The package ships one Zig module, `labelle_android`, with three services the bgfx and sokol backends used to carry as per-backend copies:
+
+| Namespace | Service | Origin |
+|-----------|---------|--------|
+| `launch_intent` / `intent_env` | launch-intent `LABELLE_*` extras → process env (allow-list, debuggable gate, revert on relaunch, failed-restore retry) | bgfx #139 / sokol #25 (the sokol superset) |
+| `debuggable` | `isDebuggable(activity)`: is the running apk `android:debuggable`? Process-cached, fail-closed | assembler #737 |
+| `relayout` | `forceWindowRelayout(activity)`: re-apply the window attributes so a stuck 1x1 restored window relayouts (UI thread only) | bgfx #127 |
+
+Every service takes the running `ANativeActivity*` as an opaque pointer; the JNI walks (`src/jni/*.c`) read `->vm` / `->clazz` through the NDK's own header, so both backends pass what they already hold. `build.zig` also exports `addAndroidSysroot` / `resolveNdk` / `nativeAppGlueDir` / `isAndroidTarget` for consumers' build scripts.
+
+Consumers: labelle-bgfx (from the PR that lands #149 phase 1a/1b). labelle-sokol adoption is a filed follow-up; until then sokol keeps its own copies. Packaging, asset access and provider commands are still not implemented; runtime acceptance is on-device (SM-T505), not cross-compilation alone.
+
+### Naming
+
+- Zig package `.name = .labelle_android`; the one module is `labelle_android`.
+- `plugin.labelle` `.name = "android"`: the assembler derives a plugin's module alias as `labelle_<name>` (`deps_linker.zig`, `build_files/build_zig.zig`), so `android` is the name that yields `labelle_android` with no `b.modules.put` alias. `manifest_version = 1` (the shipping CLI parses nothing higher); no commands or hooks yet — the `android` command namespace (CLI #406) is reserved for this package pending the contract decisions (CLI #411).
+
+### Build and test
+
+```bash
+zig build test --summary all                                  # host: intent allow-list / decision + NDK-selection tests
+zig build test -Dtarget=aarch64-linux-android --summary all   # Android compile-check (needs ANDROID_NDK_HOME or ANDROID_HOME)
+```
 
 ## Planned responsibilities
 
@@ -23,6 +45,6 @@ The existing `labelle-android-gamepad` remains a separate package unless its own
 - [Contract decisions before implementation: CLI #411](https://github.com/labelle-toolkit/labelle-cli/issues/411)
 - [APK-loaded assets: assembler #759](https://github.com/labelle-toolkit/labelle-assembler/issues/759)
 
-Migration is breaking: consumers explicitly adopt the package and update configuration. No compatibility shims or implicit provider injection. Introduce the package manifest after the contract decisions are settled.
+Migration is breaking: consumers explicitly adopt the package and update configuration. No compatibility shims or implicit provider injection. The package manifest ships now at `manifest_version = 1` with no commands or hooks; its command/hook surface waits for the contract decisions.
 
 Device validation must cover bgfx and sokol cold launch, background/resume, rotation, and asset access; cross-compilation alone is not runtime acceptance.

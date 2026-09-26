@@ -1,0 +1,19 @@
+// labelle-android package manifest. Runtime services only: no commands, no
+// hooks, no convention directories yet.
+//
+// `.name = "android"` because the assembler derives a plugin's module alias
+// as `labelle_<name>` (labelle-assembler `deps_linker.zig` /
+// `build_files/build_zig.zig`), and this package's one module is
+// `labelle_android` — the same name its `build.zig.zon` declares, so no
+// `b.modules.put` alias is needed. Short plugin names are the convention
+// (`fsm`, `spine`, `pathfinder`); the repo name stays `labelle-android`.
+//
+// `manifest_version = 1`: the shipping labelle-cli parses only v1 (anything
+// higher is error E5 "upgrade labelle-cli"). The `android` command namespace
+// (labelle-cli#406) is reserved for this package and will be declared here
+// once the package-manifest contract (labelle-cli#411) lands.
+.{
+    .name = "android",
+    .manifest_version = 1,
+    .convention_dirs = .{},
+}
