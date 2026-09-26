@@ -36,6 +36,23 @@ pub fn isAndroidTarget(t: std.Target) bool {
     return t.abi == .android or t.abi == .androideabi;
 }
 
+/// labelle-android#10: the toolkit builds, packages and ships 64-bit Android
+/// only — the labelle CLI's `AbiArch` is `arm64`/`x86_64`, the bgfx/sokol
+/// hooks accept `-Dandroid_arch=arm64|x86_64`, and shipped APKs carry only
+/// `lib/arm64-v8a`. 32-bit `armeabi-v7a` / `x86` are unsupported (and
+/// `aaudio.zig`'s 64-bit atomics cannot lower on 32-bit ARM). Kept in sync
+/// with `unsupported_abi_message` in `src/root.zig`, which is the same guard
+/// for consumers that compile the module from their own build.
+pub const unsupported_abi_message =
+    "labelle-android supports 64-bit Android only (arm64-v8a = aarch64-linux-android, " ++
+    "x86_64 = x86_64-linux-android); 32-bit armeabi-v7a / x86 are not supported";
+
+/// True for a 32-bit Android target (arm/thumb `.androideabi`, x86
+/// `.android`): see `unsupported_abi_message`.
+pub fn isUnsupportedAndroidTarget(t: std.Target) bool {
+    return isAndroidTarget(t) and t.ptrBitWidth() != 64;
+}
+
 pub const ResolveOptions = struct {
     /// Matches the toolkit's default Android `min_sdk` (28). Must be >= 23:
     /// Bionic exposes `stdout`/`stderr` as real symbols only from API 23.
@@ -97,6 +114,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_android = isAndroidTarget(target.result);
+    // Decided before any NDK discovery: a 32-bit Android target must get the
+    // one clear message even with no NDK installed (labelle-android#10).
+    const unsupported = isUnsupportedAndroidTarget(target.result);
 
     const mod = b.addModule("labelle_android", .{
         .root_source_file = b.path("src/root.zig"),
@@ -108,7 +128,7 @@ pub fn build(b: *std.Build) void {
         // comptime-gated stubs off Android).
         .link_libc = is_android,
     });
-    if (is_android) {
+    if (is_android and !unsupported) {
         // Sysroot BEFORE the C sources (see `addAndroidSysroot`).
         _ = addAndroidSysroot(b, mod, target);
         mod.addCSourceFiles(.{
@@ -133,6 +153,14 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run labelle-android unit tests");
+
+    // 32-bit Android: fail every step with the one clear message rather than
+    // a wall of atomics errors from `aaudio.zig` (labelle-android#10).
+    if (unsupported) {
+        const fail = b.addFail(unsupported_abi_message);
+        b.default_step.dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
+    }
 
     // Host-run tests (pure Zig: the intent allow-list / decision, the video
     // `yuv`/`planes` helpers), pinned to the host so
@@ -163,7 +191,7 @@ pub fn build(b: *std.Build) void {
     // `android_app_tests` does): proves the JNI C and the `extern "c"`
     // bindings compile against the NDK. Depends on the compile step, never a
     // run step.
-    if (is_android) {
+    if (is_android and !unsupported) {
         const android_check = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&android_check.step);
     }
@@ -251,6 +279,22 @@ test "selectGreatestValidNdk: greatest VALID dir wins; an invalid greater dir ca
     try testing.expectEqualStrings("27.0.12077973", selectGreatestValidNdk(&c).?);
     try testing.expect(selectGreatestValidNdk(&.{}) == null);
     try testing.expect(selectGreatestValidNdk(&.{.{ .name = "x", .has_sysroot = false }}) == null);
+}
+
+test "isUnsupportedAndroidTarget: only 32-bit Android is rejected" {
+    const testing = std.testing;
+    const q = std.Target.Query;
+    const cases = [_]struct { q: q, unsupported: bool }{
+        .{ .q = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .android }, .unsupported = false },
+        .{ .q = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .android }, .unsupported = false },
+        .{ .q = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .androideabi }, .unsupported = true },
+        .{ .q = .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .android }, .unsupported = true },
+        .{ .q = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .gnueabihf }, .unsupported = false },
+    };
+    for (cases) |c| {
+        const t = try std.zig.system.resolveTargetQuery(testing.io, c.q);
+        try testing.expectEqual(c.unsupported, isUnsupportedAndroidTarget(t));
+    }
 }
 
 test "isAndroidTarget: both Android ABIs, nothing else" {

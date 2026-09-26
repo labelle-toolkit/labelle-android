@@ -24,6 +24,20 @@ const builtin = @import("builtin");
 /// True on Android (arm64/x86_64 `.android`, arm/x86 `.androideabi`).
 pub const is_android = builtin.target.abi == .android or builtin.target.abi == .androideabi;
 
+/// The only Android ABIs the toolkit builds, packages and ships (labelle CLI
+/// `AbiArch`, the bgfx/sokol `-Dandroid_arch=arm64|x86_64` hooks): 32-bit
+/// `armeabi-v7a` / `x86` are not supported. `aaudio`'s lock-free counters
+/// are 64-bit atomics, which 32-bit ARM cannot lower, so fail here with a
+/// clear message instead of an atomics error deep in `aaudio.zig`
+/// (labelle-android#10).
+pub const unsupported_abi_message =
+    "labelle-android supports 64-bit Android only (arm64-v8a = aarch64-linux-android, " ++
+    "x86_64 = x86_64-linux-android); 32-bit armeabi-v7a / x86 are not supported";
+
+comptime {
+    if (is_android and builtin.target.ptrBitWidth() != 64) @compileError(unsupported_abi_message);
+}
+
 pub const intent_env = @import("intent_env.zig");
 pub const launch_intent = @import("launch_intent.zig");
 pub const debuggable = @import("debuggable.zig");
