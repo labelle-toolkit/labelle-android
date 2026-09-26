@@ -114,6 +114,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_android = isAndroidTarget(target.result);
+    // Decided before any NDK discovery: a 32-bit Android target must get the
+    // one clear message even with no NDK installed (labelle-android#10).
+    const unsupported = isUnsupportedAndroidTarget(target.result);
 
     const mod = b.addModule("labelle_android", .{
         .root_source_file = b.path("src/root.zig"),
@@ -125,7 +128,7 @@ pub fn build(b: *std.Build) void {
         // comptime-gated stubs off Android).
         .link_libc = is_android,
     });
-    if (is_android) {
+    if (is_android and !unsupported) {
         // Sysroot BEFORE the C sources (see `addAndroidSysroot`).
         _ = addAndroidSysroot(b, mod, target);
         mod.addCSourceFiles(.{
@@ -153,7 +156,6 @@ pub fn build(b: *std.Build) void {
 
     // 32-bit Android: fail every step with the one clear message rather than
     // a wall of atomics errors from `aaudio.zig` (labelle-android#10).
-    const unsupported = isUnsupportedAndroidTarget(target.result);
     if (unsupported) {
         const fail = b.addFail(unsupported_abi_message);
         b.default_step.dependOn(&fail.step);
