@@ -23,7 +23,11 @@ cli, zig = str(Path(a.cli).resolve()), str(Path(a.zig).resolve())
 repo = Path(__file__).resolve().parents[2]
 version = subprocess.check_output([zig, 'version'], text=True).strip()
 windows = os.name == 'nt'
-host = {'nt': 'windows-x86_64'}.get(os.name, 'darwin-x86_64' if os.uname().sysname == 'Darwin' else 'linux-x86_64')
+# `os.uname()` does not exist on Windows, so branch before calling it.
+if windows:
+    host = 'windows-x86_64'
+else:
+    host = 'darwin-x86_64' if os.uname().sysname == 'Darwin' else 'linux-x86_64'
 
 
 def tool(path: Path, kind='exe'):

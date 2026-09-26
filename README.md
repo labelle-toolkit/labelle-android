@@ -53,12 +53,20 @@ Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/
 
 ### Project setup
 
+No release carries the provider yet, so pin a local checkout for development:
+
 ```zig
 // project.labelle
 .plugins = .{
-    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.0" },
+    .{ .name = "android", .repo = "local:../labelle-android" },
 },
 .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
+```
+
+After the first release that ships the provider, pin the released version instead (`<version>` is that release's tag):
+
+```zig
+.{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "<version>" },
 ```
 
 ### `providers/android.json` (schema v1)
