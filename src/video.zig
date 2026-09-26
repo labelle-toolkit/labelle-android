@@ -11,7 +11,8 @@
 //!   * `video/audio_track.zig` — `decodeTrack`: the mp4's audio track → 48 kHz
 //!                                stereo i16 `Pcm` for the backend's mixer.
 //!                                Android-only; `error.Unsupported` elsewhere.
-//!   * `video/yuv.zig`         — CPU YUV 4:2:0 → RGBA8 (BT.601). Pure Zig,
+//!   * `video/yuv.zig`         — CPU YUV 4:2:0 → RGBA8 (`Matrix`: BT.601 /
+//!                                BT.709, limited / full range). Pure Zig,
 //!                                host-tested; the desktop ffmpeg decoder uses
 //!                                it too.
 //!   * `video/planes.zig`      — row de-pad / NV12 de-interleave for the GPU
@@ -34,6 +35,10 @@ pub const planes = @import("video/planes.zig");
 pub const VideoDecoder = decoder.VideoDecoder;
 /// `VideoDecoder`'s error set.
 pub const Error = decoder.Error;
+/// The decoded stream's colour metadata (`VideoDecoder.colorSpace()`):
+/// standard / range / transfer from the codec's output format, and the
+/// `yuv.Matrix` it selects. The GPU-YUV consumer's input (labelle-bgfx#155).
+pub const ColorSpace = decoder.ColorSpace;
 
 /// Decoded 48 kHz stereo i16 PCM (`samples` interleaved, caller frees via
 /// `deinit`).
@@ -67,10 +72,16 @@ test "the decoder entry points are analyzed (host: stubs; Android compile-check:
     _ = &VideoDecoder.height;
     _ = &VideoDecoder.decodeFrame;
     _ = &VideoDecoder.decodeFramePlanes;
+    _ = &VideoDecoder.colorSpace;
     _ = &VideoDecoder.deinit;
+    var dec: VideoDecoder = undefined;
+    _ = &dec;
+    if (comptime !is_android) try std.testing.expectEqual(ColorSpace{}, dec.colorSpace());
     _ = &decodeTrack;
     var pcm: Pcm = .{ .samples = &.{}, .frames = 0 };
     pcm.deinit(std.testing.allocator);
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
+const is_android = builtin.abi == .android or builtin.abi == .androideabi;

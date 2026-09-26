@@ -8,8 +8,12 @@
 //!
 //! This module is **pure Zig with no NDK dependency**, so it builds and is
 //! unit-tested on the host — the one piece of the Android decode path that is
-//! verifiable without a device. The conversion uses the BT.601 limited-range
-//! integer coefficients (the standard for SD/most MediaCodec output).
+//! verifiable without a device. The conversion is 8.8 fixed-point integer
+//! math driven by a `Matrix`: BT.601 or BT.709 coefficients, limited (16–235)
+//! or full (0–255) range. `nv12ToRgba` / `i420ToRgba` / `yuv420ToRgba` keep
+//! the BT.601 limited-range default (the SD / desktop-ffmpeg convention);
+//! `yuv420ToRgbaMatrix` takes the matrix the stream's colour metadata selects
+//! (the Android decoder's `ColorSpace.matrix`, labelle-android#3 round 2).
 //!
 //! Strides are explicit: MediaCodec output planes are frequently padded
 //! (`stride >= width`), so the caller passes the real plane strides from the
@@ -18,16 +22,43 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// BT.601 limited-range YUV → RGB, integer math (matches the canonical
-/// fixed-point coefficients). Inputs are the raw plane samples; output is a
-/// clamped RGBA8 pixel.
-inline fn yuvToRgba(y: u8, u: u8, v: u8, out: *[4]u8) void {
-    const c: i32 = @as(i32, y) - 16;
+/// YUV → RGB coefficients in 8.8 fixed point (gain × 256, rounded):
+///
+///   R = (y_gain·(Y − y_off) + rv·(V − 128) + 128) >> 8
+///   G = (y_gain·(Y − y_off) − gu·(U − 128) − gv·(V − 128) + 128) >> 8
+///   B = (y_gain·(Y − y_off) + bu·(U − 128) + 128) >> 8
+///
+/// Limited range: Y 16–235 → `y_off` 16, `y_gain` 255/219 (298); chroma
+/// 16–240 scales the standard's gains by 255/224. Full range: `y_off` 0,
+/// `y_gain` 1 (256), chroma gains unscaled. BT.601 (Kr 0.299, Kb 0.114) vs
+/// BT.709 (Kr 0.2126, Kb 0.0722) differ in every chroma gain.
+pub const Matrix = struct {
+    y_off: i32,
+    y_gain: i32,
+    rv: i32,
+    gu: i32,
+    gv: i32,
+    bu: i32,
+
+    /// The canonical SD matrix: 1.164·(Y−16), 1.596·V, 0.391·U, 0.813·V, 2.018·U.
+    pub const bt601_limited: Matrix = .{ .y_off = 16, .y_gain = 298, .rv = 409, .gu = 100, .gv = 208, .bu = 516 };
+    /// BT.601 over 0–255: 1.402·V, 0.344·U, 0.714·V, 1.772·U.
+    pub const bt601_full: Matrix = .{ .y_off = 0, .y_gain = 256, .rv = 359, .gu = 88, .gv = 183, .bu = 454 };
+    /// The HD matrix: 1.164·(Y−16), 1.793·V, 0.213·U, 0.533·V, 2.112·U.
+    pub const bt709_limited: Matrix = .{ .y_off = 16, .y_gain = 298, .rv = 459, .gu = 55, .gv = 136, .bu = 541 };
+    /// BT.709 over 0–255: 1.575·V, 0.187·U, 0.468·V, 1.856·U.
+    pub const bt709_full: Matrix = .{ .y_off = 0, .y_gain = 256, .rv = 403, .gu = 48, .gv = 120, .bu = 475 };
+};
+
+/// One YUV sample → a clamped RGBA8 pixel with `m`'s coefficients. Inputs are
+/// the raw plane samples.
+inline fn yuvToRgba(m: Matrix, y: u8, u: u8, v: u8, out: *[4]u8) void {
+    const c: i32 = @as(i32, y) - m.y_off;
     const d: i32 = @as(i32, u) - 128;
     const e: i32 = @as(i32, v) - 128;
-    out[0] = clamp8((298 * c + 409 * e + 128) >> 8);
-    out[1] = clamp8((298 * c - 100 * d - 208 * e + 128) >> 8);
-    out[2] = clamp8((298 * c + 516 * d + 128) >> 8);
+    out[0] = clamp8((m.y_gain * c + m.rv * e + 128) >> 8);
+    out[1] = clamp8((m.y_gain * c - m.gu * d - m.gv * e + 128) >> 8);
+    out[2] = clamp8((m.y_gain * c + m.bu * d + 128) >> 8);
     out[3] = 255;
 }
 
@@ -57,7 +88,7 @@ pub fn nv12ToRgba(
             const u = uv_plane[uv_off];
             const v = uv_plane[uv_off + 1];
             const o = (row * width + col) * 4;
-            yuvToRgba(y, u, v, out[o..][0..4]);
+            yuvToRgba(.bt601_limited, y, u, v, out[o..][0..4]);
         }
     }
 }
@@ -84,7 +115,7 @@ pub fn i420ToRgba(
             const u = u_plane[chroma_off];
             const v = v_plane[chroma_off];
             const o = (row * width + col) * 4;
-            yuvToRgba(y, u, v, out[o..][0..4]);
+            yuvToRgba(.bt601_limited, y, u, v, out[o..][0..4]);
         }
     }
 }
@@ -97,7 +128,26 @@ pub fn i420ToRgba(
 /// strides. A `pixel_stride` of 1 ⇒ planar; 2 ⇒ interleaved/semi-planar — both
 /// fall out of the same loop, so one converter covers every real device.
 /// `u`/`v` may point into the same interleaved buffer (NV12) or separate planes.
+/// BT.601 limited range; `yuv420ToRgbaMatrix` takes the stream's matrix.
 pub fn yuv420ToRgba(
+    y: []const u8,
+    y_row_stride: u32,
+    y_pixel_stride: u32,
+    u: []const u8,
+    v: []const u8,
+    uv_row_stride: u32,
+    uv_pixel_stride: u32,
+    width: u32,
+    height: u32,
+    out: []u8,
+) void {
+    yuv420ToRgbaMatrix(.bt601_limited, y, y_row_stride, y_pixel_stride, u, v, uv_row_stride, uv_pixel_stride, width, height, out);
+}
+
+/// `yuv420ToRgba` with an explicit `Matrix` — the one the decoder selects from
+/// the stream's colour standard / range (`ColorSpace.matrix` in `decoder.zig`).
+pub fn yuv420ToRgbaMatrix(
+    m: Matrix,
     y: []const u8,
     y_row_stride: u32,
     y_pixel_stride: u32,
@@ -121,6 +171,7 @@ pub fn yuv420ToRgba(
     std.debug.assert(v.len > last_c);
 
     const args = ConvertArgs{
+        .m = m,
         .y = y,
         .y_row_stride = y_row_stride,
         .y_pixel_stride = y_pixel_stride,
@@ -188,6 +239,7 @@ pub fn yuv420ToRgba(
 /// Bundle of immutable conversion parameters shared by every worker. Carrying
 /// these as one struct keeps the `std.Thread.spawn` arg-tuple small.
 const ConvertArgs = struct {
+    m: Matrix,
     y: []const u8,
     y_row_stride: u32,
     y_pixel_stride: u32,
@@ -237,15 +289,15 @@ fn convertRowRange(a: ConvertArgs, row_start: u32, row_end: u32) void {
                 vv[k] = a.v[ci];
             }
 
-            const c = yv - @as(I32x, @splat(16));
+            const c = yv - @as(I32x, @splat(a.m.y_off));
             const d = uv - @as(I32x, @splat(128));
             const e = vv - @as(I32x, @splat(128));
 
-            const c298 = @as(I32x, @splat(298)) * c;
+            const cy = @as(I32x, @splat(a.m.y_gain)) * c;
             const rnd = @as(I32x, @splat(128));
-            const r = (c298 + @as(I32x, @splat(409)) * e + rnd) >> @splat(8);
-            const g = (c298 - @as(I32x, @splat(100)) * d - @as(I32x, @splat(208)) * e + rnd) >> @splat(8);
-            const b = (c298 + @as(I32x, @splat(516)) * d + rnd) >> @splat(8);
+            const r = (cy + @as(I32x, @splat(a.m.rv)) * e + rnd) >> @splat(8);
+            const g = (cy - @as(I32x, @splat(a.m.gu)) * d - @as(I32x, @splat(a.m.gv)) * e + rnd) >> @splat(8);
+            const b = (cy + @as(I32x, @splat(a.m.bu)) * d + rnd) >> @splat(8);
 
             const lo: I32x = @splat(0);
             const hi: I32x = @splat(255);
@@ -269,7 +321,7 @@ fn convertRowRange(a: ConvertArgs, row_start: u32, row_end: u32) void {
             const yi = y_base + col * a.y_pixel_stride;
             const ci = c_base + (col / 2) * a.uv_pixel_stride;
             const o = o_base + col * 4;
-            yuvToRgba(a.y[yi], a.u[ci], a.v[ci], a.out[o..][0..4]);
+            yuvToRgba(a.m, a.y[yi], a.u[ci], a.v[ci], a.out[o..][0..4]);
         }
     }
 }
@@ -277,6 +329,7 @@ fn convertRowRange(a: ConvertArgs, row_start: u32, row_end: u32) void {
 /// Reference scalar converter — the original naive double-loop, kept verbatim
 /// as the bit-exact equivalence guard for the SIMD + threaded path. Test-only.
 fn yuv420ToRgbaScalar(
+    m: Matrix,
     y: []const u8,
     y_row_stride: u32,
     y_pixel_stride: u32,
@@ -297,7 +350,7 @@ fn yuv420ToRgbaScalar(
             const yi = row * y_row_stride + col * y_pixel_stride;
             const ci = (row / 2) * uv_row_stride + (col / 2) * uv_pixel_stride;
             const o = (row * width + col) * 4;
-            yuvToRgba(y[yi], u[ci], v[ci], out[o..][0..4]);
+            yuvToRgba(m, y[yi], u[ci], v[ci], out[o..][0..4]);
         }
     }
 }
@@ -383,8 +436,45 @@ test "stride padding is honoured (y_stride > width)" {
     nv12ToRgba(&y, &uv, w, h, y_stride, w, &out);
     // Just assert the padded bytes weren't sampled: pixel (1,1) uses y=40 not 0.
     var expect: [4]u8 = undefined;
-    yuvToRgba(40, 128, 128, &expect);
+    yuvToRgba(.bt601_limited, 40, 128, 128, &expect);
     try std.testing.expectEqualSlices(u8, &expect, out[(3) * 4 ..][0..4]);
+}
+
+test "Matrix: BT.709 limited decodes 709-encoded red that BT.601 would desaturate" {
+    // Pure red (255,0,0) encoded per BT.709 limited range is Y=63 U=102 V=240;
+    // per BT.601 it is Y=81 U=90 V=240. Each decodes to red only through its
+    // own matrix — the mismatch the colour metadata exists to prevent.
+    var px: [4]u8 = undefined;
+    yuvToRgba(.bt709_limited, 63, 102, 240, &px);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 1, 0, 255 }, &px);
+    yuvToRgba(.bt601_limited, 63, 102, 240, &px);
+    try std.testing.expectEqualSlices(u8, &.{ 234, 0, 2, 255 }, &px); // the wrong matrix: dull, shifted
+    yuvToRgba(.bt601_limited, 81, 90, 240, &px);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, &px);
+    // Neutral chroma is grey under every matrix; limited white is Y=235.
+    yuvToRgba(.bt709_limited, 235, 128, 128, &px);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &px);
+}
+
+test "Matrix: full range maps Y=0→black, Y=255→white, Y=128→mid grey without clipping" {
+    var px: [4]u8 = undefined;
+    inline for (.{ Matrix.bt601_full, Matrix.bt709_full }) |m| {
+        yuvToRgba(m, 0, 128, 128, &px);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, &px);
+        yuvToRgba(m, 255, 128, 128, &px);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, &px);
+        yuvToRgba(m, 128, 128, 128, &px);
+        try std.testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, &px);
+    }
+    // The limited matrix would crush a full-range Y=8 to black and clip Y=250.
+    yuvToRgba(.bt601_limited, 8, 128, 128, &px);
+    try std.testing.expectEqual(@as(u8, 0), px[0]);
+    yuvToRgba(.bt601_full, 8, 128, 128, &px);
+    try std.testing.expectEqual(@as(u8, 8), px[0]);
+    // Full-range pure red per BT.709: Y=54 U=99 V=255 (chroma not compressed).
+    yuvToRgba(.bt709_full, 54, 99, 255, &px);
+    try std.testing.expect(px[0] == 254 or px[0] == 255);
+    try std.testing.expect(px[1] <= 1 and px[2] <= 1);
 }
 
 test "yuv420ToRgba SIMD+threaded path is bit-exact vs scalar reference" {
@@ -439,10 +529,18 @@ test "yuv420ToRgba SIMD+threaded path is bit-exact vs scalar reference" {
             const got = try alloc.alloc(u8, @as(usize, w) * h * 4);
             defer alloc.free(got);
 
-            yuv420ToRgbaScalar(y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, ref);
+            yuv420ToRgbaScalar(.bt601_limited, y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, ref);
             yuv420ToRgba(y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, got);
-
             try std.testing.expectEqualSlices(u8, ref, got);
+
+            // The matrix reaches the SIMD lanes too: BT.709 full range must
+            // match its scalar reference AND differ from the BT.601 result.
+            const bt601 = try alloc.dupe(u8, got); // the BT.601 result from above
+            defer alloc.free(bt601);
+            yuv420ToRgbaScalar(.bt709_full, y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, ref);
+            yuv420ToRgbaMatrix(.bt709_full, y, y_row_stride, 1, u_slice, v_slice, uv_row_stride, uv_pix, w, h, got);
+            try std.testing.expectEqualSlices(u8, ref, got);
+            if (w * h >= 4) try std.testing.expect(!std.mem.eql(u8, bt601, got));
         }
     }
 }

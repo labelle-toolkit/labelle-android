@@ -31,11 +31,23 @@
 //! get past codec creation — only an APK proves this file. The host-testable
 //! colour conversion lives in `yuv.zig`, the plane tightening in `planes.zig`.
 //!
+//! Colour (labelle-android#3 round 2): the codec's `OUTPUT_FORMAT_CHANGED`
+//! carries `color-standard` / `color-range` / `color-transfer` (API 28+; absent
+//! on older devices or untagged streams). `refreshFormat` retains them as a
+//! `ColorSpace`, every ring frame is stamped with the one in force when it was
+//! decoded, `decodeFrame` converts with the matching `yuv.Matrix` (BT.709 vs
+//! BT.601, full vs limited), and `colorSpace()` exposes it to the GPU-YUV
+//! consumer. bgfx's `fs_yuv` still hard-codes BT.601 limited — selecting the
+//! GPU matrix from this metadata is labelle-bgfx#155.
+//!
+//! Crop: the `AImage` crop rect is honoured — validated against the frame's
+//! dimensions and the plane sizes, then copied from its origin; an
+//! inconsistent crop rejects the frame (logged once) instead of asserting or
+//! reading out of bounds (`resolveCrop` / `planeHolds`, host-tested).
+//!
 //! Known follow-ups (next slices):
-//!   - crop rectangle (the AImage may be padded beyond w×h on some devices).
 //!   - on a real handset (vs the emulator) confirm a Flexible/tiled clip; the
 //!     plane-stride path is built for it but only emulator-verified so far.
-//!   - audio-track decode (this is video-only) + AAudio output device (#306).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -50,6 +62,103 @@ const is_android = builtin.abi == .android or builtin.abi == .androideabi;
 /// Public decoder type. Real implementation on Android; a stub elsewhere so the
 /// engine compiles on every backend/target.
 pub const VideoDecoder = if (is_android) AndroidVideoDecoder else UnsupportedDecoder;
+
+/// The decoded stream's colour metadata, from the codec's output format
+/// (`color-standard` / `color-range` / `color-transfer`, the `MediaFormat`
+/// integer constants; API 28+). `.unspecified` when the key is absent — an
+/// untagged stream, an older device, or a codec that does not report it.
+/// Read it with `VideoDecoder.colorSpace()`: after a `decodeFrame` /
+/// `decodeFramePlanes` it is the colour space of the frame just returned.
+pub const ColorSpace = struct {
+    pub const Standard = enum { unspecified, bt709, bt601_pal, bt601_ntsc, bt2020, other };
+    pub const Range = enum { unspecified, full, limited };
+    pub const Transfer = enum { unspecified, linear, sdr_video, st2084, hlg, other };
+
+    standard: Standard = .unspecified,
+    range: Range = .unspecified,
+    transfer: Transfer = .unspecified,
+
+    /// From the raw `MediaFormat` values (`null` = key absent):
+    /// COLOR_STANDARD_BT709 = 1, BT601_PAL = 2, BT601_NTSC = 4, BT2020 = 6;
+    /// COLOR_RANGE_FULL = 1, LIMITED = 2; COLOR_TRANSFER_LINEAR = 1,
+    /// SDR_VIDEO = 3, ST2084 = 6, HLG = 7.
+    pub fn fromFormat(standard: ?i32, range: ?i32, transfer: ?i32) ColorSpace {
+        return .{
+            .standard = if (standard) |s| switch (s) {
+                1 => .bt709,
+                2 => .bt601_pal,
+                4 => .bt601_ntsc,
+                6 => .bt2020,
+                else => .other,
+            } else .unspecified,
+            .range = if (range) |r| switch (r) {
+                1 => .full,
+                2 => .limited,
+                else => .unspecified,
+            } else .unspecified,
+            .transfer = if (transfer) |t| switch (t) {
+                1 => .linear,
+                3 => .sdr_video,
+                6 => .st2084,
+                7 => .hlg,
+                else => .other,
+            } else .unspecified,
+        };
+    }
+
+    /// The CPU conversion matrix for a stream of `height` rows. BT.709 for
+    /// `.bt709` (and `.bt2020`, whose Y'CbCr coefficients are far closer to
+    /// 709 than 601 — a proper 2020 matrix is not carried); BT.601 for the
+    /// two 601 standards. An UNSPECIFIED standard follows the ffmpeg /
+    /// Chromium convention: HD (≥ 720 rows) is BT.709, SD is BT.601. Range
+    /// defaults to limited (what every MediaCodec decoder emits unless the
+    /// stream says full).
+    pub fn matrix(self: ColorSpace, height: u32) yuv.Matrix {
+        const hd = switch (self.standard) {
+            .bt709, .bt2020 => true,
+            .bt601_pal, .bt601_ntsc => false,
+            .unspecified, .other => height >= 720,
+        };
+        const full = self.range == .full;
+        return if (hd) (if (full) .bt709_full else .bt709_limited) else (if (full) .bt601_full else .bt601_limited);
+    }
+};
+
+/// `AImageCropRect` (NdkImage.h): right/bottom are EXCLUSIVE, so the crop is
+/// `(right − left) × (bottom − top)`.
+const CropRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+
+const CropError = error{ NegativeOrigin, Inverted, SmallerThanFrame };
+/// Why an AImage could not be read into a ring slot (`readPlanes`).
+const ReadError = CropError || error{ NoPlanes, PlaneData, PlaneTooSmall };
+
+/// The origin to copy a `w × h` frame from inside an image whose crop rect is
+/// `crop`. An all-zero rect means "no crop reported" (`AImage_getCropRect`
+/// failed or the producer set none): the full frame at the origin. A crop at
+/// least `w × h` is copied from its top-left (the padded coded size, e.g.
+/// 1088 rows for a 1080 stream, is the common case: the crop IS `w × h`); a
+/// crop smaller than the frame in either axis, a negative origin or an
+/// inverted rect is inconsistent with the track's dimensions — the caller
+/// rejects the frame rather than sampling padding or reading past a plane.
+fn resolveCrop(crop: CropRect, w: u32, h: u32) CropError!struct { left: u32, top: u32 } {
+    if (crop.left == 0 and crop.top == 0 and crop.right == 0 and crop.bottom == 0) return .{ .left = 0, .top = 0 };
+    if (crop.left < 0 or crop.top < 0) return error.NegativeOrigin;
+    if (crop.right <= crop.left or crop.bottom <= crop.top) return error.Inverted;
+    const cw: u32 = @intCast(crop.right - crop.left);
+    const ch: u32 = @intCast(crop.bottom - crop.top);
+    if (cw < w or ch < h) return error.SmallerThanFrame;
+    return .{ .left = @intCast(crop.left), .top = @intCast(crop.top) };
+}
+
+/// Does a plane of `len` bytes hold every sample of a `w × h` copy that
+/// starts `off` bytes in with the given strides? The bottom-right sample is
+/// the last byte read (`planes.tightenPlane` asserts the same bound; this is
+/// the checked version so a bad crop is rejected, not trapped on).
+fn planeHolds(len: usize, row_stride: u32, pixel_stride: u32, off: usize, w: u32, h: u32) bool {
+    if (w == 0 or h == 0) return off <= len;
+    const last = off + @as(usize, h - 1) * row_stride + @as(usize, w - 1) * pixel_stride;
+    return last < len;
+}
 
 pub const Error = error{
     Unsupported,
@@ -76,6 +185,9 @@ const UnsupportedDecoder = struct {
     }
     pub fn decodeFramePlanes(_: *UnsupportedDecoder, _: []u8, _: []u8, _: []u8) ?f64 {
         return null;
+    }
+    pub fn colorSpace(_: *const UnsupportedDecoder) ColorSpace {
+        return .{};
     }
     pub fn deinit(_: *UnsupportedDecoder) void {}
 };
@@ -122,7 +234,9 @@ const AndroidVideoDecoder = struct {
     extern fn AMediaCodec_delete(*Codec) void;
     extern fn AMediaCodec_dequeueInputBuffer(*Codec, timeout_us: i64) isize;
     extern fn AMediaCodec_getInputBuffer(*Codec, idx: usize, out_size: *usize) ?[*]u8;
-    extern fn AMediaCodec_queueInputBuffer(*Codec, idx: usize, offset: u32, size: usize, time_us: u64, flags: u32) i32;
+    // `offset` is `_off_t_compat` (NdkMediaCodec.h), static-asserted there to
+    // be `long`-sized: i64 on the 64-bit ABIs, i32 on the 32-bit ones.
+    extern fn AMediaCodec_queueInputBuffer(*Codec, idx: usize, offset: c_long, size: usize, time_us: u64, flags: u32) i32;
     extern fn AMediaCodec_dequeueOutputBuffer(*Codec, info: *BufferInfo, timeout_us: i64) isize;
     extern fn AMediaCodec_getOutputBuffer(*Codec, idx: usize, out_size: *usize) ?[*]u8;
     extern fn AMediaCodec_getOutputFormat(*Codec) ?*Format;
@@ -146,7 +260,6 @@ const AndroidVideoDecoder = struct {
     // FIFO acquire (oldest un-acquired) — feed-ahead consumes the reader in order.
     extern fn AImageReader_acquireNextImage(*ImageReader, image: *?*Image) i32;
     extern fn AImageReader_delete(*ImageReader) void;
-    const CropRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     extern fn AImage_getNumberOfPlanes(*const Image, num: *i32) i32;
     extern fn AImage_getPlaneData(*const Image, plane: i32, data: *?[*]u8, len: *i32) i32;
     extern fn AImage_getPlaneRowStride(*const Image, plane: i32, stride: *i32) i32;
@@ -166,10 +279,15 @@ const AndroidVideoDecoder = struct {
     const AMEDIA_ERROR_BASE: isize = -10000;
     const FORMAT_YUV_420_888: i32 = 0x23; // AIMAGE_FORMAT_YUV_420_888
 
-    // AMediaFormat keys.
+    // AMediaFormat keys. The colour keys are the API-28 `AMEDIAFORMAT_KEY_COLOR_*`
+    // string values, spelled out so the binary has no link dependency on the
+    // API-28 symbols: on an older device `getInt32` simply reports them absent.
     const KEY_MIME: [*:0]const u8 = "mime";
     const KEY_WIDTH: [*:0]const u8 = "width";
     const KEY_HEIGHT: [*:0]const u8 = "height";
+    const KEY_COLOR_STANDARD: [*:0]const u8 = "color-standard";
+    const KEY_COLOR_RANGE: [*:0]const u8 = "color-range";
+    const KEY_COLOR_TRANSFER: [*:0]const u8 = "color-transfer";
 
     // Decoded-frame ring buffer — the jitter cushion that decouples decoding from
     // presentation. A WORKER THREAD fills it: feed the codec, render output into
@@ -191,6 +309,7 @@ const AndroidVideoDecoder = struct {
         u: []u8, // cw*ch (tight, de-interleaved chroma)
         v: []u8, // cw*ch
         pts: f64 = 0, // presentation timestamp, seconds
+        color: ColorSpace = .{}, // the output format's colour keys when decoded
     };
 
     /// Heap-allocated shared state. The outer `AndroidVideoDecoder` is moved by
@@ -234,6 +353,16 @@ const AndroidVideoDecoder = struct {
         // output buffer FLAG_EOS. `eof()` combines it with an empty ring so every
         // buffered frame is presented before the game hands off.
         eof_seen: bool,
+        // The codec's CURRENT output colour keys (worker writes on every
+        // OUTPUT_FORMAT_CHANGED; stamped onto each frame at publish) and the
+        // colour space of the frame most recently popped by the render thread
+        // — `colorSpace()`. Both under `mutex`.
+        color: ColorSpace,
+        last_color: ColorSpace,
+        // Worker-only: the crop rect / read failure last logged, so each is
+        // reported once (per change), not per frame.
+        logged_crop: ?CropRect,
+        logged_read_err: ?ReadError,
         running: std.atomic.Value(bool),
         thread: ?std.Thread,
     };
@@ -338,6 +467,10 @@ const AndroidVideoDecoder = struct {
             .ring_count = 0,
             .pending = 0,
             .eof_seen = false,
+            .color = .{},
+            .last_color = .{},
+            .logged_crop = null,
+            .logged_read_err = null,
             .running = std.atomic.Value(bool).init(true),
             .thread = null,
         };
@@ -527,7 +660,10 @@ const AndroidVideoDecoder = struct {
         const filled = fillPlanes(st, img, slot.y, slot.u, slot.v);
         if (filled) slot.pts = imageTimestamp(img);
         lock(&st.mutex);
-        if (filled) st.ring_count += 1;
+        if (filled) {
+            slot.color = st.color;
+            st.ring_count += 1;
+        }
         if (st.pending > 0) st.pending -= 1;
         st.mutex.unlock();
         return true;
@@ -559,7 +695,7 @@ const AndroidVideoDecoder = struct {
             while (!st.input_done and cushionLoad(st) < RING_SIZE) {
                 const in_idx = AMediaCodec_dequeueInputBuffer(st.codec, 0);
                 if (in_idx <= AMEDIA_ERROR_BASE) {
-                    terminalCodecError(st, "input", in_idx);
+                    terminalCodecError(st, "input dequeue", in_idx);
                     break;
                 }
                 if (in_idx < 0) break; // no free input buffer right now
@@ -603,7 +739,7 @@ const AndroidVideoDecoder = struct {
                     continue;
                 }
                 if (out_idx <= AMEDIA_ERROR_BASE) {
-                    terminalCodecError(st, "output", out_idx);
+                    terminalCodecError(st, "output dequeue", out_idx);
                     break;
                 }
                 if (out_idx < 0) break; // no decoded output ready right now
@@ -617,8 +753,20 @@ const AndroidVideoDecoder = struct {
                 // pending only then, or `pending` would never drain and `eof()`
                 // would never fire.
                 const has_frame = info.size > 0;
-                _ = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), has_frame);
+                const rc = AMediaCodec_releaseOutputBuffer(st.codec, @intCast(out_idx), has_frame);
                 if (!has_frame) continue;
+                if (rc != AMEDIA_OK) {
+                    // The frame was NOT handed to the reader, so it must not
+                    // be counted as pending: RING_SIZE such failures would
+                    // fill the cushion, stop every further dequeue (the EOS
+                    // carrier included) and — with `eof_seen` still false —
+                    // starve the dry-drain failsafe: a play-once clip stuck
+                    // forever. A codec/surface that refuses a render is done;
+                    // end the stream like any other codec error (the ring
+                    // still plays out, then `eof()` fires).
+                    terminalCodecError(st, "output release", rc);
+                    break;
+                }
                 lock(&st.mutex);
                 st.pending += 1;
                 st.mutex.unlock();
@@ -668,11 +816,12 @@ const AndroidVideoDecoder = struct {
     /// reader, not frames the codec still owes, so they can still be acquired
     /// and shown. Any that never surface are written off by the worker's
     /// dry-drain failsafe once `eof_seen` is set, the same as after a normal EOS.
-    fn terminalCodecError(st: *State, side: []const u8, code: isize) void {
+    /// Also the terminal path for a failed `releaseOutputBuffer(render=true)`.
+    fn terminalCodecError(st: *State, what: []const u8, code: anytype) void {
         lock(&st.mutex);
         defer st.mutex.unlock();
         if (st.eof_seen) return; // already ending (EOS or an earlier error)
-        std.log.err("video: codec error {d} on {s} dequeue — ending the stream", .{ code, side });
+        std.log.err("video: codec error {d} on {s} — ending the stream", .{ code, what });
         st.input_done = true;
         st.eof_seen = true;
     }
@@ -693,11 +842,14 @@ const AndroidVideoDecoder = struct {
         return &st.ring[st.ring_head];
     }
 
-    fn popDone(st: *State) void {
+    /// Advance the head after copying it out; `color` (the popped frame's)
+    /// becomes what `colorSpace()` reports.
+    fn popDone(st: *State, color: ColorSpace) void {
         lock(&st.mutex);
         defer st.mutex.unlock();
         st.ring_head = (st.ring_head + 1) % RING_SIZE;
         st.ring_count -= 1;
+        st.last_color = color;
     }
 
     /// CPU fallback path: pop the oldest ready frame and convert its (already
@@ -709,10 +861,24 @@ const AndroidVideoDecoder = struct {
         const cw = planes.chromaWidth(st.w);
         const slot = popPeek(st) orelse return null;
         // Ring planes are tight: luma stride w / pixel 1; chroma stride cw / 1.
-        yuv.yuv420ToRgba(slot.y, st.w, 1, slot.u, slot.v, cw, 1, st.w, st.h, out);
+        // The matrix follows the frame's colour keys (BT.709 vs BT.601, full
+        // vs limited) — `ColorSpace.matrix`.
+        yuv.yuv420ToRgbaMatrix(slot.color.matrix(st.h), slot.y, st.w, 1, slot.u, slot.v, cw, 1, st.w, st.h, out);
         const pts = slot.pts;
-        popDone(st);
+        popDone(st, slot.color);
         return pts;
+    }
+
+    /// The colour space of the frame most recently returned by `decodeFrame`
+    /// / `decodeFramePlanes` (before the first: what the codec has reported
+    /// so far, `.unspecified` until its first OUTPUT_FORMAT_CHANGED). The
+    /// GPU-YUV consumer selects its shader matrix from this (labelle-bgfx#155;
+    /// bgfx's `fs_yuv` is BT.601 limited until then).
+    pub fn colorSpace(self: *const AndroidVideoDecoder) ColorSpace {
+        const st = self.st;
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        return st.last_color;
     }
 
     /// GPU-YUV path: pop the oldest ready frame and memcpy its tight Y/U/V planes
@@ -731,29 +897,74 @@ const AndroidVideoDecoder = struct {
         @memcpy(u, slot.u);
         @memcpy(v, slot.v);
         const pts = slot.pts;
-        popDone(st);
+        popDone(st, slot.color);
         return pts;
     }
 
-    /// An output-format change is emitted once before the first frame. We
-    /// deliberately do NOT re-read width/height here.
+    /// An output-format change is emitted once before the first frame (and
+    /// again if the decoded layout changes). It retains the COLOUR keys —
+    /// `color-standard` / `color-range` / `color-transfer` — as the current
+    /// `ColorSpace`, stamped onto every frame published from here on: the CPU
+    /// `decodeFrame` selects its matrix from it and `colorSpace()` hands it to
+    /// the GPU-YUV consumer (labelle-bgfx#155). Absent keys (untagged stream,
+    /// pre-API-28 device) leave the fields `.unspecified`, which `matrix`
+    /// resolves by height.
     ///
-    /// `openFd` already sized `w`/`h` (and thus the ImageReader) from the
-    /// track's display dimensions, and `Player.init` allocated its texture +
-    /// `pixels` buffer from `width()`/`height()` before any frame is decoded.
-    /// Mutating the dims now — to the aligned/coded size (e.g. 1080 → 1088) OR to
-    /// a crop rect that differs from the open dims — would desync that buffer, so
-    /// `decodeFrame`'s `out.len != w*h*4` guard would then reject every frame
-    /// (black screen). Keep the allocation dimensions stable; crop-accurate
-    /// display, if ever needed, belongs at draw time as a source-rect crop.
+    /// We deliberately do NOT re-read width/height here. `openFd` already
+    /// sized `w`/`h` (and thus the ImageReader) from the track's display
+    /// dimensions, and `Player.init` allocated its texture + `pixels` buffer
+    /// from `width()`/`height()` before any frame is decoded. Mutating the dims
+    /// now — to the aligned/coded size (e.g. 1080 → 1088) OR to a crop rect that
+    /// differs from the open dims — would desync that buffer, so `decodeFrame`'s
+    /// `out.len != w*h*4` guard would then reject every frame (black screen).
+    /// The coded-size padding is handled per frame by the AImage crop rect
+    /// (`readPlanes`) instead.
     fn refreshFormat(st: *State) void {
-        _ = st;
+        const fmt = AMediaCodec_getOutputFormat(st.codec) orelse return;
+        defer AMediaFormat_delete(fmt);
+        var standard: i32 = 0;
+        var range: i32 = 0;
+        var transfer: i32 = 0;
+        const color = ColorSpace.fromFormat(
+            if (AMediaFormat_getInt32(fmt, KEY_COLOR_STANDARD, &standard)) standard else null,
+            if (AMediaFormat_getInt32(fmt, KEY_COLOR_RANGE, &range)) range else null,
+            if (AMediaFormat_getInt32(fmt, KEY_COLOR_TRANSFER, &transfer)) transfer else null,
+        );
+        var fw: i32 = 0;
+        var fh: i32 = 0;
+        _ = AMediaFormat_getInt32(fmt, KEY_WIDTH, &fw);
+        _ = AMediaFormat_getInt32(fmt, KEY_HEIGHT, &fh);
+        std.log.info("video: output color standard={s} range={s} transfer={s} (raw {d}/{d}/{d}; format {d}x{d}, track {d}x{d}) → CPU matrix {s}", .{
+            @tagName(color.standard),
+            @tagName(color.range),
+            @tagName(color.transfer),
+            standard,
+            range,
+            transfer,
+            fw,
+            fh,
+            st.w,
+            st.h,
+            matrixName(color.matrix(st.h)),
+        });
+        lock(&st.mutex);
+        defer st.mutex.unlock();
+        st.color = color;
+        if (st.ring_count == 0) st.last_color = color; // nothing popped yet: report the stream's
+    }
+
+    fn matrixName(m: yuv.Matrix) []const u8 {
+        const hd = m.rv == yuv.Matrix.bt709_limited.rv or m.rv == yuv.Matrix.bt709_full.rv;
+        const full = m.y_off == 0;
+        return if (hd) (if (full) "bt709_full" else "bt709_limited") else (if (full) "bt601_full" else "bt601_limited");
     }
 
     /// The three crop-offset, stride-described plane slices of a YUV_420_888
     /// AImage, ready for either the CPU convert (`yuv.yuv420ToRgba`) or the GPU
     /// plane tighten (`planes.tightenPlane`). `u`/`v` may alias one interleaved
     /// buffer (NV12, `uv_pixel_stride == 2`) or be separate (I420, `== 1`).
+    /// Each slice starts at the crop origin and is verified to hold every
+    /// sample of the `w × h` (luma) / `cw × ch` (chroma) copy.
     const ImagePlanes = struct {
         y: []const u8,
         u: []const u8,
@@ -762,15 +973,18 @@ const AndroidVideoDecoder = struct {
         y_pixel_stride: u32,
         uv_row_stride: u32,
         uv_pixel_stride: u32,
+        crop: CropRect,
     };
 
     /// Read the Y/U/V plane pointers, strides, and crop rect from a
-    /// YUV_420_888 AImage. Format-agnostic (planar / semi-planar / vendor
-    /// Flexible all expose the same plane+stride model). Null on any API error
-    /// or out-of-range crop. Shared by `convertImage` (CPU) + `fillPlanes` (GPU).
-    fn readPlanes(img: *const Image) ?ImagePlanes {
+    /// YUV_420_888 AImage for a `w × h` frame. Format-agnostic (planar /
+    /// semi-planar / vendor Flexible all expose the same plane+stride model).
+    /// Errors on an API failure, an inconsistent crop (`resolveCrop`) or a
+    /// plane too small for the crop-offset copy (`planeHolds`) — the frame is
+    /// rejected rather than sampling padding or reading out of bounds.
+    fn readPlanes(img: *const Image, w: u32, h: u32) ReadError!ImagePlanes {
         var num: i32 = 0;
-        if (AImage_getNumberOfPlanes(img, &num) != AMEDIA_OK or num < 3) return null;
+        if (AImage_getNumberOfPlanes(img, &num) != AMEDIA_OK or num < 3) return error.NoPlanes;
 
         var yd: ?[*]u8 = null;
         var ud: ?[*]u8 = null;
@@ -778,13 +992,13 @@ const AndroidVideoDecoder = struct {
         var yl: i32 = 0;
         var ul: i32 = 0;
         var vl: i32 = 0;
-        if (AImage_getPlaneData(img, 0, &yd, &yl) != AMEDIA_OK) return null;
-        if (AImage_getPlaneData(img, 1, &ud, &ul) != AMEDIA_OK) return null;
-        if (AImage_getPlaneData(img, 2, &vd, &vl) != AMEDIA_OK) return null;
-        const yp = yd orelse return null;
-        const up = ud orelse return null;
-        const vp = vd orelse return null;
-        if (yl <= 0 or ul <= 0 or vl <= 0) return null;
+        if (AImage_getPlaneData(img, 0, &yd, &yl) != AMEDIA_OK) return error.PlaneData;
+        if (AImage_getPlaneData(img, 1, &ud, &ul) != AMEDIA_OK) return error.PlaneData;
+        if (AImage_getPlaneData(img, 2, &vd, &vl) != AMEDIA_OK) return error.PlaneData;
+        const yp = yd orelse return error.PlaneData;
+        const up = ud orelse return error.PlaneData;
+        const vp = vd orelse return error.PlaneData;
+        if (yl <= 0 or ul <= 0 or vl <= 0) return error.PlaneData;
 
         var y_row: i32 = 0;
         var uv_row: i32 = 0;
@@ -800,18 +1014,23 @@ const AndroidVideoDecoder = struct {
         const ux: u32 = @intCast(@max(uv_px, 1));
 
         // Crop rect: the buffer may be padded beyond the display frame (e.g.
-        // 1080 → 1088). Offset each plane to the crop's top-left so we sample the
-        // real frame, not alignment padding. Defaults to (0,0) when absent.
+        // 1080 → 1088 rows), and the valid region may not start at the origin.
+        // Offset each plane to the crop's top-left and copy `w × h` from there
+        // — the crop must hold at least that (see `resolveCrop`). A failed
+        // `getCropRect` leaves the all-zero rect = no crop.
         var crop: CropRect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        _ = AImage_getCropRect(img, &crop);
-        const cl: u32 = @intCast(@max(crop.left, 0));
-        const ct: u32 = @intCast(@max(crop.top, 0));
-        const y_off: usize = @as(usize, ct) * ys + @as(usize, cl) * yx;
-        const uv_off: usize = @as(usize, ct / 2) * us + @as(usize, cl / 2) * ux;
+        if (AImage_getCropRect(img, &crop) != AMEDIA_OK) crop = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        const origin = try resolveCrop(crop, w, h);
+        const cw = planes.chromaWidth(w);
+        const ch = planes.chromaHeight(h);
+        const y_off: usize = @as(usize, origin.top) * ys + @as(usize, origin.left) * yx;
+        const uv_off: usize = @as(usize, origin.top / 2) * us + @as(usize, origin.left / 2) * ux;
         const yl_u: usize = @intCast(yl);
         const ul_u: usize = @intCast(ul);
         const vl_u: usize = @intCast(vl);
-        if (y_off >= yl_u or uv_off >= ul_u or uv_off >= vl_u) return null;
+        if (!planeHolds(yl_u, ys, yx, y_off, w, h)) return error.PlaneTooSmall;
+        if (!planeHolds(ul_u, us, ux, uv_off, cw, ch)) return error.PlaneTooSmall;
+        if (!planeHolds(vl_u, us, ux, uv_off, cw, ch)) return error.PlaneTooSmall;
 
         return .{
             .y = yp[y_off..yl_u],
@@ -821,6 +1040,7 @@ const AndroidVideoDecoder = struct {
             .y_pixel_stride = yx,
             .uv_row_stride = us,
             .uv_pixel_stride = ux,
+            .crop = crop,
         };
     }
 
@@ -828,9 +1048,24 @@ const AndroidVideoDecoder = struct {
     /// tightening Y; row-tightening AND de-interleaving U/V for the NV12
     /// `pixel_stride == 2` case). Runs on the WORKER thread — reads of the
     /// image's gralloc memory are slow (~10–30 ms/frame even vectorized) and
-    /// must not touch the render thread.
+    /// must not touch the render thread. False (frame skipped) when the image
+    /// cannot be read consistently; the crop rect and any read error are
+    /// logged once per change, not per frame.
     fn fillPlanes(st: *State, img: *Image, y_dst: []u8, u_dst: []u8, v_dst: []u8) bool {
-        const p = readPlanes(img) orelse return false;
+        const p = readPlanes(img, st.w, st.h) catch |e| {
+            const already_logged = if (st.logged_read_err) |prev| prev == e else false;
+            if (!already_logged) {
+                st.logged_read_err = e;
+                std.log.err("video: image rejected ({s}) for the {d}x{d} frame — skipping until it changes", .{ @errorName(e), st.w, st.h });
+            }
+            return false;
+        };
+        if (st.logged_crop == null or !std.meta.eql(st.logged_crop.?, p.crop)) {
+            st.logged_crop = p.crop;
+            std.log.info("video: image crop l={d} t={d} r={d} b={d} for the {d}x{d} frame (Y row stride {d} px {d}; UV row stride {d} px {d}; plane bytes {d}/{d}/{d})", .{
+                p.crop.left, p.crop.top, p.crop.right, p.crop.bottom, st.w, st.h, p.y_row_stride, p.y_pixel_stride, p.uv_row_stride, p.uv_pixel_stride, p.y.len, p.u.len, p.v.len,
+            });
+        }
         const cw = planes.chromaWidth(st.w);
         const ch = planes.chromaHeight(st.h);
         planes.tightenPlane(p.y, p.y_row_stride, p.y_pixel_stride, st.w, st.h, y_dst);
@@ -855,3 +1090,77 @@ const AndroidVideoDecoder = struct {
         st.allocator.destroy(st);
     }
 };
+
+// ── Tests (host-runnable — the pure colour / crop helpers) ───────────────
+
+const testing = std.testing;
+
+test "ColorSpace.fromFormat: the MediaFormat constants; absent keys stay unspecified" {
+    const hd = ColorSpace.fromFormat(1, 2, 3);
+    try testing.expectEqual(ColorSpace.Standard.bt709, hd.standard);
+    try testing.expectEqual(ColorSpace.Range.limited, hd.range);
+    try testing.expectEqual(ColorSpace.Transfer.sdr_video, hd.transfer);
+    try testing.expectEqual(ColorSpace.Standard.bt601_pal, ColorSpace.fromFormat(2, null, null).standard);
+    try testing.expectEqual(ColorSpace.Standard.bt601_ntsc, ColorSpace.fromFormat(4, null, null).standard);
+    try testing.expectEqual(ColorSpace.Standard.bt2020, ColorSpace.fromFormat(6, 1, 6).standard);
+    try testing.expectEqual(ColorSpace.Range.full, ColorSpace.fromFormat(6, 1, 6).range);
+    try testing.expectEqual(ColorSpace.Transfer.st2084, ColorSpace.fromFormat(6, 1, 6).transfer);
+    try testing.expectEqual(ColorSpace.Transfer.hlg, ColorSpace.fromFormat(null, null, 7).transfer);
+    try testing.expectEqual(ColorSpace.Standard.other, ColorSpace.fromFormat(99, 99, 99).standard);
+    try testing.expectEqual(ColorSpace.Range.unspecified, ColorSpace.fromFormat(99, 99, 99).range);
+    try testing.expectEqual(ColorSpace{}, ColorSpace.fromFormat(null, null, null));
+}
+
+test "ColorSpace.matrix: standard + range pick the matrix; unspecified follows HD/SD by height" {
+    const M = yuv.Matrix;
+    try testing.expectEqual(M.bt709_limited, (ColorSpace{ .standard = .bt709, .range = .limited }).matrix(1080));
+    try testing.expectEqual(M.bt709_full, (ColorSpace{ .standard = .bt709, .range = .full }).matrix(1080));
+    try testing.expectEqual(M.bt601_limited, (ColorSpace{ .standard = .bt601_ntsc }).matrix(1080)); // tagged 601 wins over height
+    try testing.expectEqual(M.bt601_full, (ColorSpace{ .standard = .bt601_pal, .range = .full }).matrix(480));
+    try testing.expectEqual(M.bt709_limited, (ColorSpace{ .standard = .bt2020 }).matrix(2160));
+    // Untagged: the ffmpeg/Chromium convention.
+    try testing.expectEqual(M.bt709_limited, (ColorSpace{}).matrix(1080));
+    try testing.expectEqual(M.bt709_limited, (ColorSpace{}).matrix(720));
+    try testing.expectEqual(M.bt601_limited, (ColorSpace{}).matrix(576));
+    try testing.expectEqual(M.bt601_full, (ColorSpace{ .range = .full }).matrix(480));
+}
+
+test "resolveCrop: no rect = origin; a crop covering the frame copies from its origin; inconsistent crops error" {
+    const none = CropRect{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    try testing.expectEqual(@as(u32, 0), (try resolveCrop(none, 1920, 1080)).top);
+    // The common padded case: 1920x1088 buffer, crop = the 1920x1080 frame.
+    const coded = CropRect{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    try testing.expectEqual(@as(u32, 0), (try resolveCrop(coded, 1920, 1080)).left);
+    // An offset crop: copy from (8, 4).
+    const offset = CropRect{ .left = 8, .top = 4, .right = 1928, .bottom = 1084 };
+    const o = try resolveCrop(offset, 1920, 1080);
+    try testing.expectEqual(@as(u32, 8), o.left);
+    try testing.expectEqual(@as(u32, 4), o.top);
+    // A crop LARGER than the frame is fine (the top-left w×h is taken).
+    _ = try resolveCrop(.{ .left = 0, .top = 0, .right = 1920, .bottom = 1088 }, 1920, 1080);
+    // Smaller than the frame in either axis, inverted, or negative: rejected.
+    try testing.expectError(error.SmallerThanFrame, resolveCrop(.{ .left = 0, .top = 0, .right = 1918, .bottom = 1080 }, 1920, 1080));
+    try testing.expectError(error.SmallerThanFrame, resolveCrop(.{ .left = 8, .top = 0, .right = 1920, .bottom = 1080 }, 1920, 1080));
+    try testing.expectError(error.Inverted, resolveCrop(.{ .left = 10, .top = 0, .right = 10, .bottom = 1080 }, 1920, 1080));
+    try testing.expectError(error.Inverted, resolveCrop(.{ .left = 0, .top = 100, .right = 1920, .bottom = 50 }, 1920, 1080));
+    try testing.expectError(error.NegativeOrigin, resolveCrop(.{ .left = -8, .top = 0, .right = 1912, .bottom = 1080 }, 1920, 1080));
+}
+
+test "planeHolds: the bottom-right sample must lie inside the plane (the check that replaces the assert)" {
+    // Tight 4x2 luma plane: exactly 8 bytes hold it; 7 do not.
+    try testing.expect(planeHolds(8, 4, 1, 0, 4, 2));
+    try testing.expect(!planeHolds(7, 4, 1, 0, 4, 2));
+    // Row-padded (stride 6): last sample at 1*6 + 3 = 9 → needs 10 bytes.
+    try testing.expect(planeHolds(10, 6, 1, 0, 4, 2));
+    try testing.expect(!planeHolds(9, 6, 1, 0, 4, 2));
+    // A crop origin offset shifts the requirement: the finding's OOB case —
+    // an offset crop whose final row exceeds the shortened plane slice.
+    const off: usize = 2 * 6 + 1; // origin (1, 2) in a stride-6 plane
+    try testing.expect(planeHolds(off + 10, 6, 1, off, 4, 2));
+    try testing.expect(!planeHolds(off + 9, 6, 1, off, 4, 2));
+    // NV12 chroma (pixel stride 2): 2x1 chroma needs bytes 0..3 → len 3.
+    try testing.expect(planeHolds(3, 4, 2, 0, 2, 1));
+    try testing.expect(!planeHolds(2, 4, 2, 0, 2, 1));
+    // Degenerate sizes read nothing.
+    try testing.expect(planeHolds(0, 4, 1, 0, 0, 0));
+}
