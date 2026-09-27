@@ -113,11 +113,13 @@ pub fn shellQuote(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// `adb` under the SDK's platform-tools, else on PATH.
+/// `adb` under the SDK's platform-tools, else on PATH, whether or not an
+/// SDK home is set (a minimal SDK with a Homebrew/apt `adb` is common).
 pub fn findAdb(a: std.mem.Allocator, io: std.Io, env: *const sdk.Env) ![]const u8 {
     if (sdk.findSdkHome(env)) |home| {
         if (try sdk.findAdbUnder(a, io, env, home)) |adb| return adb;
-    } else if (try sdk.findOnPath(a, io, env, "adb")) |adb| return adb;
+    }
+    if (try sdk.findOnPath(a, io, env, "adb")) |adb| return adb;
     std.debug.print("labelle-android: adb not found: set ANDROID_HOME or add adb to PATH\n", .{});
     return error.AdbNotFound;
 }
@@ -209,4 +211,24 @@ test "findAdb: platform-tools first; no SDK and no PATH is AdbNotFound" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ "platform-tools", name }), .data = "" });
     try env.put("ANDROID_HOME", root);
     try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "platform-tools", name }), try findAdb(a, std.testing.io, &env));
+}
+
+test "findAdb: an SDK home without platform-tools/adb falls back to PATH" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const name = if (builtin.os.tag == .windows) "adb.exe" else "adb";
+    // A fake SDK with platform-tools/ but no adb in it...
+    try tmp.dir.createDirPath(std.testing.io, "sdk/platform-tools");
+    // ...and an adb on a fake PATH.
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ "bin", name }), .data = "" });
+    var env = sdk.Env.init(a);
+    try env.put("ANDROID_HOME", try std.fs.path.join(a, &.{ root, "sdk" }));
+    try std.testing.expectError(error.AdbNotFound, findAdb(a, std.testing.io, &env));
+    try env.put("PATH", try std.fs.path.join(a, &.{ root, "bin" }));
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ root, "bin", name }), try findAdb(a, std.testing.io, &env));
 }

@@ -108,15 +108,35 @@ pub fn generate(allocator: std.mem.Allocator, in: Inputs) ![]u8 {
     , .{
         try xmlEscape(allocator, in.package_name),
         in.version_code,
-        try xmlEscape(allocator, in.version_name),
+        try xmlEscape(allocator, try androidString(allocator, in.version_name)),
         in.min_sdk_version,
         in.target_sdk_version,
-        try xmlEscape(allocator, in.app_name),
+        try xmlEscape(allocator, try androidString(allocator, in.app_name)),
         icon_attr,
         debuggable_attr,
         orientation,
         theme_attr,
     });
+}
+
+/// Encode `text` as an Android string literal, the way aapt reads a
+/// string attribute once the XML parser is done with it: a leading `@` or
+/// `?` would make it a resource / theme-attribute reference (`@Home` fails
+/// to link), an unescaped `'` is an aapt error ("Apostrophe not preceded
+/// by \\"), an unescaped `"` starts a quoted run and is dropped, and `\\`
+/// starts an escape. Each gets a backslash. Text with none of them (every
+/// name the CLI could package) is returned unchanged; the result is then
+/// XML-escaped by `xmlEscape`.
+fn androidString(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const sigil = text.len > 0 and (text[0] == '@' or text[0] == '?');
+    if (!sigil and std.mem.indexOfAny(u8, text, "\\'\"") == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    if (sigil) try out.append(allocator, '\\');
+    for (text) |ch| {
+        if (ch == '\\' or ch == '\'' or ch == '"') try out.append(allocator, '\\');
+        try out.append(allocator, ch);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// Escape the five XML-special characters of an attribute value. The CLI
@@ -282,8 +302,36 @@ test "attribute text is XML-escaped; plain text is untouched" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const xml = try generate(a, with("app_name", "Tom & \"Jerry\" <3"));
-    try std.testing.expect(std.mem.indexOf(u8, xml, "android:label=\"Tom &amp; &quot;Jerry&quot; &lt;3\"") != null);
+    const xml = try generate(a, with("app_name", "Tom & Jerry <3"));
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:label=\"Tom &amp; Jerry &lt;3\"") != null);
     const plain = "Flying Platform";
     try std.testing.expect((try xmlEscape(a, plain)).ptr == plain.ptr);
+}
+
+test "app_name and version_name are Android string literals: sigils, quotes and backslashes escaped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_][2][]const u8{
+        // A leading @/? is a reference to aapt; later ones are plain text.
+        .{ "@Home", "\\@Home" },
+        .{ "?attr", "\\?attr" },
+        .{ "Tom@Home?", "Tom@Home?" },
+        // Apostrophes and quotes: backslash (aapt), then the XML entity.
+        .{ "it's", "it\\&apos;s" },
+        .{ "say \"hi\"", "say \\&quot;hi\\&quot;" },
+        .{ "a\\b", "a\\\\b" },
+        .{ "", "" },
+    };
+    for (cases) |c| {
+        const label = try generate(a, with("app_name", c[0]));
+        const want_label = try std.fmt.allocPrint(a, "android:label=\"{s}\"", .{c[1]});
+        try std.testing.expect(std.mem.indexOf(u8, label, want_label) != null);
+        const version = try generate(a, with("version_name", c[0]));
+        const want_version = try std.fmt.allocPrint(a, "android:versionName=\"{s}\">", .{c[1]});
+        try std.testing.expect(std.mem.indexOf(u8, version, want_version) != null);
+    }
+    // A normal name is untouched (the FP manifest test above stays byte-identical).
+    const plain = "Flying Platform";
+    try std.testing.expect((try androidString(a, plain)).ptr == plain.ptr);
 }

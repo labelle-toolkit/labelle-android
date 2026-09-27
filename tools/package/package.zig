@@ -199,6 +199,11 @@ pub fn package(
         try argv.appendSlice(a, &.{ tools.aapt, "package", "-f", "-M", manifest_path, "-I", tools.android_jar, "-F", unsigned_apk });
         if (cwd.access(io, assets_dst, .{})) |_| {
             try argv.appendSlice(a, &.{ "-A", assets_dst });
+            // Videos are read in place from the APK
+            // (`AAsset_openFileDescriptor64`), which only works for STORED
+            // entries. aapt already stores most video suffixes; the rest are
+            // added here.
+            for (aapt_extra_no_compress) |ext| try argv.appendSlice(a, &.{ "-0", ext });
         } else |_| {}
         // `res/` exists only when the launcher icon was staged; `-S` is what
         // makes the APK carry a `resources.arsc`, which apps targeting API
@@ -232,6 +237,14 @@ pub fn package(
     try std.Io.Dir.rename(cwd, signed_apk, cwd, out.apk, io);
     std.debug.print("  APK: {s}\n", .{out.apk});
 }
+
+/// Suffixes aapt (build-tools 34-36, `kNoCompressExt`) stores uncompressed
+/// without being told: the video ones among them.
+const aapt_stored_video_extensions = [_][]const u8{ ".mp4", ".m4v", ".3gp", ".webm", ".mkv" };
+
+/// `-0 <ext>` for every video suffix the runtime reads from the APK
+/// (`slim.apk_read_extensions`) that aapt would otherwise deflate.
+pub const aapt_extra_no_compress = [_][]const u8{"mov"};
 
 /// Run one packaging tool; a non-zero exit is `error.PackageFailed` with
 /// the tool's stderr printed.
@@ -313,4 +326,16 @@ test "package: a missing libgame.so fails before anything is staged" {
         .llvm_strip = null,
     }));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, staging, .{}));
+}
+
+test "aapt: every video the runtime reads from the APK is stored uncompressed" {
+    for (slim.apk_read_extensions) |ext| {
+        var stored = false;
+        for (aapt_stored_video_extensions) |d| stored = stored or std.ascii.eqlIgnoreCase(ext, d);
+        for (aapt_extra_no_compress) |x| stored = stored or std.ascii.eqlIgnoreCase(ext[1..], x);
+        if (!stored) {
+            std.debug.print("{s} would be deflated by aapt\n", .{ext});
+            return error.TestUnexpectedResult;
+        }
+    }
 }

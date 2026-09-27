@@ -138,11 +138,26 @@ fn checkedApk(c: Context, target_dir: []const u8) ![]const u8 {
     };
     const record = std.json.parseFromSliceLeaky(Record, c.a, raw, .{}) catch return error.StaleApk;
     const so_now = fileSha256(c.a, c.io, try pkg.soPath(c.a, target_dir)) catch return error.StaleApk;
-    if (!std.mem.eql(u8, record.so_sha256, so_now)) {
-        std.debug.print("labelle-android: {s} was packaged from an older libgame.so: rebuild with `labelle build --platform=android`\n", .{apk});
-        return error.StaleApk;
+    switch (staleness(record, so_now, try hexSha256(c.a, c.settings_bytes), c.settings.package_name)) {
+        .fresh => return apk,
+        .library => std.debug.print("labelle-android: {s} was packaged from an older libgame.so: rebuild with `labelle build --platform=android`\n", .{apk}),
+        .settings => std.debug.print("labelle-android: {s} was packaged with different providers/android.json settings (package {s}, now {s}): rebuild with `labelle build --platform=android`\n", .{ apk, record.package_name, c.settings.package_name }),
     }
-    return apk;
+    return error.StaleApk;
+}
+
+pub const Staleness = enum { fresh, library, settings };
+
+/// Whether the APK a package record describes is still what this build
+/// would package: the same `libgame.so` and the same settings file (the
+/// package name, label, SDK levels, signing... the APK was made with). An
+/// APK packaged under an old `package_name` would install fine and then
+/// fail to launch as the new one, so the settings are checked too.
+pub fn staleness(record: Record, so_sha256: []const u8, settings_sha256: []const u8, package_name: []const u8) Staleness {
+    if (!std.mem.eql(u8, record.so_sha256, so_sha256)) return .library;
+    if (!std.mem.eql(u8, record.settings_sha256, settings_sha256) or
+        !std.mem.eql(u8, record.package_name, package_name)) return .settings;
+    return .fresh;
 }
 
 // ── run/replace: deploy ───────────────────────────────────────────────────
@@ -359,6 +374,28 @@ test "parseRunArgs: both spellings; unknown flags and missing values are refused
     try std.testing.expectError(error.UnknownArgument, parseRunArgs(&.{"--release"}));
     try std.testing.expectError(error.InvalidArgs, parseRunArgs(&.{"--device"}));
     try std.testing.expectError(error.InvalidArgs, parseRunArgs(&.{"--apk="}));
+}
+
+test "staleness: the recorded library and settings must both match" {
+    const a = std.testing.allocator;
+    const settings = "{\"schema_version\": 1, \"package_name\": \"com.a.b\"}";
+    const settings_sha = try hexSha256(a, settings);
+    defer a.free(settings_sha);
+    const so_sha = try hexSha256(a, "LIB");
+    defer a.free(so_sha);
+    const record: Record = .{ .package_name = "com.a.b", .version_code = 1, .optimize = .Debug, .so_sha256 = so_sha, .settings_sha256 = settings_sha };
+    try std.testing.expectEqual(Staleness.fresh, staleness(record, so_sha, settings_sha, "com.a.b"));
+
+    const other_so = try hexSha256(a, "REBUILT");
+    defer a.free(other_so);
+    try std.testing.expectEqual(Staleness.library, staleness(record, other_so, settings_sha, "com.a.b"));
+
+    // providers/android.json edited (a new package_name) without a rebuild.
+    const edited = try hexSha256(a, "{\"schema_version\": 1, \"package_name\": \"com.a.c\"}");
+    defer a.free(edited);
+    try std.testing.expectEqual(Staleness.settings, staleness(record, so_sha, edited, "com.a.c"));
+    // A record whose package differs is stale even if the digest matched.
+    try std.testing.expectEqual(Staleness.settings, staleness(record, so_sha, settings_sha, "com.a.c"));
 }
 
 test "exactlyOne: one wins, none and several are errors" {

@@ -201,7 +201,7 @@ pub fn loadEmbeddedAssets(allocator: std.mem.Allocator, io: std.Io, target_dir: 
 
 /// Extensions the runtime opens from the APK by name (the video path).
 /// Never skipped, whichever rule would otherwise match.
-const apk_read_extensions = [_][]const u8{ ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".3gp" };
+pub const apk_read_extensions = [_][]const u8{ ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".3gp" };
 
 fn isApkRead(rel: []const u8) bool {
     const ext = std.fs.path.extension(rel);
@@ -281,11 +281,11 @@ fn stageDir(
         const dst_sub = try std.fs.path.join(allocator, &.{ dst, entry.name });
         defer allocator.free(dst_sub);
 
-        switch (entry.kind) {
+        switch (try entryAction(io, src_dir, entry.name, entry.kind)) {
             // Every file, `raw/` included, goes through `skipReason`: that is
             // where the video exemption lives.
-            .directory => try stageDir(allocator, io, src_sub, dst_sub, rel, embedded, summary),
-            .file => {
+            .recurse => try stageDir(allocator, io, src_sub, dst_sub, rel, embedded, summary),
+            .copy => {
                 if (skipReason(rel, embedded)) |reason| {
                     const st = try cwd.statFile(io, src_sub, .{});
                     summary.skipped_files[@intFromEnum(reason)] += 1;
@@ -302,9 +302,29 @@ fn stageDir(
                 try cwd.copyFile(src_sub, cwd, dst_sub, io, .{});
                 summary.kept_files += 1;
             },
-            else => {},
+            .skip => {},
         }
     }
+}
+
+pub const EntryAction = enum { recurse, copy, skip };
+
+/// What staging does with the entry `name` of `dir`, whose iterator reported
+/// `kind`: recurse into directories, copy files, skip the rest (symlinks,
+/// devices...). Some filesystems (NFS, FUSE mounts) report `.unknown` for
+/// every entry; those are resolved with a no-follow stat first, so their
+/// files are staged rather than silently left out, and a symlink stays a
+/// symlink (skipped) as it would on any other filesystem.
+pub fn entryAction(io: std.Io, dir: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !EntryAction {
+    const resolved = if (kind == .unknown)
+        (try dir.statFile(io, name, .{ .follow_symlinks = false })).kind
+    else
+        kind;
+    return switch (resolved) {
+        .directory => .recurse,
+        .file => .copy,
+        else => .skip,
+    };
 }
 
 // ── Size report ────────────────────────────────────────────────────
@@ -760,6 +780,25 @@ pub const StageAssetsSpec = struct {
         try std.testing.expect(!fx.exists("dst/raw/sheet"));
         try expectEq(summary.kept_files, 2);
         try expectEq(summary.skipped_files[@intFromEnum(SkipReason.packer_source)], 2);
+    }
+
+    test "entryAction: known kinds decide directly, .unknown is resolved by a no-follow stat" {
+        const io = std.testing.io;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "clip.mp4", .data = "VIDEO" });
+        try tmp.dir.createDirPath(io, "sub");
+        // Known kinds never touch the filesystem (the name does not exist).
+        try expectEq(try entryAction(io, tmp.dir, "absent", .file), .copy);
+        try expectEq(try entryAction(io, tmp.dir, "absent", .directory), .recurse);
+        try expectEq(try entryAction(io, tmp.dir, "absent", .sym_link), .skip);
+        // What an NFS/FUSE iterator reports: resolved from the entry itself.
+        try expectEq(try entryAction(io, tmp.dir, "clip.mp4", .unknown), .copy);
+        try expectEq(try entryAction(io, tmp.dir, "sub", .unknown), .recurse);
+        if (builtin.os.tag != .windows) {
+            try tmp.dir.symLink(io, "clip.mp4", "link.mp4", .{});
+            try expectEq(try entryAction(io, tmp.dir, "link.mp4", .unknown), .skip);
+        }
     }
 
     test "no embeds known: everything but raw/ ships" {

@@ -295,7 +295,9 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     same(argv_of('aapt')[:8], ['package', '-f', '-M', str(staging / 'AndroidManifest.xml'),
                                    '-I', str(sdk / 'platforms/android-34/android.jar'), '-F',
                                    str(staging / 'game.apk.unsigned')])
-    same(argv_of('aapt')[8:], ['-A', str(staging / 'assets'), '-S', str(staging / 'res'), '-0', 'arsc'])
+    # `-0 mov`: the one runtime-read video suffix aapt would deflate.
+    same(argv_of('aapt')[8:], ['-A', str(staging / 'assets'), '-0', 'mov',
+                                   '-S', str(staging / 'res'), '-0', 'arsc'])
     same(argv_of('jar'), ['--update', '--no-compress', '--file', str(staging / 'game.apk.unsigned'),
                               '-C', str(staging), 'lib'])
     same(argv_of('zipalign'), ['-f', '4', str(staging / 'game.apk.unsigned'), str(staging / 'game.apk.aligned')])
@@ -365,6 +367,13 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
         ['-s', 'SERIAL-1', 'install', '-r', str(apk)],
         ['-s', 'SERIAL-1', 'shell', 'am', 'start', '-S', '-n', 'com.labelle.fixture/android.app.NativeActivity'],
     ])
+    # Nor one packaged with other settings (a new package_name, no rebuild):
+    # it would install under the old name and fail to launch as the new one.
+    settings.write_text(json.dumps({'schema_version': 1, 'package_name': 'com.labelle.renamed'}))
+    reset_log()
+    out = run('android', 'run', ok=False)
+    assert 'packaged with different providers/android.json settings' in out and calls() == [], out
+    settings.write_text(good)
     # An APK packaged from another libgame.so is never installed.
     so.write_text('REBUILT-ELSEWHERE')
     reset_log()
