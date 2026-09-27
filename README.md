@@ -4,7 +4,7 @@ Android platform package for the Labelle toolkit.
 
 ## Status
 
-**v0.2.0 (in preparation): the `android` CLI provider ships.** What it carries:
+**v0.2.x: the `android` CLI provider** (v0.2.0 shipped it; v0.2.1 streams the tool's stdout/stderr so output redirected to a file stays whole, cli#446). What it carries:
 
 - **Provider shipped:** `labelle android doctor`, `labelle android run`, `labelle android deploy`, and the `package` / `deploy` / `bundle` target hooks behind `labelle build|run|bundle --platform=android` ([CLI provider](#cli-provider)).
 - **Not included:** `labelle android studio` (the Android Studio / Gradle project export).
@@ -94,7 +94,7 @@ Pin the release (v0.2.0 is the first that ships the provider):
 ```zig
 // project.labelle
 .plugins = .{
-    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.0" },
+    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.1" },
 },
 .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
 ```
