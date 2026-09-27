@@ -73,8 +73,9 @@ pub fn main(init: std.process.Init) !u8 {
             // Splice extra `"key": value` pairs before the closing brace.
             text = try std.fmt.allocPrint(a, "{s},{s}}}", .{ text[0 .. text.len - 1], extra.items });
         }
-        var file = std.Io.Dir.cwd().openFile(io, log_path, .{ .mode = .write_only }) catch
-            try std.Io.Dir.cwd().createFile(io, log_path, .{});
+        // Read access too: Windows needs it to query the length.
+        var file = std.Io.Dir.cwd().openFile(io, log_path, .{ .mode = .read_write }) catch
+            try std.Io.Dir.cwd().createFile(io, log_path, .{ .read = true, .truncate = false });
         defer file.close(io);
         const end = try file.length(io);
         try file.writePositionalAll(io, try std.fmt.allocPrint(a, "{s}\n", .{text}), end);
