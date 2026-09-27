@@ -163,13 +163,14 @@ jobs:
           persist-credentials: false
       - run: zig build
         working-directory: .test-cli
-      # The fixture's backend. ndk_e2e.py stages a copy whose labelle_android
-      # dependency is the staged plugin itself, so the link sees ONE copy of
-      # the JNI C (#405 D11); drop that once bgfx pins the provider release.
+      # The fixture's backend, unmodified. From v0.30.0 bgfx's build hook
+      # points its labelle_android imports at the `android` plugin's module,
+      # so the link sees ONE copy of the JNI C (#405 D11); ndk_e2e.py checks
+      # it is the plugin's.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-bgfx
-          ref: v0.29.1
+          ref: v0.30.0
           path: .test-bgfx
           persist-credentials: false
       - name: Bundle, verify and inspect the fixture APK

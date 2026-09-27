@@ -11,7 +11,7 @@ Android platform package for the Labelle toolkit.
 - **bgfx only:** the packager is verified end to end on labelle-bgfx; sokol is tracked in [#14](https://github.com/labelle-toolkit/labelle-android/issues/14).
 - **Projectless `doctor` needs a project:** the CLI dispatches provider commands only from a project's `.plugins`, so run `labelle android doctor` inside a project that pins this package.
 - **Requires labelle-cli ≥ v2.0.0**, the release that removes the CLI's built-in Android support ([CLI #405](https://github.com/labelle-toolkit/labelle-cli/issues/405) PR 3, [#441](https://github.com/labelle-toolkit/labelle-cli/pull/441)). Older CLIs reserve the `android` namespace and reject this provider.
-- **Requires a labelle-bgfx that pins labelle-android v0.2.0** (labelle-bgfx 0.30.0, coming). See [Duplicate `labelle_android_*` symbols](#duplicate-labelle_android_-symbols-older-bgfx).
+- **Requires labelle-bgfx ≥ 0.30.0** (released), whose build hook links one copy of this package's JNI C next to the plugin. Older bgfx fails the `libgame.so` link; see [Duplicate `labelle_android_*` symbols](#duplicate-labelle_android_-symbols-older-bgfx).
 
 v0.1.x shipped the runtime services only. The runtime extraction, phase 1a–1d ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)): the package ships one Zig module, `labelle_android`, with five services the bgfx and sokol backends used to carry as per-backend copies:
 
@@ -107,7 +107,11 @@ To develop the provider itself, pin a local checkout instead:
 
 #### Duplicate `labelle_android_*` symbols (older bgfx)
 
-labelle-bgfx depends on this package for the runtime services, pinned by hash. labelle-bgfx releases before the one that pins labelle-android v0.2.0 pin v0.1.x, so a project using this provider gets two copies of the package: the backend's and the plugin's. Both carry the same JNI helpers (`src/jni/*.c`), and the `libgame.so` link fails with duplicate `labelle_android_*` symbols (labelle-cli#405 D11). Use a labelle-bgfx release that pins labelle-android v0.2.0 (labelle-bgfx 0.30.0, coming), which makes both resolve to one package. Until then, CI's `tests/provider/ndk_e2e.py` rewrites a copy of bgfx v0.29.1 to use the staged plugin.
+labelle-bgfx depends on this package for the runtime services, fetched by url+hash into `zig-pkg/labelle_android-<version>-<hash>`. The assembler wires every plugin, this provider included, as a `.path` dependency at `<project>/.labelle/deps/labelle-android`. Zig reuses a dependency only when its build root and options match, and a `.path` root never equals a hash-fetched one, so the Android build graph holds two `labelle_android` modules even when both name the same release. Pinning the same labelle-android version on both sides does not help. Each module compiles the JNI helpers (`src/jni/*.c`), and the `libgame.so` link fails with duplicate `labelle_android_*` symbols (labelle-cli#405 D11).
+
+Use labelle-bgfx ≥ 0.30.0 ([labelle-bgfx#158](https://github.com/labelle-toolkit/labelle-bgfx/pull/158)). On Android its build hook (`post_wire`) checks the import the game root gives this plugin, `android`; when that import exists and is a `labelle_android` instance, it points every `labelle_android` import in the graph at it. bgfx's own copy is then unreachable, and the `.so` carries one copy of the JNI C: the plugin's. Without the plugin nothing changes.
+
+The project's plugin pin therefore decides which labelle-android runs, for bgfx too. Keep it API-compatible with the labelle-android release the bgfx version pins (bgfx 0.30.0 pins v0.2.0). CI's `tests/provider/ndk_e2e.py` builds an unmodified bgfx 0.30.0 next to this checkout as the plugin and checks that the JNI C in `libgame.so` is the plugin's copy.
 
 ### `providers/android.json` (schema v1)
 
