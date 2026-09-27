@@ -166,5 +166,14 @@ jobs:
         run: tests/provider/unreserve-android.sh .test-cli
       - run: zig build
         working-directory: .test-cli
+      # The fixture's backend. ndk_e2e.py stages a copy whose labelle_android
+      # dependency is the staged plugin itself, so the link sees ONE copy of
+      # the JNI C (#405 D11); drop that once bgfx pins the provider release.
+      - uses: actions/checkout@v4
+        with:
+          repository: labelle-toolkit/labelle-bgfx
+          ref: v0.29.1
+          path: .test-bgfx
+          persist-credentials: false
       - name: Bundle, verify and inspect the fixture APK
-        run: python tests/provider/ndk_e2e.py --cli .test-cli/zig-out/bin/labelle
+        run: python tests/provider/ndk_e2e.py --cli .test-cli/zig-out/bin/labelle --bgfx .test-bgfx

@@ -1,6 +1,6 @@
 """A real APK through the real CLI, the real assembler and the real NDK/SDK.
 
-python tests/provider/ndk_e2e.py --cli <labelle> [--keep DIR]
+python tests/provider/ndk_e2e.py --cli <labelle> --bgfx <labelle-bgfx v0.29.1 checkout> [--keep DIR]
 
 Writes a tiny bgfx project (one screen-space rectangle, the assembler's
 default launcher icon, an `assets/` tree with a `raw/` packer source) that
@@ -18,7 +18,18 @@ pins this checkout as the `android` provider, then:
   kept.
 
 Needs ANDROID_HOME (platform 34, build-tools, an NDK) and a JDK on
-JAVA_HOME. Network access: the CLI fetches the assembler and the backend.
+JAVA_HOME. Network access: the CLI fetches the assembler and the packages.
+
+The backend is a COPY of the given labelle-bgfx checkout whose
+`labelle_android` dependency is rewritten to the path where the assembler
+stages this `local:` plugin, `<project>/.labelle/deps/labelle-android` (the
+assembler re-roots a staged package's relative paths, so they must name the
+final directory). Both the generated build and the backend then name ONE
+directory, and Zig resolves ONE `labelle_android` package. Released bgfx pins labelle-android
+v0.1.1 by hash; next to a `local:` plugin that is a second copy of the same
+JNI C, and the `libgame.so` link fails on duplicate
+`labelle_android_*` symbols (labelle-cli#405 D11). Drop the rewrite once
+bgfx pins the labelle-android release that ships this provider (#405 PR 4b).
 """
 import argparse
 import json
@@ -31,6 +42,7 @@ import tempfile
 
 p = argparse.ArgumentParser()
 p.add_argument('--cli', required=True)
+p.add_argument('--bgfx', required=True, help='a labelle-bgfx checkout at v0.29.1')
 p.add_argument('--keep', help='build the project in this directory and leave it there')
 a = p.parse_args()
 cli = str(Path(a.cli).resolve())
@@ -56,7 +68,7 @@ PROJECT = '''.{{
     .height = 600,
     .target_fps = 60,
     .backend = .bgfx,
-    .backend_package = .{{ .name = "bgfx", .repo = "github.com/labelle-toolkit/labelle-bgfx", .version = "0.29.1" }},
+    .backend_package = .{{ .name = "bgfx", .repo = "local:{bgfx}", .version = "0.29.1" }},
     .gamepad = .none,
     .y_axis = .up,
     .ecs = .mock,
@@ -118,7 +130,10 @@ def inventory(apk):
     out = run(['unzip', '-Zv', apk], cwd=apk.parent)
     entries = {}
     for block in out.split('Central directory entry #')[1:]:
-        name = block.split('\n', 3)[2].strip()
+        # `#<n>:`, a rule, then the entry's name, after any zipalign
+        # padding note ("There are an extra N bytes preceding this file.").
+        lines = [line.strip() for line in block.split('\n')[2:]]
+        name = next(line for line in lines if line and not line.startswith('There are an extra'))
         method = re.search(r'compression method:\s+(.+)', block).group(1).strip()
         size = int(re.search(r'uncompressed size:\s+(\d+)', block).group(1))
         entries[name] = (method, size)
@@ -145,22 +160,39 @@ def check_apk(apk, version_code, symbols_so):
     return files
 
 
+def stage_bgfx(root, project):
+    """The bgfx copy whose labelle_android is the staged plugin (see above)."""
+    bgfx = root / 'labelle-bgfx'
+    shutil.rmtree(bgfx, ignore_errors=True)
+    shutil.copytree(Path(a.bgfx), bgfx, ignore=shutil.ignore_patterns('.git', '.zig-cache', 'zig-out', '.labelle'))
+    zon = bgfx / 'build.zig.zon'
+    text = zon.read_text()
+    patched, n = re.subn(r'\.labelle_android = \.\{\s*\.url = "[^"]+",\s*\.hash = "[^"]+",\s*\}',
+                         '.labelle_android = .{ .path = "../%s/.labelle/deps/labelle-android" }' % project.name, text)
+    assert n == 1, 'labelle_android dependency not found in ' + str(zon)
+    zon.write_text(patched)
+    return bgfx
+
+
 def main(root):
     project = root / 'tiny'
+    bgfx = stage_bgfx(root, project)
     shutil.rmtree(project, ignore_errors=True)
     (project / 'scenes').mkdir(parents=True)
     (project / 'providers').mkdir()
     (project / 'assets/raw').mkdir(parents=True)
     (project / 'scripts').mkdir()
     (project / 'scripts/.gitkeep').write_text('')
-    (project / 'project.labelle').write_text(PROJECT.format(repo=repo.as_posix()))
+    (project / 'project.labelle').write_text(PROJECT.format(repo=repo.as_posix(), bgfx=bgfx.as_posix()))
     (project / 'scenes/main.jsonc').write_text(SCENE)
     (project / 'providers/android.json').write_text(json.dumps(SETTINGS, indent=2))
     (project / 'assets/keep.txt').write_text('shipped: no rule leaves it out')
     (project / 'assets/raw/source.txt').write_text('packer source: never shipped')
 
-    out = run([cli, 'bundle', '--platform=android', '--optimize=ReleaseFast', '--build-number=3', '--allow-older-cli'],
-              cwd=project, timeout=3600)
+    # The pinned CLI is a `development` build, versioned below the releases
+    # the pinned packages expect.
+    out = run([cli, 'bundle', '--platform=android', '--optimize=ReleaseFast', '--build-number=3'],
+              cwd=project, timeout=3600, env=dict(os.environ, LABELLE_ALLOW_OLDER_CLI='1'))
     print(out[-4000:])
     target = project / '.labelle' / 'bgfx_android'
     apk = target / 'zig-out/apk/game.apk'
