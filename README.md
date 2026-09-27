@@ -4,7 +4,16 @@ Android platform package for the Labelle toolkit.
 
 ## Status
 
-**Phase 1a–1d of the runtime extraction ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)) — unreleased (no tag yet).** The package ships one Zig module, `labelle_android`, with five services the bgfx and sokol backends used to carry as per-backend copies:
+**v0.2.0 (in preparation): the `android` CLI provider ships.** What it carries:
+
+- **Provider shipped:** `labelle android doctor`, `labelle android run`, `labelle android deploy`, and the `package` / `deploy` / `bundle` target hooks behind `labelle build|run|bundle --platform=android` ([CLI provider](#cli-provider)).
+- **Not included:** `labelle android studio` (the Android Studio / Gradle project export).
+- **bgfx only:** the packager is verified end to end on labelle-bgfx; sokol is tracked in [#14](https://github.com/labelle-toolkit/labelle-android/issues/14).
+- **Projectless `doctor` needs a project:** the CLI dispatches provider commands only from a project's `.plugins`, so run `labelle android doctor` inside a project that pins this package.
+- **Requires labelle-cli ≥ v2.0.0**, the release that removes the CLI's built-in Android support ([CLI #405](https://github.com/labelle-toolkit/labelle-cli/issues/405) PR 3, [#441](https://github.com/labelle-toolkit/labelle-cli/pull/441)). Older CLIs reserve the `android` namespace and reject this provider.
+- **Requires a labelle-bgfx that pins labelle-android v0.2.0** (labelle-bgfx 0.30.0, coming). See [Duplicate `labelle_android_*` symbols](#duplicate-labelle_android_-symbols-older-bgfx).
+
+v0.1.x shipped the runtime services only. The runtime extraction, phase 1a–1d ([bgfx #149](https://github.com/labelle-toolkit/labelle-bgfx/issues/149)): the package ships one Zig module, `labelle_android`, with five services the bgfx and sokol backends used to carry as per-backend copies:
 
 | Namespace | Service | Origin |
 |-----------|---------|--------|
@@ -76,25 +85,29 @@ zig-out/bundle/android/<pkg>-<ver>.apk       `bundle` hook (+ .size.txt, -symbol
 
 **Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase).
 
-Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440), on `development`) that no longer reserves the `android` namespace for its legacy built-in `labelle android` subcommand (#405 PR 3). Until PR 3, that CLI also still packages its own `<target>/game.apk` on `labelle build --platform=android`, beside this provider's `zig-out/apk/game.apk` (on `run` the provider's `deploy` hook replaces the CLI's launch, so only the provider packages). CI drives the real CLI through `tests/provider/e2e.py` (fake SDK, every host) and `tests/provider/ndk_e2e.py` (a real bgfx APK); until PR 3 lands it builds the pinned CLI with `tests/provider/unreserve-android.sh`, which makes exactly those two edits.
+Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440)) and without the built-in Android support ([CLI #441](https://github.com/labelle-toolkit/labelle-cli/pull/441), #405 PR 3): labelle-cli v2.0.0 or newer. Earlier CLIs reserve the `android` namespace for their legacy `labelle android` subcommand, so discovery rejects this provider. CI drives the real CLI, pinned at `development` 0c72c2c (the merge of #441, unpatched), through `tests/provider/e2e.py` (fake SDK, every host; asserts that only the provider packages) and `tests/provider/ndk_e2e.py` (a real bgfx APK).
 
 ### Project setup
 
-No release carries the provider yet, so pin a local checkout for development:
+Pin the release (v0.2.0 is the first that ships the provider):
 
 ```zig
 // project.labelle
 .plugins = .{
-    .{ .name = "android", .repo = "local:../labelle-android" },
+    .{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "0.2.0" },
 },
 .provider_config = .{ .{ .package = "android", .file = "providers/android.json" } },
 ```
 
-After the first release that ships the provider, pin the released version instead (`<version>` is that release's tag):
+To develop the provider itself, pin a local checkout instead:
 
 ```zig
-.{ .name = "android", .repo = "github.com/labelle-toolkit/labelle-android", .version = "<version>" },
+.{ .name = "android", .repo = "local:../labelle-android" },
 ```
+
+#### Duplicate `labelle_android_*` symbols (older bgfx)
+
+labelle-bgfx depends on this package for the runtime services, pinned by hash. labelle-bgfx releases before the one that pins labelle-android v0.2.0 pin v0.1.x, so a project using this provider gets two copies of the package: the backend's and the plugin's. Both carry the same JNI helpers (`src/jni/*.c`), and the `libgame.so` link fails with duplicate `labelle_android_*` symbols (labelle-cli#405 D11). Use a labelle-bgfx release that pins labelle-android v0.2.0 (labelle-bgfx 0.30.0, coming), which makes both resolve to one package. Until then, CI's `tests/provider/ndk_e2e.py` rewrites a copy of bgfx v0.29.1 to use the staged plugin.
 
 ### `providers/android.json` (schema v1)
 
