@@ -14,9 +14,15 @@
 // strict decoder (`tools/contract.zig` `supported_versions`) accepts: a
 // future 1.2.x patch is not admitted until the decoder learns it.
 //
-// This is the provider skeleton: `doctor` only. The packaging hooks
-// (`package` after build, `deploy` replacing run, `bundle` replacing bundle)
-// and the `run`/`deploy` commands arrive with their implementation.
+// Commands (`labelle android <cmd>`) act on already-built output; building
+// happens through `labelle build|run|bundle --platform=android`, whose
+// hooks this package supplies:
+//   - `package` after `build`: packages `zig-out/apk/game.apk` from the core
+//     build's `libgame.so`, so `labelle build` yields an installable APK;
+//   - `deploy` replacing `run`: installs that APK and launches it, turning
+//     the `run` options into `am start --es` launch extras;
+//   - `bundle` replacing `bundle`: the release APK, `versionCode` stamped
+//     from `--build-number`.
 .{
     .name = "android",
     .manifest_version = 2,
@@ -25,5 +31,12 @@
     .targets = .{"android"},
     .commands = .{
         .{ .name = "doctor", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Check the Android SDK/NDK/JDK", .needs_project = false },
+        .{ .name = "run", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Install and launch the built APK (--device, --apk)", .needs_project = true },
+        .{ .name = "deploy", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Publish the bundled APK as a GitHub Release (--tag, --channel, --notes-file, --apk)", .needs_project = true },
+    },
+    .hooks = .{
+        .{ .id = "package", .step = .build, .target = "android", .when = .after, .build_step = "install-provider", .executable = "bin/labelle-android" },
+        .{ .id = "deploy", .step = .run, .target = "android", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-android" },
+        .{ .id = "bundle", .step = .bundle, .target = "android", .when = .replace, .build_step = "install-provider", .executable = "bin/labelle-android" },
     },
 }

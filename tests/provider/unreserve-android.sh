@@ -16,7 +16,7 @@ main="$cli/src/cli.zig"
 grep -q '"ios",   "android", "wasm",' "$dispatch"
 grep -q 'std.mem.eql(u8, first, "android")' "$main"
 
-python3 - "$dispatch" "$main" <<'PY'
+"${PYTHON:-python3}" - "$dispatch" "$main" <<'PY'
 import sys
 dispatch, main = sys.argv[1], sys.argv[2]
 def edit(path, old, new):

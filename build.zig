@@ -197,7 +197,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        // The launcher-icon PNG decode/encode: stb_image / stb_image_write,
+        // vendored as C (no package fetch under `--system`).
+        .link_libc = true,
     });
+    provider_module.addCSourceFile(.{ .file = b.path("tools/vendor/stb_image_impl.c"), .flags = &.{"-std=c99"} });
+    provider_module.addIncludePath(b.path("tools/vendor"));
     // `tools/main.zig`'s test checks its routing table against the manifest.
     provider_module.addAnonymousImport("plugin.labelle", .{ .root_source_file = b.path("plugin.labelle") });
     const provider = b.addExecutable(.{ .name = "labelle-android", .root_module = provider_module });
