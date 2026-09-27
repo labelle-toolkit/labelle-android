@@ -1,6 +1,6 @@
 """A real APK through the real CLI, the real assembler and the real NDK/SDK.
 
-python tests/provider/ndk_e2e.py --cli <labelle> --bgfx <labelle-bgfx v0.29.1 checkout> [--keep DIR]
+python tests/provider/ndk_e2e.py --cli <labelle> --bgfx <labelle-bgfx v0.30.0 checkout> [--keep DIR]
 
 Writes a tiny bgfx project (one screen-space rectangle, the assembler's
 default launcher icon, an `assets/` tree with a `raw/` packer source) that
@@ -15,21 +15,22 @@ pins this checkout as the `android` provider, then:
 - `unzip -Zv`: `lib/arm64-v8a/libgame.so` stored and stripped (smaller than
   the unstripped copy under `symbols/`), `resources.arsc` stored, the five
   launcher mipmaps present, `assets/raw/` left out and the rest of `assets/`
-  kept.
+  kept;
+- the JNI C in `libgame.so` is the plugin's copy
+  (`.labelle/deps/labelle-android/src/jni/`), and bgfx's hash-fetched copy
+  (`zig-pkg/labelle_android-<version>-<hash>`) is absent.
 
 Needs ANDROID_HOME (platform 34, build-tools, an NDK) and a JDK on
 JAVA_HOME. Network access: the CLI fetches the assembler and the packages.
 
-The backend is a COPY of the given labelle-bgfx checkout whose
-`labelle_android` dependency is rewritten to the path where the assembler
-stages this `local:` plugin, `<project>/.labelle/deps/labelle-android` (the
-assembler re-roots a staged package's relative paths, so they must name the
-final directory). Both the generated build and the backend then name ONE
-directory, and Zig resolves ONE `labelle_android` package. Released bgfx pins labelle-android
-v0.1.1 by hash; next to a `local:` plugin that is a second copy of the same
-JNI C, and the `libgame.so` link fails on duplicate
-`labelle_android_*` symbols (labelle-cli#405 D11). Drop the rewrite once
-bgfx pins the labelle-android release that ships this provider (#405 PR 4b).
+The backend is the given labelle-bgfx checkout, unmodified. bgfx fetches
+labelle-android by url+hash, and the assembler wires the `android` plugin as a
+`.path` dependency (`<project>/.labelle/deps/labelle-android`); Zig does not
+dedupe the two, so before bgfx v0.30.0 the `libgame.so` link failed on
+duplicate `labelle_android_*` symbols (labelle-cli#405 D11). bgfx v0.30.0's
+build hook points every `labelle_android` import at the plugin's module. This
+checks that an unmodified bgfx 0.30.0 plus the provider links, and that the
+one copy of the JNI C in the `.so` is the plugin's.
 """
 import argparse
 import json
@@ -42,7 +43,7 @@ import tempfile
 
 p = argparse.ArgumentParser()
 p.add_argument('--cli', required=True)
-p.add_argument('--bgfx', required=True, help='a labelle-bgfx checkout at v0.29.1')
+p.add_argument('--bgfx', required=True, help='a labelle-bgfx checkout at v0.30.0')
 p.add_argument('--keep', help='build the project in this directory and leave it there')
 a = p.parse_args()
 cli = str(Path(a.cli).resolve())
@@ -68,7 +69,7 @@ PROJECT = '''.{{
     .height = 600,
     .target_fps = 60,
     .backend = .bgfx,
-    .backend_package = .{{ .name = "bgfx", .repo = "local:{bgfx}", .version = "0.29.1" }},
+    .backend_package = .{{ .name = "bgfx", .repo = "local:{bgfx}", .version = "0.30.0" }},
     .gamepad = .none,
     .y_axis = .up,
     .ecs = .mock,
@@ -161,23 +162,22 @@ def check_apk(apk, version_code, symbols_so):
     return files
 
 
-def stage_bgfx(root, project):
-    """The bgfx copy whose labelle_android is the staged plugin (see above)."""
-    bgfx = root / 'labelle-bgfx'
-    shutil.rmtree(bgfx, ignore_errors=True)
-    shutil.copytree(Path(a.bgfx), bgfx, ignore=shutil.ignore_patterns('.git', '.zig-cache', 'zig-out', '.labelle'))
-    zon = bgfx / 'build.zig.zon'
-    text = zon.read_text()
-    patched, n = re.subn(r'\.labelle_android = \.\{\s*\.url = "[^"]+",\s*\.hash = "[^"]+",\s*\}',
-                         '.labelle_android = .{ .path = "../%s/.labelle/deps/labelle-android" }' % project.name, text)
-    assert n == 1, 'labelle_android dependency not found in ' + str(zon)
-    zon.write_text(patched)
-    return bgfx
+def check_jni_origin(so):
+    """The JNI C in the .so is the plugin's copy, not bgfx's (#405 D11).
+
+    Reads the unstripped `symbols/` copy: its debug info names each C source
+    by path. The plugin is staged at `.labelle/deps/labelle-android`; bgfx's
+    own copy would sit under `zig-pkg/labelle_android-<version>-<hash>`.
+    """
+    data = so.read_bytes()
+    assert b'deps/labelle-android/src/jni/intent_extras.c' in data, f'{so}: the JNI C is not the plugin\'s copy'
+    stray = re.search(rb'labelle_android-[0-9][0-9.]*-[A-Za-z0-9_-]*/src/jni', data)
+    assert stray is None, f'{so}: bgfx\'s own labelle_android copy reached the .so: {stray.group(0)!r}'
 
 
 def main(root):
     project = root / 'tiny'
-    bgfx = stage_bgfx(root, project)
+    bgfx = Path(a.bgfx).resolve()
     shutil.rmtree(project, ignore_errors=True)
     (project / 'scenes').mkdir(parents=True)
     (project / 'providers').mkdir()
@@ -200,6 +200,7 @@ def main(root):
     bundled = target / 'zig-out/bundle/android/com.labelle.tiny_android-0.3.apk'
     assert apk.is_file() and bundled.is_file(), out
     check_apk(apk, 1, target / 'zig-out/apk/symbols/arm64-v8a/libgame.so')
+    check_jni_origin(target / 'zig-out/apk/symbols/arm64-v8a/libgame.so')
     files = check_apk(bundled, 3, target / 'zig-out/bundle/android/com.labelle.tiny_android-0.3-symbols/arm64-v8a/libgame.so')
     print('inventory:')
     for name, (method, size) in sorted(files.items()):
