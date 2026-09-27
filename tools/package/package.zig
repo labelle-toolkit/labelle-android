@@ -266,11 +266,33 @@ fn runTool(a: std.mem.Allocator, io: std.Io, label: []const u8, argv: []const []
 /// those files staged under their target-relative path and deflated
 /// (labelle-assembler#759), and packaging without them would install an APK that
 /// fails at startup. So a non-empty list is refused, before anything is
-/// staged. A missing or unparsable file (an older assembler) is ignored.
+/// staged. Only an absent file (an older assembler) is skipped; a file that
+/// is there but cannot be read, is too large, or does not parse fails the
+/// packaging, since it may be hiding a non-empty list.
 pub fn checkApkAssets(a: std.mem.Allocator, io: std.Io, target_dir: []const u8) !void {
+    return checkApkAssetsLimited(a, io, target_dir, apk_assets_max_bytes);
+}
+
+const apk_assets_max_bytes = 16 << 20;
+
+fn checkApkAssetsLimited(a: std.mem.Allocator, io: std.Io, target_dir: []const u8, max_bytes: usize) !void {
     const path = try std.fs.path.join(a, &.{ target_dir, "apk_assets.json" });
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return;
-    const count = apkAssetCount(a, bytes) orelse return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.OutOfMemory => return err,
+        error.StreamTooLong => {
+            std.debug.print("labelle-android: {s} is larger than {d} bytes: not packaging from it\n", .{ path, max_bytes });
+            return error.ApkAssetsUnreadable;
+        },
+        else => {
+            std.debug.print("labelle-android: cannot read {s} ({s}): not packaging without it\n", .{ path, @errorName(err) });
+            return error.ApkAssetsUnreadable;
+        },
+    };
+    const count = apkAssetCount(a, bytes) orelse {
+        std.debug.print("labelle-android: {s} is not a valid APK asset list (expected {{\"files\": [...]}}): rebuild, or delete it if it is stale\n", .{path});
+        return error.ApkAssetsMalformed;
+    };
     if (count == 0) return;
     std.debug.print(
         \\labelle-android: {s} lists {d} file(s) to load from the APK (project.labelle `.android.load_assets_from_apk = true`),
@@ -280,8 +302,10 @@ pub fn checkApkAssets(a: std.mem.Allocator, io: std.Io, target_dir: []const u8) 
     return error.ApkAssetsUnsupported;
 }
 
+/// The length of the document's `files` list; null when the bytes are not a
+/// JSON object with a `files` array of strings (malformed or truncated).
 fn apkAssetCount(a: std.mem.Allocator, bytes: []const u8) ?usize {
-    const Doc = struct { files: []const []const u8 = &.{} };
+    const Doc = struct { files: []const []const u8 };
     const doc = std.json.parseFromSliceLeaky(Doc, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
     return doc.files.len;
 }
@@ -300,6 +324,41 @@ test "apk_assets.json: the empty list and an older assembler's absence pass, a n
     try checkApkAssets(a, std.testing.io, root);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "apk_assets.json", .data = "{\"version\":1,\"compression\":\"deflate\",\"files\":[\"assets/a.json\"]}" });
     try std.testing.expectError(error.ApkAssetsUnsupported, checkApkAssets(a, std.testing.io, root));
+}
+
+test "apk_assets.json fails closed: unreadable, oversized, truncated or malformed is an error, not a skip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+
+    // Oversized: a well-formed empty list over the size limit is still refused.
+    const empty_list = "{\"version\":1,\"compression\":\"deflate\",\"files\":[]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "apk_assets.json", .data = empty_list });
+    try checkApkAssetsLimited(a, io, root, empty_list.len + 1);
+    try std.testing.expectError(error.ApkAssetsUnreadable, checkApkAssetsLimited(a, io, root, 8));
+
+    // Truncated mid-write, malformed, the wrong shape, no `files` key.
+    for ([_][]const u8{
+        "{\"version\":1,\"files\":[\"assets/a.js",
+        "",
+        "not json",
+        "[]",
+        "{\"files\":{}}",
+        "{\"files\":[1]}",
+        "{\"version\":1}",
+    }) |bad| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "apk_assets.json", .data = bad });
+        try std.testing.expectError(error.ApkAssetsMalformed, checkApkAssets(a, io, root));
+    }
+
+    // Present but unreadable as a file: a directory in its place.
+    try tmp.dir.deleteFile(io, "apk_assets.json");
+    try tmp.dir.createDirPath(io, "apk_assets.json");
+    try std.testing.expectError(error.ApkAssetsUnreadable, checkApkAssets(a, io, root));
 }
 
 test "package: a missing libgame.so fails before anything is staged" {

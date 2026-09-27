@@ -117,10 +117,25 @@ fn hexSha256(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "{x}", .{&digest});
 }
 
+/// The hex SHA-256 of the file at `path`, read through a fixed buffer: no
+/// allocation beyond the 64-character result, whatever the file's size.
 fn fileSha256(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 30));
-    defer a.free(bytes);
-    return hexSha256(a, bytes);
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    while (true) {
+        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.ReadFailed => return reader.err.?,
+        };
+        hasher.update(chunk);
+        reader.interface.toss(chunk.len);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 
 /// The APK under `target_dir`, checked against its package record: it
@@ -241,7 +256,7 @@ fn builtOutputs(c: Context, sub: []const []const u8) ![]const []const u8 {
     defer dir.close(c.io);
     var it = dir.iterate();
     while (try it.next(c.io)) |entry| {
-        if (entry.kind != .directory or !std.mem.endsWith(u8, entry.name, "_android")) continue;
+        if (!try isOutputDir(c.io, dir, entry.name, entry.kind)) continue;
         var parts: std.ArrayList([]const u8) = .empty;
         try parts.appendSlice(c.a, &.{ labelle_dir, entry.name });
         try parts.appendSlice(c.a, sub);
@@ -250,6 +265,21 @@ fn builtOutputs(c: Context, sub: []const []const u8) ![]const []const u8 {
     }
     std.mem.sort([]const u8, found.items, {}, lessThan);
     return found.items;
+}
+
+/// Whether the `.labelle/` entry `name` is an Android target directory
+/// (`<backend>_android`). The name is checked first; an `.unknown` kind
+/// (NFS, FUSE mounts) is then resolved with a no-follow stat.
+fn isOutputDir(io: std.Io, dir: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !bool {
+    if (!std.mem.endsWith(u8, name, "_android")) return false;
+    return try slim.resolveKind(io, dir, name, kind) == .directory;
+}
+
+/// Whether the bundle-directory entry `name` is a bundled APK: a regular
+/// `*.apk` file, an `.unknown` kind resolved as `isOutputDir` does.
+fn isBundledApk(io: std.Io, dir: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !bool {
+    if (!std.mem.endsWith(u8, name, ".apk")) return false;
+    return try slim.resolveKind(io, dir, name, kind) == .file;
 }
 
 fn lessThan(_: void, x: []const u8, y: []const u8) bool {
@@ -338,7 +368,7 @@ pub fn deployCommand(c: Context, args: []const []const u8) !void {
             defer d.close(c.io);
             var it = d.iterate();
             while (try it.next(c.io)) |entry| {
-                if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".apk"))
+                if (try isBundledApk(c.io, d, entry.name, entry.kind))
                     try candidates.append(c.a, try std.fs.path.join(c.a, &.{ dir, entry.name }));
             }
         }
@@ -402,6 +432,58 @@ test "exactlyOne: one wins, none and several are errors" {
     try std.testing.expectEqualStrings("a", try exactlyOne(&.{"a"}, "x", "y"));
     try std.testing.expectError(error.NoBuiltApk, exactlyOne(&.{}, "x", "y"));
     try std.testing.expectError(error.AmbiguousBuildOutput, exactlyOne(&.{ "a", "b" }, "x", "y"));
+}
+
+test "fileSha256 streams: equals the one-shot digest of a multi-buffer file, allocating only the result" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Several 64 KiB reader buffers plus a partial tail, with position-dependent bytes.
+    const data = try std.testing.allocator.alloc(u8, 3 * 64 * 1024 + 1234);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 9));
+    try tmp.dir.writeFile(io, .{ .sub_path = "libgame.so", .data = data });
+    const path = try tmp.dir.realPathFileAlloc(io, "libgame.so", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    const expected = try hexSha256(std.testing.allocator, data);
+    defer std.testing.allocator.free(expected);
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const got = try fileSha256(counting.allocator(), io, path);
+    defer counting.allocator().free(got);
+    try std.testing.expectEqualStrings(expected, got);
+    // Only the 64-character hex string: nothing proportional to the file.
+    try std.testing.expectEqual(@as(usize, 64), counting.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 1), counting.allocations);
+
+    try std.testing.expectError(error.FileNotFound, fileSha256(std.testing.allocator, io, "/nonexistent-labelle-android/libgame.so"));
+}
+
+test "output scans: .unknown entry kinds are resolved by a no-follow stat before filtering" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "raylib_android");
+    try tmp.dir.createDirPath(io, "raylib_desktop");
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes_android", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "g-1.0.apk", .data = "APK" });
+    try tmp.dir.createDirPath(io, "dir.apk");
+
+    // What an NFS/FUSE iterator reports: every kind `.unknown`.
+    try std.testing.expect(try isOutputDir(io, tmp.dir, "raylib_android", .unknown));
+    try std.testing.expect(!try isOutputDir(io, tmp.dir, "notes_android", .unknown));
+    try std.testing.expect(!try isOutputDir(io, tmp.dir, "raylib_desktop", .unknown));
+    try std.testing.expect(try isBundledApk(io, tmp.dir, "g-1.0.apk", .unknown));
+    try std.testing.expect(!try isBundledApk(io, tmp.dir, "dir.apk", .unknown));
+    // Known kinds decide without a stat (the names do not exist).
+    try std.testing.expect(try isOutputDir(io, tmp.dir, "absent_android", .directory));
+    try std.testing.expect(try isBundledApk(io, tmp.dir, "absent.apk", .file));
+    try std.testing.expect(!try isBundledApk(io, tmp.dir, "absent.apk", .sym_link));
+    if (builtin.os.tag != .windows) {
+        // A symlink stays a symlink (not followed), as on any other filesystem.
+        try tmp.dir.symLink(io, "raylib_android", "link_android", .{});
+        try std.testing.expect(!try isOutputDir(io, tmp.dir, "link_android", .unknown));
+    }
 }
 
 test {

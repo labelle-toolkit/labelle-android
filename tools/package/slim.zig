@@ -316,15 +316,19 @@ pub const EntryAction = enum { recurse, copy, skip };
 /// files are staged rather than silently left out, and a symlink stays a
 /// symlink (skipped) as it would on any other filesystem.
 pub fn entryAction(io: std.Io, dir: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !EntryAction {
-    const resolved = if (kind == .unknown)
-        (try dir.statFile(io, name, .{ .follow_symlinks = false })).kind
-    else
-        kind;
-    return switch (resolved) {
+    return switch (try resolveKind(io, dir, name, kind)) {
         .directory => .recurse,
         .file => .copy,
         else => .skip,
     };
+}
+
+/// The kind of the entry `name` of `dir`, whose iterator reported `kind`:
+/// `kind` itself, unless it is `.unknown` (NFS, FUSE mounts...), which is
+/// resolved with a no-follow stat, so a symlink is still reported as one.
+pub fn resolveKind(io: std.Io, dir: std.Io.Dir, name: []const u8, kind: std.Io.File.Kind) !std.Io.File.Kind {
+    if (kind != .unknown) return kind;
+    return (try dir.statFile(io, name, .{ .follow_symlinks = false })).kind;
 }
 
 // ── Size report ────────────────────────────────────────────────────
