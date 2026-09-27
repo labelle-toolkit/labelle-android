@@ -9,8 +9,8 @@ The Android SDK, JDK and NDK are fakes: `tests/provider/stub_tool.zig`,
 compiled here and copied under every tool name (aapt, zipalign, the
 apksigner `.bat` on Windows, jar, keytool, llvm-strip, adb, and gh on PATH).
 Each call appends its argv to a JSON log, marked `via_provider` when the
-provider (not the CLI's own legacy packager, still in the pinned CLI until
-labelle-cli#405 PR 3) ran it, and the APK stand-ins are real stored zips,
+provider ran it (the pinned CLI has no Android code since labelle-cli#405
+PR 3, so every call must be the provider's), and the APK stand-ins are real stored zips,
 so the assertions read what the provider actually packaged. Generation is a
 fake assembler (the CLI suites' pattern) whose target `build.zig` installs a
 marker `libgame.so`, so `labelle build|run|bundle --platform=android` run
@@ -286,9 +286,14 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     out = run('build', '--platform=android')
     assert apk.is_file(), out
     assert 'labelle-android: APK ready:' in out and 'labelle-android: APK size' in out, out
-    # The pinned CLI (pre-PR 3) still packages its own <target>/game.apk on
-    # `build`; the provider's calls are the ones marked via_provider.
-    assert [e['tool'] for e in calls()] == ['aapt', 'jar', 'zipalign', 'apksigner'], calls()
+    # Only the provider packages: the pinned CLI (labelle-cli#405 PR 3) has no
+    # Android packager, so no tool call is the CLI's and no <target>/game.apk.
+    # That includes the debug keystore: the CLI used to generate it first; now
+    # the provider's `keytool` does, on this first signed build.
+    assert calls(provider=False) == [], calls(provider=False)
+    assert not (target / 'game.apk').exists(), list(target.iterdir())
+    assert [e['tool'] for e in calls()] == ['aapt', 'jar', 'zipalign', 'keytool', 'apksigner'], calls()
+    assert keystore.is_file(), keystore
     assert not list(apk_dir.glob('.staging-*')), list(apk_dir.iterdir())
     staging = Path(argv_of('jar')[argv_of('jar').index('-C') + 1])
     assert staging.parent == apk_dir and staging.name.startswith('.staging-'), staging

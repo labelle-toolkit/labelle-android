@@ -102,19 +102,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # labelle-cli `development` at the merge of PR #440 (contract 1.2.0).
-      # Move the pin forward (and drop the unreserve step) once #405 PR 3 merges.
+      # labelle-cli `development` at the merge of PR #441 (#405 PR 3): contract
+      # 1.2.0, no reserved `android` namespace and no built-in Android code.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 23aa180d0da9d7bfc71cdac765d36706a0d605ad
+          ref: 0c72c2ce6289270413a5c74cc54ac6d9f7e445dd
           path: .test-cli
           persist-credentials: false
-      # Until #405 PR 3, the CLI reserves the `android` namespace for its
-      # legacy subcommand; this makes exactly those two edits (see the script).
-      - name: Unreserve the android namespace in the pinned CLI
-        shell: bash
-        run: PYTHON=python tests/provider/unreserve-android.sh .test-cli
       - run: zig build
         working-directory: .test-cli
       - name: Exercise discovery, dispatch, packaging, run and bundle
@@ -159,14 +154,13 @@ jobs:
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      # The same labelle-cli pin as the provider job (#441 merged).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 23aa180d0da9d7bfc71cdac765d36706a0d605ad
+          ref: 0c72c2ce6289270413a5c74cc54ac6d9f7e445dd
           path: .test-cli
           persist-credentials: false
-      - name: Unreserve the android namespace in the pinned CLI
-        run: tests/provider/unreserve-android.sh .test-cli
       - run: zig build
         working-directory: .test-cli
       # The fixture's backend. ndk_e2e.py stages a copy whose labelle_android
