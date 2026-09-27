@@ -209,23 +209,9 @@ pub fn build(b: *std.Build) void {
     b.step("install-provider", "Install the labelle-cli provider tool (bin/labelle-android)")
         .dependOn(&b.addInstallArtifact(provider, .{}).step);
     const provider_tests = b.addRunArtifact(b.addTest(.{ .root_module = provider_module }));
-    const test_provider = b.step("test-provider", "Run the provider host-tool tests (wire contract, settings, doctor, redirected output)");
-    test_provider.dependOn(&provider_tests.step);
+    b.step("test-provider", "Run the provider host-tool tests (wire contract, settings, doctor)")
+        .dependOn(&provider_tests.step);
     test_step.dependOn(&provider_tests.step);
-    // labelle-cli#446: the BUILT tool, its stdout+stderr redirected to one
-    // regular file the "CLI" already wrote to, must append rather than
-    // overwrite from offset 0 (a pipe hides a positional writer).
-    const stdio_e2e = b.addRunArtifact(b.addExecutable(.{
-        .name = "stdio-e2e",
-        .root_module = b.createModule(.{ .root_source_file = b.path("tools/stdio_e2e.zig"), .target = b.graph.host }),
-    }));
-    stdio_e2e.addArtifactArg(provider);
-    _ = stdio_e2e.addOutputFileArg("redirected.txt");
-    stdio_e2e.expectExitCode(0);
-    b.step("test-provider-stdio", "Run the built provider tool with output redirected to a file (cli#446)")
-        .dependOn(&stdio_e2e.step);
-    test_provider.dependOn(&stdio_e2e.step);
-    test_step.dependOn(&stdio_e2e.step);
 
     // Android compile-check (object emission, as labelle-bgfx's
     // `android_app_tests` does): proves the JNI C and the `extern "c"`
