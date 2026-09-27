@@ -31,6 +31,19 @@ jobs:
       # tool names SDK tools `.exe`/`.bat` there.
       - name: Build and test the provider tool
         run: zig build install-provider test-provider --summary all
+      # labelle-cli#446: the built tool's stdout+stderr redirected to one FILE
+      # the "CLI" already wrote to must append, not overwrite from offset 0.
+      # Python hands the file over the way a shell redirect does on every OS
+      # (shared file pointer); see the script for why it isn't a Zig harness.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Redirected stdio appends (labelle-cli#446)
+        shell: bash
+        run: |
+          tool=zig-out/bin/labelle-android
+          if [ "$RUNNER_OS" = Windows ]; then tool="$tool.exe"; fi
+          python tests/provider/stdio_e2e.py --tool "$tool"
       # The intent allow-list / decision tests, the video `yuv`/`planes`
       # helpers and the NDK-selection rule run on the host; no JNI or NDK needed.
       - name: Run unit tests
