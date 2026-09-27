@@ -163,7 +163,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
 
     def run(*args, cwd=project, ok=True, extra_env=None):
         merged = dict(env, **(extra_env or {}))
-        result = subprocess.run([cli, *args], cwd=cwd, env=merged, text=True, capture_output=True, timeout=900)
+        result = subprocess.run([cli, *args], cwd=cwd, env=merged, capture_output=True, timeout=900,
+                                encoding='utf-8', errors='replace')
         out = result.stdout + result.stderr
         if ok:
             assert result.returncode == 0, (args, result.returncode, out)
@@ -176,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
         """The logged tool calls since the last `reset_log`."""
         if not log.exists():
             return []
-        entries = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+        entries = [json.loads(line) for line in log.read_text(encoding='utf-8').splitlines() if line.strip()]
         return [e for e in entries if provider is None or e['via_provider'] == provider]
 
     def reset_log():
@@ -403,7 +404,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     assert norm(signer[8][len('file:'):]) == norm(project / 'keys/key.pass'), signer
     assert apk.is_file()
     for secret in ('s3cret-store-value', 's3cret-key-value'):
-        assert secret not in out and secret not in log.read_text(), secret
+        assert secret not in out and secret not in log.read_text(encoding='utf-8'), secret
     out = run('build', '--platform=android', ok=False)
     assert 'FIXTURE_KS_PASS, which is not set' in out, out
     settings.write_text(good)

@@ -113,7 +113,8 @@ SETTINGS = {
 
 def run(argv, cwd, **kw):
     print('+', ' '.join(str(x) for x in argv), flush=True)
-    result = subprocess.run([str(x) for x in argv], cwd=cwd, text=True, capture_output=True, **kw)
+    result = subprocess.run([str(x) for x in argv], cwd=cwd, capture_output=True, encoding='utf-8',
+                            errors='replace', **kw)
     out = result.stdout + result.stderr
     if result.returncode != 0:
         print(out)

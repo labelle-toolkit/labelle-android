@@ -98,6 +98,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The action's default still names the retired `tools` package.
+          packages: platform-tools
 
       - name: Install Android platform, build-tools and NDK
         run: |

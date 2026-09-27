@@ -150,7 +150,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      # `packages`: the action's default still names the retired `tools`.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install platform 34, build-tools and NDK r27c
         run: |
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
