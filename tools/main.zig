@@ -18,6 +18,7 @@ const identity_mod = @import("project_identity.zig");
 const doctor = @import("doctor.zig");
 const sdk = @import("sdk.zig");
 const actions = @import("actions.zig");
+const stdio = @import("stdio.zig");
 
 /// What an invocation runs.
 pub const Action = enum {
@@ -89,7 +90,8 @@ fn samePhase(a: ?contract.Phase, b: ?contract.Phase) bool {
 
 pub fn main(init: std.process.Init) u8 {
     var err_buf: [1024]u8 = undefined;
-    var stderr = std.Io.File.stderr().writer(init.io, &err_buf);
+    // Streaming, never positional: stderr may be a file the CLI shares (cli#446).
+    var stderr = stdio.stderrWriter(init.io, &err_buf);
     const out = &stderr.interface;
     const failed = execute(init, out) catch |err| {
         out.print("labelle-android: {s}\n", .{@errorName(err)}) catch {};
@@ -310,4 +312,5 @@ test {
     _ = doctor;
     _ = @import("sdk.zig");
     _ = @import("proc.zig");
+    _ = stdio;
 }

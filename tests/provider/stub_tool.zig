@@ -165,7 +165,7 @@ fn act(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, to
     }
     if (std.mem.eql(u8, tool, "adb")) {
         var out_buf: [256]u8 = undefined;
-        var out = std.Io.File.stdout().writer(io, &out_buf);
+        var out = std.Io.File.stdout().writerStreaming(io, &out_buf); // never positional (cli#446)
         if (has(args, "install")) try out.interface.writeAll("Success\n");
         if (has(args, "start")) try out.interface.writeAll("Starting: Intent\n");
         try out.interface.flush();
