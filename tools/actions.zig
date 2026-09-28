@@ -79,11 +79,17 @@ pub fn packageSkipped(ctx: contract.Context) bool {
 pub fn packageHook(c: Context) !void {
     const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
     const dir = try apkDir(c.a, target_dir);
-    std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
     if (packageSkipped(c.ctx)) {
+        // Nothing replaces the old APK here, so failing to remove it (a
+        // locked file on Windows) must fail the hook, not leave it behind.
+        std.Io.Dir.cwd().deleteTree(c.io, dir) catch |err| {
+            std.debug.print("labelle-android: could not remove the previous install APK in {s}: {s}\n", .{ dir, @errorName(err) });
+            return err;
+        };
         std.debug.print("labelle-android: not packaging zig-out/apk/game.apk: the bundle step packages the release APK\n", .{});
         return;
     }
+    std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
     const strip = stripFor(c.ctx.optimize);
     const tools = try pkg.findTools(c.a, c.io, c.env, c.settings.target_sdk_version, strip);
     const apk = try std.fs.path.join(c.a, &.{ dir, apk_name });
