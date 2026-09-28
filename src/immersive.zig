@@ -359,17 +359,22 @@ const FocusCb = *const fn (*ANativeActivity, c_int) callconv(.c) void;
 /// `0` == none.
 var saved_focus_cb: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-/// Install guard for the `onContentRectChanged` chain. `swap(true)`
-/// makes the install an atomic test-and-set so a double
-/// `enable()` can't double-chain.
-var installed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Install guard for the `onContentRectChanged` chain: the address of the
+/// activity whose callbacks table carries our hook (`0` == none). `swap`
+/// makes the install an atomic test-and-set, so a double `enable()` for
+/// the same activity can't double-chain. It is keyed on the activity, not
+/// a bool, because Android can recreate the `NativeActivity` in the same
+/// process (an unhandled configuration change): the new activity has a
+/// fresh callbacks table, and `sokol_main()` calls `enable()` again for it.
+var installed_for: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-/// Install guard for the `onWindowFocusChanged` chain, set the first
-/// time `contentRectHook` runs (it deferred-installs the focus chain).
-/// Plain `bool`, not atomic: `installFocusChain` is only ever reached
-/// from `contentRectHook`, which the framework invokes exclusively on
-/// the one UI thread — no cross-thread access, so no atomic needed.
-var focus_chain_installed: bool = false;
+/// Install guard for the `onWindowFocusChanged` chain: the address of the
+/// activity it was chained on, set the first time `contentRectHook` runs
+/// for that activity (it deferred-installs the focus chain). Plain, not
+/// atomic: `installFocusChain` is only ever reached from
+/// `contentRectHook`, which the framework invokes exclusively on the one
+/// UI thread — no cross-thread access, so no atomic needed.
+var focus_chain_for: usize = 0;
 
 /// Our replacement `onWindowFocusChanged`. Runs on the UI thread, so
 /// `activity.env` is a valid `JNIEnv*` for decor-view mutation.
@@ -405,8 +410,8 @@ fn focusChangedHook(activity: *ANativeActivity, has_focus: c_int) callconv(.c) v
 /// `focusChangedHook` into the callbacks struct, so the hook never
 /// reads a `saved_focus_cb` that has not been written yet.
 fn installFocusChain(activity: *ANativeActivity) void {
-    if (focus_chain_installed) return;
-    focus_chain_installed = true;
+    if (focus_chain_for == @intFromPtr(activity)) return;
+    focus_chain_for = @intFromPtr(activity);
     const orig_bits: usize = if (activity.callbacks.onWindowFocusChanged) |cb|
         @intFromPtr(cb)
     else
@@ -702,8 +707,10 @@ pub fn enable(activity: ?*anyopaque) void {
     }));
 
     // Atomic test-and-set install guard: if it was already `true`,
-    // another caller (or an earlier call) already installed the hook.
-    if (installed.swap(true, .seq_cst)) return;
+    // another caller (or an earlier call) already installed the hook on
+    // THIS activity. A recreated activity has a new address, so it gets
+    // its own hook.
+    if (installed_for.swap(@intFromPtr(na), .seq_cst) == @intFromPtr(na)) return;
 
     // Install our hook into `onContentRectChanged`. sokol's
     // `ANativeActivity_onCreate` leaves this slot unset (its
@@ -757,5 +764,5 @@ test "enable and applyUiThread are no-ops off Android, whatever the pointer" {
     applyUiThread(null);
     enable(@ptrFromInt(0x1000));
     applyUiThread(@ptrFromInt(0x1000));
-    try std.testing.expect(!installed.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), installed_for.load(.seq_cst));
 }
