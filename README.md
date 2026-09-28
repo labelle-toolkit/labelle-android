@@ -54,7 +54,7 @@ The Android compile-check compiles and links every AAudio entry point (`ensureSt
 
 | Command | What it does |
 |---|---|
-| `labelle android doctor [--json]` | Checks the Android SDK (adb, build-tools `aapt`/`zipalign`/`apksigner`, `android.jar` for the configured target SDK), the NDK (sysroot, `llvm-strip`) and the JDK (`jar`, `keytool`). Exits non-zero when a required tool is missing. `--json` prints one `android` capability object on stdout instead (one item per check), which `labelle doctor --json` aggregates. |
+| `labelle android doctor [--json]` | Checks the Android SDK (adb, build-tools `aapt`/`zipalign`/`apksigner`, `android.jar` for the configured target SDK), the NDK (sysroot, `llvm-strip`) and the JDK (`jar`, `keytool`). Exits non-zero when a required tool is missing. `--json` prints one `android` capability object on stdout instead (one item per check), which `labelle doctor --json` aggregates on labelle-cli ≥ v2.1.1. |
 | `labelle android run [--device <serial>] [--apk <path>]` | Installs and launches the APK the last `labelle build --platform=android` packaged (checked against the `libgame.so` it was packaged from), on `--device` or adb's default (`ANDROID_SERIAL`). Builds nothing. |
 | `labelle android deploy --tag <tag> [--channel <c>] [--notes-file <f>] [--apk <path>]` | Publishes the APK `labelle bundle --platform=android` produced as a GitHub Release (`gh release create`, `--repo` from `deploy.repo`; a non-`stable` channel is a pre-release). Builds nothing. See [`docs/workflows/android-release.yml`](docs/workflows/android-release.yml). |
 
