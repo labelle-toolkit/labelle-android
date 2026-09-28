@@ -227,6 +227,8 @@ pub fn parseVersion(version: []const u8) u128 {
 
 /// One probe's outcome, for the doctor report.
 pub const Check = struct {
+    /// Stable machine id: the item id in `doctor --json`.
+    id: []const u8,
     name: []const u8,
     path: ?[]const u8 = null,
     /// A remediation hint when `path` is null.
@@ -266,18 +268,21 @@ pub fn detect(a: std.mem.Allocator, io: std.Io, env: *const Env, opts: DetectOpt
     var checks: std.ArrayList(Check) = .empty;
     const sdk_home = findSdkHome(env);
     try checks.append(a, .{
+        .id = "sdk-home",
         .name = "SDK home (ANDROID_HOME / ANDROID_SDK_ROOT)",
         .path = sdk_home,
         .hint = "set ANDROID_HOME to your Android SDK directory",
     });
     if (sdk_home) |home| {
         try checks.append(a, .{
+            .id = "adb",
             .name = "adb",
             .path = try findAdbUnder(a, io, env, home),
             .hint = "install SDK platform-tools: `sdkmanager \"platform-tools\"`",
         });
         const bt = try findBuildTools(a, io, home);
         try checks.append(a, .{
+            .id = "build-tools",
             .name = "build-tools",
             .path = if (bt) |b| b.dir else null,
             .hint = "install build-tools: `sdkmanager \"build-tools;34.0.0\"`",
@@ -289,39 +294,53 @@ pub fn detect(a: std.mem.Allocator, io: std.Io, env: *const Env, opts: DetectOpt
                 if (isFile(io, path)) found = path;
             }
             try checks.append(a, .{
+                .id = tool.name,
                 .name = tool.name,
                 .path = found,
                 .hint = if (bt == null) "resolve build-tools first" else "missing from build-tools",
             });
         }
         try checks.append(a, .{
+            .id = "android-jar",
             .name = "android.jar (platform)",
             .path = try findAndroidJar(a, io, home, opts.target_sdk_version),
             .hint = try std.fmt.allocPrint(a, "install SDK platform: `sdkmanager \"platforms;android-{d}\"`", .{opts.target_sdk_version}),
         });
     } else {
-        for ([_][]const u8{ "adb", "build-tools", "aapt", "zipalign", "apksigner", "android.jar (platform)" }) |name| {
-            try checks.append(a, .{ .name = name, .hint = "resolve SDK home first" });
+        const unresolved = [_][2][]const u8{
+            .{ "adb", "adb" },
+            .{ "build-tools", "build-tools" },
+            .{ "aapt", "aapt" },
+            .{ "zipalign", "zipalign" },
+            .{ "apksigner", "apksigner" },
+            .{ "android-jar", "android.jar (platform)" },
+        };
+        for (unresolved) |c| {
+            try checks.append(a, .{ .id = c[0], .name = c[1], .hint = "resolve SDK home first" });
         }
     }
     const ndk = try findNdkRoot(a, io, env, sdk_home);
     try checks.append(a, .{
+        .id = "ndk-sysroot",
         .name = "NDK sysroot",
         .path = if (ndk) |root| try sysrootOf(a, root) else null,
         .hint = "install an NDK: `sdkmanager \"ndk;27.2.12479018\"` (or set ANDROID_NDK_HOME)",
     });
     try checks.append(a, .{
+        .id = "llvm-strip",
         .name = "llvm-strip (NDK)",
         .path = if (ndk) |root| try findNdkLlvmStrip(a, io, root) else null,
         .hint = "release builds strip the .so with the NDK's llvm-strip",
         .required = false,
     });
     try checks.append(a, .{
+        .id = "jar",
         .name = "jar (JDK)",
         .path = try findJdkTool(a, io, env, "jar"),
         .hint = "install a JDK and set JAVA_HOME to it",
     });
     try checks.append(a, .{
+        .id = "keytool",
         .name = "keytool (JDK)",
         .path = try findJdkTool(a, io, env, "keytool"),
         .hint = "install a JDK (it ships keytool, used for the debug keystore)",

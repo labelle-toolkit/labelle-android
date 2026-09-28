@@ -30,7 +30,7 @@
     .namespace = "android",
     .targets = .{"android"},
     .commands = .{
-        .{ .name = "doctor", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Check the Android SDK/NDK/JDK", .needs_project = false },
+        .{ .name = "doctor", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Check the Android SDK/NDK/JDK (--json)", .needs_project = false },
         .{ .name = "run", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Install and launch the built APK (--device, --apk)", .needs_project = true },
         .{ .name = "deploy", .build_step = "install-provider", .executable = "bin/labelle-android", .help = "Publish the bundled APK as a GitHub Release (--tag, --channel, --notes-file, --apk)", .needs_project = true },
     },

@@ -9,7 +9,9 @@
 //!
 //! Exit status: 0 on success, 1 on any failure (with one `labelle-android:`
 //! diagnostic line on stderr). Reports go to stderr, so stdout stays free
-//! for the CLI's JSON progress protocol.
+//! for the CLI's JSON progress protocol. The one exception is
+//! `doctor --json`, whose capability object is the command's stdout (the
+//! CLI captures it for `labelle doctor --json`).
 const std = @import("std");
 const builtin = @import("builtin");
 const contract = @import("contract.zig");
@@ -127,9 +129,15 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !bool {
             try args.append(a, try a.dupe(u8, arg));
         }
     }
+    // `doctor --json`: the capability object on stdout (labelle-android#18).
+    var doctor_json = false;
     if (action == .doctor) {
         for (args.items) |arg| {
-            try out.print("labelle-android: unknown argument '{s}'\n", .{arg});
+            if (std.mem.eql(u8, arg, "--json")) {
+                doctor_json = true;
+                continue;
+            }
+            try out.print("labelle-android: unknown argument '{s}' (usage: labelle android doctor [--json])\n", .{arg});
             return error.UnknownArgument;
         }
     }
@@ -148,6 +156,13 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !bool {
     var identity: ?identity_mod.Identity = null;
     if (ctx.project_dir) |project| identity = try identity_mod.load(a, io, project);
 
+    if (action == .doctor and doctor_json) {
+        const level = if (settings) |s| s.target_sdk_version else settings_mod.default_target_sdk;
+        var out_buf: [4096]u8 = undefined;
+        var stdout = stdio.stdoutWriter(io, &out_buf);
+        const summary = try doctor.runJson(a, io, init.environ_map, .{ .target_sdk_version = level }, &stdout.interface);
+        return summary.failures != 0;
+    }
     if (action == .doctor) {
         if (settings) |s| {
             try out.print("\n  package: {s}  label: \"{s}\"  min SDK: {d}\n", .{
