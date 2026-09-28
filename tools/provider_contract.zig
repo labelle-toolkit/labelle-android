@@ -1,29 +1,38 @@
-//! Vendored from labelle-cli `src/cli/provider_contract.zig` on `development`
-//! at 23aa180d0da9d7bfc71cdac765d36706a0d605ad (PR #440 merged):
-//! the strict provider wire decoder, contract 1.2.0. Its JSON fixtures are
-//! vendored alongside in `provider_contract/`. Re-vendor verbatim (keep this
-//! header) when the CLI ships a new contract minor; do not edit below.
+//! Vendored verbatim from labelle-cli `src/cli/provider_contract.zig` at
+//! d7827ebec1b936ad953ae1893a797ad115e791af (labelle-cli#443, contract 1.4.0). Re-vendor verbatim
+//! (keep this header) when the CLI ships a new contract minor; do not edit below.
 //!
 //! Provider contract v1. Pure validation; does not resolve or execute packages.
 const std = @import("std");
 
 /// The contract version this CLI implements: the newest wire it speaks.
-pub const version = "1.2.0";
+pub const version = "1.4.0";
 
 /// Every wire version this CLI can speak, newest first. A minor is additive:
-/// `1.1.0` is `1.0.0` plus the optional `build_number` key, and `1.2.0` is
-/// `1.1.0` plus `target_dir` and the `run` options (§2). The version a
-/// provider receives is negotiated from its `command_contract` range
+/// `1.1.0` is `1.0.0` plus the optional `build_number` key, `1.2.0` is
+/// `1.1.0` plus `target_dir` and the `run` options, `1.3.0` is `1.2.0`
+/// plus `cache_dir` and `env_file`, and `1.4.0` is `1.3.0` plus
+/// `final_step` (§2). The version a provider receives is
+/// negotiated from its `command_contract` range
 /// (`provider_manifest.negotiate`), so a provider pinned to `<1.1.0` keeps
 /// receiving the exact `1.0.0` wire and never sees a key it would reject as
 /// unknown.
-pub const supported_versions = [_][]const u8{ version, "1.1.0", "1.0.0" };
+pub const supported_versions = [_][]const u8{ version, "1.3.0", "1.2.0", "1.1.0", "1.0.0" };
 
 /// The first wire version that carries `build_number`.
 pub const build_number_since = "1.1.0";
 
 /// The first wire version that carries `target_dir` and `run`.
 pub const run_context_since = "1.2.0";
+
+/// The first wire version that carries `cache_dir` and `env_file`.
+pub const toolchain_context_since = "1.3.0";
+
+/// The first wire version whose `run` context carries `watch`.
+pub const watch_context_since = "1.3.0";
+
+/// The first wire version that carries `final_step`.
+pub const final_step_since = "1.4.0";
 
 fn atLeast(wire_version: []const u8, since: []const u8) bool {
     const wire = std.SemanticVersion.parse(wire_version) catch return false;
@@ -42,6 +51,57 @@ pub fn carriesRunContext(wire_version: []const u8) bool {
     return atLeast(wire_version, run_context_since);
 }
 
+/// True when the wire `contract_version` carries the `cache_dir` and
+/// `env_file` keys (on every context).
+pub fn carriesToolchainContext(wire_version: []const u8) bool {
+    return atLeast(wire_version, toolchain_context_since);
+}
+
+/// True when the wire `contract_version`'s `run` context carries the
+/// `watch` key (null outside a watch session).
+pub fn carriesWatchContext(wire_version: []const u8) bool {
+    return atLeast(wire_version, watch_context_since);
+}
+
+/// True when the wire `contract_version` carries the `final_step` key (on
+/// every context).
+pub fn carriesFinalStep(wire_version: []const u8) bool {
+    return atLeast(wire_version, final_step_since);
+}
+
+/// Whether a command whose last lifecycle step is `final` runs the hooks of
+/// `step` (contract §6): every command runs `generate`; `build`, `run` and
+/// `bundle` run `build` first; and `run` and `bundle` are alternatives, so
+/// a `bundle` hook never sees `final_step = run`, nor the reverse.
+pub fn stepReaches(final: Step, step: Step) bool {
+    return switch (step) {
+        .generate => true,
+        .build => final != .generate,
+        .run, .bundle => final == step,
+    };
+}
+
+/// The hook slots whose context names an `env_file` (wire `1.3.0`+): the
+/// `before generate`, `after generate` and `before build` hooks, which run
+/// ahead of the zig invocations a contributed environment is for (the
+/// generation-time fingerprint pass and the compile). Every other hook and
+/// every command gets `env_file: null`.
+pub fn envFileSlot(invocation: Invocation) bool {
+    if (invocation.kind != .hook) return false;
+    const step = invocation.step orelse return false;
+    const phase = invocation.phase orelse return false;
+    return switch (step) {
+        .generate => phase == .before or phase == .after,
+        .build => phase == .before,
+        .bundle, .run => false,
+    };
+}
+
+/// Environment names a provider's `env_file` may not set are the CLI-owned
+/// ones in `config.reserved_env` (`config.zig`, beside the CLI's own
+/// environment access). The table names legacy toolchain variables, so it
+/// lives in a file the agnosticism guard already tracks rather than in this
+/// platform-neutral contract.
 fn supported(wire_version: []const u8) bool {
     for (supported_versions) |candidate| {
         if (std.mem.eql(u8, wire_version, candidate)) return true;
@@ -69,9 +129,28 @@ pub const RunEnv = struct {
     value: []const u8,
 };
 
+/// A watch session (`labelle run --watch`, wire `1.3.0`+), handed to the
+/// run replacement only. Both paths are absolute. `output_dir` names the
+/// last successfully built output, switched atomically to each new
+/// publication; `generation_file` holds that publication's number (ASCII
+/// decimal and a newline, 0 first), advanced only AFTER `output_dir` was
+/// switched. A consumer polls the generation and re-resolves `output_dir`
+/// once it changes.
+pub const WatchContext = struct {
+    generation_file: []const u8,
+    output_dir: []const u8,
+
+    pub fn validate(self: WatchContext) !void {
+        try absolute(self.generation_file);
+        try absolute(self.output_dir);
+    }
+};
+
 /// The `labelle run` options a `run`-step hook receives (wire `1.2.0`+).
 /// Every key is required; `timeout_ms` is null when `--timeout` was not
-/// given.
+/// given. `watch` (wire `1.3.0`+) is required there too: null outside a
+/// watch session and on every hook but the replacement; absent below
+/// `1.3.0`.
 pub const RunContext = struct {
     /// The run options as `LABELLE_*` variables, in the order the core
     /// launch sets them. Empty when none was given.
@@ -80,6 +159,8 @@ pub const RunContext = struct {
     args: []const []const u8,
     /// `--timeout`, in milliseconds.
     timeout_ms: ?u64,
+    /// The watch session, on the run replacement of `labelle run --watch`.
+    watch: ?WatchContext = null,
 
     /// Whether the user passed any run option at all.
     pub fn given(self: RunContext) bool {
@@ -97,11 +178,29 @@ pub const RunContext = struct {
         for (self.args) |arg| {
             if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidRunArgument;
         }
+        if (self.watch) |w| try w.validate();
+    }
+
+    /// The object on `wire`: `watch` written (null or not) from `1.3.0`,
+    /// never below.
+    fn write(self: RunContext, jws: anytype, wire: []const u8) !void {
+        try jws.beginObject();
+        try jws.objectField("env");
+        try jws.write(self.env);
+        try jws.objectField("args");
+        try jws.write(self.args);
+        try jws.objectField("timeout_ms");
+        try jws.write(self.timeout_ms);
+        if (carriesWatchContext(wire)) {
+            try jws.objectField("watch");
+            try jws.write(self.watch);
+        }
+        try jws.endObject();
     }
 };
 
 /// A portable environment-variable name: `[A-Za-z_][A-Za-z0-9_]*`.
-fn envName(name: []const u8) bool {
+pub fn envName(name: []const u8) bool {
     if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
     for (name) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
@@ -121,6 +220,13 @@ fn envName(name: []const u8) bool {
 ///   Never present below `1.2.0`.
 /// - `run` (wire `1.2.0`+) is present on every `run`-step hook context and
 ///   absent (never null) everywhere else.
+/// - `cache_dir` (wire `1.3.0`+) is required, and never null, on every
+///   `1.3.0` context: the provider's persistent cache directory.
+/// - `env_file` (wire `1.3.0`+) is required on every `1.3.0` context: an
+///   absolute path on a hook in an `envFileSlot`, null everywhere else.
+/// - `final_step` (wire `1.4.0`+) is required on every `1.4.0` context: on
+///   a hook, the last lifecycle step the invoking CLI command runs (one the
+///   hook's own step leads to, `stepReaches`); null on a command.
 ///
 /// Paths are absolute for the host running the provider.
 pub const Context = struct {
@@ -146,6 +252,26 @@ pub const Context = struct {
     /// The `labelle run` options, for a `run`-step hook that stands in for
     /// or wraps the launch. Wire `1.2.0`+ (see above).
     run: ?RunContext = null,
+    /// The provider's persistent cache directory,
+    /// `<LABELLE_HOME>/providers/<canonical provider id>/`: created by the
+    /// CLI, shared by every project that pins the same provider, and laid
+    /// out by the provider. Wire `1.3.0`+ (see above).
+    cache_dir: ?[]const u8 = null,
+    /// Where a `before generate`, `after generate` or `before build` hook
+    /// may write its environment contribution (contract §2, "Environment
+    /// contributions"). The file does not exist when the hook starts. Wire
+    /// `1.3.0`+ (see above).
+    env_file: ?[]const u8 = null,
+    /// The last lifecycle step of the CLI command that runs this hook:
+    /// `generate` (`labelle generate`, and a legacy subcommand that only
+    /// runs the generate hooks), `build`, `run` (`labelle run`, watched
+    /// rebuilds included) or `bundle`. A hook uses it to tell a build it
+    /// finalises from one a later step packages anyway: an `after build`
+    /// hook that makes the installable package of `labelle build` and
+    /// `labelle run` can skip that work when `final_step` is `bundle`,
+    /// whose replacement produces the distributable (cli#443). Wire
+    /// `1.4.0`+ (see above).
+    final_step: ?Step = null,
 
     pub fn validate(self: Context, needs_project: bool) !void {
         if (!supported(self.contract_version)) return error.UnsupportedContract;
@@ -178,6 +304,10 @@ pub const Context = struct {
             if (self.invocation.kind != .hook or self.invocation.step != .bundle) return error.InvalidInvocation;
             if (number.len == 0) return error.InvalidBuildNumber;
         }
+        if (!carriesToolchainContext(self.contract_version)) {
+            // Keys a `1.2.0` or older strict decoder would reject as unknown.
+            if (self.cache_dir != null or self.env_file != null or self.final_step != null) return error.UnsupportedContract;
+        }
         if (!carriesRunContext(self.contract_version)) {
             // Keys a `1.1.0`/`1.0.0` strict decoder would reject as unknown.
             if (self.target_dir != null or self.run != null) return error.UnsupportedContract;
@@ -191,11 +321,32 @@ pub const Context = struct {
         if (self.run) |run| {
             if (!run_hook) return error.InvalidInvocation;
             try run.validate();
+            if (run.watch != null) {
+                // A `1.2.0` strict decoder rejects the key.
+                if (!carriesWatchContext(self.contract_version)) return error.UnsupportedContract;
+                // Only the replacement is the session's long-lived launch.
+                if (self.invocation.phase != .replace) return error.WatchNotAllowed;
+            }
         } else if (run_hook) return error.MissingRunContext;
+        if (!carriesToolchainContext(self.contract_version)) return;
+        try absolute(self.cache_dir orelse return error.MissingCacheDir);
+        if (envFileSlot(self.invocation)) {
+            try absolute(self.env_file orelse return error.MissingEnvFile);
+        } else if (self.env_file != null) return error.EnvFileNotAllowed;
+        if (!carriesFinalStep(self.contract_version)) {
+            // A `1.3.0` strict decoder rejects the key as unknown.
+            if (self.final_step != null) return error.UnsupportedContract;
+            return;
+        }
+        if (hook) {
+            const final = self.final_step orelse return error.MissingFinalStep;
+            if (!stepReaches(final, self.invocation.step.?)) return error.InvalidFinalStep;
+        } else if (self.final_step != null) return error.InvalidInvocation;
     }
 
     /// Every field in declaration order, nulls included, except the keys the
-    /// context's wire does not carry (`target_dir` below `1.2.0`) and the
+    /// context's wire does not carry (`target_dir` below `1.2.0`, `cache_dir`
+    /// and `env_file` below `1.3.0`, `final_step` below `1.4.0`) and the
     /// optional ones when absent (`build_number`, `run`), which are omitted
     /// rather than written as null.
     pub fn jsonStringify(self: Context, jws: anytype) !void {
@@ -203,16 +354,24 @@ pub const Context = struct {
         inline for (std.meta.fields(Context)) |field| {
             const value = @field(self, field.name);
             const optional = comptime std.mem.eql(u8, field.name, "build_number") or std.mem.eql(u8, field.name, "run");
-            const wire_gated = comptime std.mem.eql(u8, field.name, "target_dir");
+            const run_gated = comptime std.mem.eql(u8, field.name, "target_dir");
+            const toolchain_gated = comptime std.mem.eql(u8, field.name, "cache_dir") or std.mem.eql(u8, field.name, "env_file");
+            const final_step_gated = comptime std.mem.eql(u8, field.name, "final_step");
             const write = if (optional)
                 value != null
-            else if (wire_gated)
+            else if (run_gated)
                 carriesRunContext(self.contract_version)
+            else if (toolchain_gated)
+                carriesToolchainContext(self.contract_version)
+            else if (final_step_gated)
+                carriesFinalStep(self.contract_version)
             else
                 true;
             if (write) {
                 try jws.objectField(field.name);
-                try jws.write(value);
+                if (comptime std.mem.eql(u8, field.name, "run")) {
+                    try value.?.write(jws, self.contract_version);
+                } else try jws.write(value);
             }
         }
         try jws.endObject();
@@ -231,7 +390,9 @@ pub fn parseContext(allocator: std.mem.Allocator, bytes: []const u8, needs_proje
 /// What the typed decode cannot see, because a missing optional field and
 /// an explicit null both decode to null: on a `1.2.0` wire `target_dir` is
 /// a required key (null on a command, never absent), below it the key does
-/// not exist (even as null), and an optional key is absent rather than null.
+/// not exist (even as null); `cache_dir` and `env_file` follow the same rule
+/// from `1.3.0`, and `final_step` from `1.4.0`; and an optional key is
+/// absent rather than null.
 fn keyPresence(allocator: std.mem.Allocator, bytes: []const u8, wire: []const u8) !void {
     const raw = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer raw.deinit();
@@ -245,9 +406,23 @@ fn keyPresence(allocator: std.mem.Allocator, bytes: []const u8, wire: []const u8
     } else {
         if (has_target_dir or object.contains("run")) return error.UnknownField;
     }
+    for ([_][]const u8{ "cache_dir", "env_file" }) |key| {
+        if (carriesToolchainContext(wire)) {
+            if (!object.contains(key)) return error.MissingField;
+        } else if (object.contains(key)) return error.UnknownField;
+    }
+    if (carriesFinalStep(wire)) {
+        if (!object.contains("final_step")) return error.MissingField;
+    } else if (object.contains("final_step")) return error.UnknownField;
     for ([_][]const u8{ "build_number", "run" }) |key| {
         if (object.get(key)) |value| if (value == .null) return error.NullOptionalKey;
     }
+    // `run.watch`: required (possibly null) from `1.3.0`, absent below.
+    if (object.get("run")) |run| if (run == .object) {
+        if (carriesWatchContext(wire)) {
+            if (!run.object.contains("watch")) return error.MissingField;
+        } else if (run.object.contains("watch")) return error.UnknownField;
+    };
 }
 
 /// A named install-only build step produces this exact host executable.
@@ -362,7 +537,7 @@ fn absolute(path: []const u8) !void {
 
 /// Windows paths must name their volume: `X:\...` or a UNC `\\server\share...`.
 /// Host-independent so the rule is exercised by the tests on every platform.
-fn windowsVolumeQualified(path: []const u8) bool {
+pub fn windowsVolumeQualified(path: []const u8) bool {
     const seps = "/\\";
     const drive = path.len >= 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and
         std.mem.indexOfScalar(u8, seps, path[2]) != null;
@@ -377,7 +552,13 @@ fn windowsVolumeQualified(path: []const u8) bool {
     return rest.next() != null;
 }
 
-const fixture = if (@import("builtin").os.tag == .windows)
+test {
+    _ = @import("provider_contract_watch_test.zig");
+    _ = @import("provider_contract_wire_test.zig");
+    _ = @import("provider_contract_final_step_test.zig");
+}
+
+pub const fixture = if (@import("builtin").os.tag == .windows)
     @embedFile("provider_contract/projectless-windows.json")
 else
     @embedFile("provider_contract/projectless.json");
@@ -535,7 +716,7 @@ test "build_number is optional on the wire and only for bundle hooks" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "\"target\":null") != null);
     // Present on a command: refused.
     var value = parsed.value;
-    value.contract_version = version;
+    value.contract_version = "1.2.0";
     value.build_number = "42";
     try std.testing.expectError(error.InvalidInvocation, value.validate(false));
     // Present on a bundle hook: accepted, written and read back.
@@ -559,9 +740,10 @@ test "build_number is optional on the wire and only for bundle hooks" {
 }
 
 test "a 1.0.0 context never carries build_number; every wire otherwise validates" {
-    try std.testing.expectEqualStrings("1.2.0", version);
+    try std.testing.expectEqualStrings("1.4.0", version);
     try std.testing.expect(carriesBuildNumber("1.1.0"));
     try std.testing.expect(carriesBuildNumber("1.2.0"));
+    try std.testing.expect(carriesBuildNumber("1.3.0"));
     try std.testing.expect(!carriesBuildNumber("1.0.0"));
     const parsed = try parseContext(std.testing.allocator, fixture, false);
     defer parsed.deinit();
@@ -575,8 +757,12 @@ test "a 1.0.0 context never carries build_number; every wire otherwise validates
     for (supported_versions) |wire| {
         value.contract_version = wire;
         value.target_dir = if (carriesRunContext(wire)) value.package_dir else null;
+        value.cache_dir = if (carriesToolchainContext(wire)) value.package_dir else null;
+        value.final_step = if (carriesFinalStep(wire)) .bundle else null;
         try value.validate(true);
     }
+    value.cache_dir = null;
+    value.final_step = null;
     // ...and only a 1.1.0+ wire may carry it: a strict 1.0.0 decoder
     // rejects the key as unknown, so the CLI must never emit it there.
     value.build_number = "42";
@@ -589,11 +775,17 @@ test "a 1.0.0 context never carries build_number; every wire otherwise validates
     value.target_dir = value.package_dir;
     try value.validate(true);
     value.contract_version = "1.3.0";
+    value.cache_dir = value.package_dir;
+    try value.validate(true);
+    value.contract_version = "1.4.0";
+    value.final_step = .bundle;
+    try value.validate(true);
+    value.contract_version = "1.5.0";
     try std.testing.expectError(error.UnsupportedContract, value.validate(true));
 }
 
 /// A project hook context on `wire` for `step`, from the projectless fixture.
-fn hookContext(base: Context, wire: []const u8, step: Step) Context {
+pub fn hookContext(base: Context, wire: []const u8, step: Step) Context {
     var value = base;
     value.contract_version = wire;
     value.project_dir = value.package_dir;
@@ -601,138 +793,4 @@ fn hookContext(base: Context, wire: []const u8, step: Step) Context {
     value.target = "sample-target";
     value.invocation = .{ .kind = .hook, .id = "probe", .step = step, .phase = .replace };
     return value;
-}
-
-test "1.2.0: target_dir is required on hooks, null on commands, absent below 1.2.0" {
-    try std.testing.expect(carriesRunContext("1.2.0"));
-    try std.testing.expect(!carriesRunContext("1.1.0"));
-    try std.testing.expect(!carriesRunContext("1.0.0"));
-    const parsed = try parseContext(std.testing.allocator, fixture, false);
-    defer parsed.deinit();
-    for ([_]Step{ .generate, .build, .bundle }) |step| {
-        var value = hookContext(parsed.value, "1.2.0", step);
-        // A 1.2.0 hook without its target dir: refused.
-        try std.testing.expectError(error.MissingTargetDir, value.validate(true));
-        value.target_dir = "relative/target";
-        try std.testing.expectError(error.InvalidPath, value.validate(true));
-        value.target_dir = value.package_dir;
-        try value.validate(true);
-        // The same hook on an older wire may not carry it: a strict 1.1.0
-        // or 1.0.0 decoder would reject the key.
-        for ([_][]const u8{ "1.1.0", "1.0.0" }) |older| {
-            value.contract_version = older;
-            try std.testing.expectError(error.UnsupportedContract, value.validate(true));
-        }
-        value.target_dir = null;
-        for ([_][]const u8{ "1.1.0", "1.0.0" }) |older| {
-            value.contract_version = older;
-            try value.validate(true);
-        }
-    }
-    // A command: null on 1.2.0; a value is refused.
-    var command = parsed.value;
-    command.contract_version = "1.2.0";
-    try command.validate(false);
-    command.target_dir = command.package_dir;
-    try std.testing.expectError(error.InvalidInvocation, command.validate(false));
-}
-
-test "1.2.0: run is only on run-step hooks and its env is well formed" {
-    const parsed = try parseContext(std.testing.allocator, fixture, false);
-    defer parsed.deinit();
-    const env = [_]RunEnv{ .{ .name = "LABELLE_SCENE", .value = "intro" }, .{ .name = "LABELLE_PROFILE", .value = "1" } };
-    const options: RunContext = .{ .env = &env, .args = &.{ "a", "b" }, .timeout_ms = 2000 };
-    var value = hookContext(parsed.value, "1.2.0", .run);
-    value.target_dir = value.package_dir;
-    // A run hook on 1.2.0 must carry it (possibly empty)...
-    try std.testing.expectError(error.MissingRunContext, value.validate(true));
-    value.run = .{ .env = &.{}, .args = &.{}, .timeout_ms = null };
-    try value.validate(true);
-    try std.testing.expect(!value.run.?.given());
-    value.run = options;
-    try value.validate(true);
-    try std.testing.expect(value.run.?.given());
-    // ...and no other step's hook, nor a command, may.
-    for ([_]Step{ .generate, .build, .bundle }) |step| {
-        var other = hookContext(parsed.value, "1.2.0", step);
-        other.target_dir = other.package_dir;
-        other.run = options;
-        try std.testing.expectError(error.InvalidInvocation, other.validate(true));
-    }
-    var command = parsed.value;
-    command.contract_version = "1.2.0";
-    command.run = options;
-    try std.testing.expectError(error.InvalidInvocation, command.validate(false));
-    // Below 1.2.0 the key does not exist.
-    for ([_][]const u8{ "1.1.0", "1.0.0" }) |older| {
-        var old = hookContext(parsed.value, older, .run);
-        try old.validate(true);
-        old.run = options;
-        try std.testing.expectError(error.UnsupportedContract, old.validate(true));
-    }
-    // Malformed env: bad names, duplicates, NUL bytes.
-    for ([_][]const RunEnv{
-        &.{.{ .name = "", .value = "x" }},
-        &.{.{ .name = "1ABC", .value = "x" }},
-        &.{.{ .name = "HAS SPACE", .value = "x" }},
-        &.{.{ .name = "A=B", .value = "x" }},
-        &.{ .{ .name = "LABELLE_SCENE", .value = "a" }, .{ .name = "LABELLE_SCENE", .value = "b" } },
-        &.{.{ .name = "LABELLE_SCENE", .value = "a\x00b" }},
-    }) |bad| {
-        value.run = .{ .env = bad, .args = &.{}, .timeout_ms = null };
-        try std.testing.expectError(error.InvalidRunEnv, value.validate(true));
-    }
-    value.run = .{ .env = &.{}, .args = &.{"a\x00b"}, .timeout_ms = null };
-    try std.testing.expectError(error.InvalidRunArgument, value.validate(true));
-}
-
-test "1.2.0 wire: written and read back; key presence follows the wire" {
-    const a = std.testing.allocator;
-    const parsed = try parseContext(a, fixture, false);
-    defer parsed.deinit();
-    const env = [_]RunEnv{.{ .name = "LABELLE_SCENE", .value = "intro" }};
-    var value = hookContext(parsed.value, "1.2.0", .run);
-    value.target_dir = value.package_dir;
-    value.run = .{ .env = &env, .args = &.{ "a", "b" }, .timeout_ms = null };
-    const wire = try std.json.Stringify.valueAlloc(a, value, .{});
-    defer a.free(wire);
-    try std.testing.expect(std.mem.indexOf(u8, wire, "\"timeout_ms\":null") != null);
-    const back = try parseContext(a, wire, true);
-    defer back.deinit();
-    try std.testing.expectEqualStrings(value.package_dir, back.value.target_dir.?);
-    try std.testing.expectEqualStrings("LABELLE_SCENE", back.value.run.?.env[0].name);
-    try std.testing.expectEqualStrings("intro", back.value.run.?.env[0].value);
-    try std.testing.expectEqual(@as(usize, 2), back.value.run.?.args.len);
-    try std.testing.expect(back.value.run.?.timeout_ms == null);
-    // A 1.2.0 command writes `target_dir` as an explicit null, and a
-    // decoder refuses a 1.2.0 context that omits the key.
-    var command = parsed.value;
-    command.contract_version = "1.2.0";
-    const command_wire = try std.json.Stringify.valueAlloc(a, command, .{});
-    defer a.free(command_wire);
-    try std.testing.expect(std.mem.indexOf(u8, command_wire, "\"target_dir\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, command_wire, "\"run\":") == null);
-    (try parseContext(a, command_wire, false)).deinit();
-    const omitted = try std.mem.replaceOwned(u8, a, command_wire, ",\"target_dir\":null", "");
-    defer a.free(omitted);
-    try std.testing.expectError(error.MissingField, parseContext(a, omitted, false));
-    // An older wire never writes the key, and refuses it even as null.
-    var older = parsed.value;
-    older.contract_version = "1.1.0";
-    const older_wire = try std.json.Stringify.valueAlloc(a, older, .{});
-    defer a.free(older_wire);
-    try std.testing.expect(std.mem.indexOf(u8, older_wire, "target_dir") == null);
-    const smuggled = try std.mem.replaceOwned(u8, a, older_wire, "\"progress\":\"json\"", "\"progress\":\"json\",\"target_dir\":null");
-    defer a.free(smuggled);
-    try std.testing.expect(!std.mem.eql(u8, older_wire, smuggled));
-    try std.testing.expectError(error.UnknownField, parseContext(a, smuggled, false));
-    // An optional key is absent, never null.
-    const null_run = try std.mem.replaceOwned(u8, a, command_wire, "\"target_dir\":null", "\"target_dir\":null,\"run\":null");
-    defer a.free(null_run);
-    try std.testing.expectError(error.NullOptionalKey, parseContext(a, null_run, false));
-    // A run hook on 1.2.0 whose `run` lacks a key: refused like any
-    // missing required field.
-    const partial = try std.mem.replaceOwned(u8, a, wire, ",\"timeout_ms\":null", "");
-    defer a.free(partial);
-    try std.testing.expectError(error.MissingField, parseContext(a, partial, true));
 }

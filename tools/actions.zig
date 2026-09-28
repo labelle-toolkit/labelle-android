@@ -7,14 +7,15 @@
 //! directory `.labelle/<backend>_android/`:
 //!
 //!   zig-out/lib/libgame.so          the core build's output (input)
-//!   zig-out/apk/game.apk            `package` hook, after every build
+//!   zig-out/apk/game.apk            `package` hook, after the build of
+//!                                   `labelle build` and `labelle run`
 //!   zig-out/apk/symbols/<abi>/      the unstripped library of a release build
 //!   zig-out/apk/package.json        what game.apk was packaged from
 //!   zig-out/bundle/android/         `bundle` hook (or `--output`):
 //!       <package>-<versionName>.apk, its size report and symbols
 const std = @import("std");
 const builtin = @import("builtin");
-const contract = @import("contract.zig");
+const contract = @import("provider_contract.zig");
 const settings_mod = @import("settings.zig");
 const identity_mod = @import("project_identity.zig");
 const sdk = @import("sdk.zig");
@@ -59,10 +60,26 @@ fn stagingName(a: std.mem.Allocator, prefix: []const u8) ![]const u8 {
 
 // ── build/after: package ──────────────────────────────────────────────────
 
+/// Whether the `package` hook has nothing to do: under `labelle bundle`
+/// (contract `final_step = bundle`, wire 1.4.0+) the `bundle` replacement
+/// packages the release APK from this same build, so packaging the install
+/// APK too would make it twice (labelle-cli#443). An older CLI (wire 1.3.0
+/// or below) sends no `final_step`, and the hook packages as before.
+pub fn packageSkipped(ctx: contract.Context) bool {
+    return ctx.final_step == .bundle;
+}
+
 /// Package `zig-out/apk/game.apk` from this build. The previous
 /// `zig-out/apk/` is deleted first, so a failure leaves no APK: an older one
-/// is never presented as this build's.
+/// is never presented as this build's. Skipped under `labelle bundle`
+/// (`packageSkipped`); an APK left from an earlier build stays, and the
+/// `deploy` hook and `labelle android run` refuse it once it no longer
+/// matches the built library (`staleness`).
 pub fn packageHook(c: Context) !void {
+    if (packageSkipped(c.ctx)) {
+        std.debug.print("labelle-android: not packaging zig-out/apk/game.apk: the bundle step packages the release APK\n", .{});
+        return;
+    }
     const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
     const dir = try apkDir(c.a, target_dir);
     std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
@@ -386,6 +403,31 @@ test "strip follows the optimize mode: every release mode strips, Debug copies" 
     try std.testing.expect(stripFor(.ReleaseSafe));
     try std.testing.expect(stripFor(.ReleaseFast));
     try std.testing.expect(stripFor(.ReleaseSmall));
+}
+
+test "packageSkipped: only a build whose command ends in bundle skips the install APK" {
+    const root = if (builtin.os.tag == .windows) "C:/p" else "/p";
+    var ctx: contract.Context = .{
+        .contract_version = contract.version,
+        .invocation = .{ .kind = .hook, .id = "package", .step = .build, .phase = .after },
+        .package_dir = root,
+        .project_dir = root,
+        .target = "android",
+        .lock_file = root,
+        .config_file = null,
+        .output_dir = root,
+        .zig_executable = root,
+        .optimize = .Debug,
+        .progress = .human,
+    };
+    // An older CLI's wire has no final_step: package as before.
+    try std.testing.expect(!packageSkipped(ctx));
+    for ([_]contract.Step{ .build, .run }) |final| {
+        ctx.final_step = final;
+        try std.testing.expect(!packageSkipped(ctx));
+    }
+    ctx.final_step = .bundle;
+    try std.testing.expect(packageSkipped(ctx));
 }
 
 test "versionCode: absent is 1; a positive integer up to 2100000000; nothing else" {

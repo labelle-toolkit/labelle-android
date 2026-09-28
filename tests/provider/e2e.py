@@ -451,7 +451,10 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     bundled = bundle_dir / 'com.labelle.fixture-1.0.apk'
     assert bundled.is_file(), (out, list(bundle_dir.iterdir()) if bundle_dir.exists() else None)
     codes = [m.split('android:versionCode="')[1].split('"')[0] for m in manifests()]
-    assert codes == ['1', '7'], codes  # the build's game.apk, then the bundle
+    # Packaged once (labelle-cli#443): the bundle replacement alone. The
+    # build's `package` hook sees `final_step = bundle` and skips game.apk.
+    assert codes == ['7'], codes
+    assert 'not packaging zig-out/apk/game.apk: the bundle step packages the release APK' in out, out
     assert inventory(bundled)['lib/arm64-v8a/libgame.so'][1] == b'STRIPPED'
     check_layout(bundled)
     assert (bundle_dir / 'com.labelle.fixture-1.0.size.txt').read_text().startswith('labelle-android: APK size')

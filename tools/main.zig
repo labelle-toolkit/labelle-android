@@ -3,7 +3,7 @@
 //! One binary serves every command and hook `plugin.labelle` declares, like
 //! labelle-web's `bin/labelle-web`. The CLI writes a contract context to the
 //! file named by `LABELLE_CONTEXT`; this decodes it strictly
-//! (`contract.zig`), routes on the invocation `(kind, id, step, phase)`, and
+//! (`provider_contract.zig`), routes on the invocation `(kind, id, step, phase)`, and
 //! refuses any combination the manifest does not declare. Settings
 //! (`providers/android.json`) are validated before any side effect.
 //!
@@ -14,7 +14,7 @@
 //! CLI captures it for `labelle doctor --json`).
 const std = @import("std");
 const builtin = @import("builtin");
-const contract = @import("contract.zig");
+const contract = @import("provider_contract.zig");
 const settings_mod = @import("settings.zig");
 const identity_mod = @import("project_identity.zig");
 const doctor = @import("doctor.zig");
@@ -305,11 +305,11 @@ test "routes mirror plugin.labelle" {
     try std.testing.expectEqual(commands, std.mem.count(u8, declared, ".name = \""));
     try std.testing.expectEqual(hooks, std.mem.count(u8, declared, ".id = \""));
     try std.testing.expect(std.mem.indexOf(u8, manifest, "studio") == null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, ".command_contract = \">=1.2.0 <1.2.1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, ".command_contract = \">=1.2.0 <1.4.1\"") != null);
 }
 
-test "the vendored decoder is contract 1.2.0 and accepts its own fixtures" {
-    try std.testing.expectEqualStrings("1.2.0", contract.version);
+test "the vendored decoder is contract 1.4.0 and accepts its own fixtures" {
+    try std.testing.expectEqualStrings("1.4.0", contract.version);
     const fixture = if (@import("builtin").os.tag == .windows)
         @embedFile("provider_contract/projectless-windows.json")
     else

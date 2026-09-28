@@ -115,13 +115,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # labelle-cli v2.1.1: no reserved `android` namespace, no built-in
-      # Android code, and `labelle doctor --json` aggregates provider doctors
-      # (the e2e asserts it; --require-doctor-aggregation makes a skip fatal).
+      # labelle-cli `main` at the merge of PR #487 (cli#443): contract 1.4.0
+      # (`final_step`), no reserved `android` namespace, no built-in Android
+      # code, and `labelle doctor --json` aggregates provider doctors (the e2e
+      # asserts it; --require-doctor-aggregation makes a skip fatal).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: v2.1.1
+          ref: d7827ebec1b936ad953ae1893a797ad115e791af
           path: .test-cli
           persist-credentials: false
       - run: zig build
@@ -168,11 +169,11 @@ jobs:
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
-      # The same labelle-cli pin as the provider job.
+      # The same labelle-cli pin as the provider job (#487 merged).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: v2.1.1
+          ref: d7827ebec1b936ad953ae1893a797ad115e791af
           path: .test-cli
           persist-credentials: false
       - run: zig build
