@@ -85,7 +85,7 @@ zig-out/bundle/android/<pkg>-<ver>.apk       `bundle` hook (+ .size.txt, -symbol
 
 **Run it inside a project** that pins this package: the CLI dispatches provider commands only from a project's `.plugins`, so `labelle android doctor` outside a project no longer works (the CLI's projectless dispatch is a later phase).
 
-Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440)) and without the built-in Android support ([CLI #441](https://github.com/labelle-toolkit/labelle-cli/pull/441), #405 PR 3): labelle-cli v2.0.0 or newer. Earlier CLIs reserve the `android` namespace for their legacy `labelle android` subcommand, so discovery rejects this provider. CI drives the real CLI, pinned at `development` 0c72c2c (the merge of #441, unpatched), through `tests/provider/e2e.py` (fake SDK, every host; asserts that only the provider packages) and `tests/provider/ndk_e2e.py` (a real bgfx APK).
+Needs a labelle-cli with provider contract 1.2.0 ([CLI #440](https://github.com/labelle-toolkit/labelle-cli/pull/440)) and without the built-in Android support ([CLI #441](https://github.com/labelle-toolkit/labelle-cli/pull/441), #405 PR 3): labelle-cli v2.0.0 or newer. Earlier CLIs reserve the `android` namespace for their legacy `labelle android` subcommand, so discovery rejects this provider. CI drives the real CLI, pinned at the released v2.1.1 tag (which also aggregates provider doctors into `labelle doctor --json`, asserted by the e2e), through `tests/provider/e2e.py` (fake SDK, every host; asserts that only the provider packages) and `tests/provider/ndk_e2e.py` (a real bgfx APK).
 
 ### Project setup
 
