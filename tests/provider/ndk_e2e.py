@@ -6,9 +6,10 @@ Writes a tiny bgfx project (one screen-space rectangle, the assembler's
 default launcher icon, an `assets/` tree with a `raw/` packer source) that
 pins this checkout as the `android` provider, then:
 
-- `labelle bundle --platform=android --optimize=ReleaseFast --build-number=3`
-  (the core build, the `package` hook's `zig-out/apk/game.apk`, and the
-  `bundle` hook's release APK);
+- `labelle build --platform=android --optimize=ReleaseFast` (the core build
+  and the `package` hook's `zig-out/apk/game.apk`), then `labelle bundle
+  --platform=android --optimize=ReleaseFast --build-number=3` (the `bundle`
+  hook's release APK; the `package` hook skips under bundle, labelle-cli#443);
 - `apksigner verify` on both APKs;
 - `aapt dump badging`: package, versionCode (1 for the build's APK, 3 for the
   bundle), SDK levels, label, orientation, launchable activity and icon;
@@ -190,17 +191,24 @@ def main(root):
     (project / 'assets/keep.txt').write_text('shipped: no rule leaves it out')
     (project / 'assets/raw/source.txt').write_text('packer source: never shipped')
 
-    # The pinned CLI is a `development` build, versioned below the releases
+    # The pinned CLI is an unreleased build, versioned below the releases
     # the pinned packages expect.
-    out = run([cli, 'bundle', '--platform=android', '--optimize=ReleaseFast', '--build-number=3'],
-              cwd=project, timeout=3600, env=dict(os.environ, LABELLE_ALLOW_OLDER_CLI='1'))
-    print(out[-4000:])
+    env = dict(os.environ, LABELLE_ALLOW_OLDER_CLI='1')
     target = project / '.labelle' / 'bgfx_android'
     apk = target / 'zig-out/apk/game.apk'
     bundled = target / 'zig-out/bundle/android/com.labelle.tiny_android-0.3.apk'
-    assert apk.is_file() and bundled.is_file(), out
+    out = run([cli, 'build', '--platform=android', '--optimize=ReleaseFast'], cwd=project, timeout=3600, env=env)
+    print(out[-4000:])
+    assert apk.is_file(), out
     check_apk(apk, 1, target / 'zig-out/apk/symbols/arm64-v8a/libgame.so')
     check_jni_origin(target / 'zig-out/apk/symbols/arm64-v8a/libgame.so')
+    out = run([cli, 'bundle', '--platform=android', '--optimize=ReleaseFast', '--build-number=3'],
+              cwd=project, timeout=3600, env=env)
+    print(out[-4000:])
+    assert bundled.is_file(), out
+    # Packaged once under bundle (labelle-cli#443): the build's `package`
+    # hook sees `final_step = bundle` and leaves game.apk to `labelle build`.
+    assert 'not packaging zig-out/apk/game.apk: the bundle step packages the release APK' in out, out
     files = check_apk(bundled, 3, target / 'zig-out/bundle/android/com.labelle.tiny_android-0.3-symbols/arm64-v8a/libgame.so')
     print('inventory:')
     for name, (method, size) in sorted(files.items()):
