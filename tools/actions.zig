@@ -71,18 +71,19 @@ pub fn packageSkipped(ctx: contract.Context) bool {
 
 /// Package `zig-out/apk/game.apk` from this build. The previous
 /// `zig-out/apk/` is deleted first, so a failure leaves no APK: an older one
-/// is never presented as this build's. Skipped under `labelle bundle`
-/// (`packageSkipped`); an APK left from an earlier build stays, and the
-/// `deploy` hook and `labelle android run` refuse it once it no longer
-/// matches the built library (`staleness`).
+/// is never presented as this build's. Under `labelle bundle`
+/// (`packageSkipped`) only that deletion happens: an install APK from an
+/// earlier build may predate an asset, icon or identity change this build
+/// has, which its package record does not track, so `labelle android run`
+/// must ask for a `labelle build` rather than install it.
 pub fn packageHook(c: Context) !void {
+    const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
+    const dir = try apkDir(c.a, target_dir);
+    std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
     if (packageSkipped(c.ctx)) {
         std.debug.print("labelle-android: not packaging zig-out/apk/game.apk: the bundle step packages the release APK\n", .{});
         return;
     }
-    const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
-    const dir = try apkDir(c.a, target_dir);
-    std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
     const strip = stripFor(c.ctx.optimize);
     const tools = try pkg.findTools(c.a, c.io, c.env, c.settings.target_sdk_version, strip);
     const apk = try std.fs.path.join(c.a, &.{ dir, apk_name });
@@ -200,6 +201,13 @@ pub fn deployHook(c: Context) !void {
     const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
     const apk = try checkedApk(c, target_dir);
     const run = c.ctx.run orelse contract.RunContext{ .env = &.{}, .args = &.{}, .timeout_ms = null };
+    // The replacement declares no `.watch = true`, so the CLI refuses
+    // `labelle run --watch` before any build; a watch session reaching it
+    // anyway is refused rather than served once and reported as success.
+    if (run.watch != null) {
+        std.debug.print("labelle-android: run --watch is not supported: the deploy hook installs and launches once\n", .{});
+        return error.WatchNotSupported;
+    }
     if (run.args.len != 0)
         std.debug.print("labelle-android: note: {d} argument(s) after `--` ignored: a NativeActivity has no argv; use the run options (--scene, --screenshot, ...)\n", .{run.args.len});
     if (run.timeout_ms != null)
