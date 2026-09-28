@@ -11,14 +11,17 @@
 // Every command runs the one host tool `bin/labelle-android`
 // (`tools/main.zig`, built by `zig build install-provider`), which dispatches
 // on the invocation. `command_contract` admits exactly the wire versions its
-// strict decoder (`tools/contract.zig` `supported_versions`) accepts: a
-// future 1.2.x patch is not admitted until the decoder learns it.
+// strict decoder (`tools/provider_contract.zig` `supported_versions`) accepts
+// from 1.2.0 (the first wire with `target_dir`) up: a future 1.4.x patch is
+// not admitted until the decoder learns it.
 //
 // Commands (`labelle android <cmd>`) act on already-built output; building
 // happens through `labelle build|run|bundle --platform=android`, whose
 // hooks this package supplies:
 //   - `package` after `build`: packages `zig-out/apk/game.apk` from the core
-//     build's `libgame.so`, so `labelle build` yields an installable APK;
+//     build's `libgame.so`, so `labelle build` yields an installable APK
+//     (skipped under `labelle bundle`, wire 1.4.0 `final_step`: the bundle
+//     replacement packages the release APK, labelle-cli#443);
 //   - `deploy` replacing `run`: installs that APK and launches it, turning
 //     the `run` options into `am start --es` launch extras;
 //   - `bundle` replacing `bundle`: the release APK, `versionCode` stamped
@@ -26,7 +29,7 @@
 .{
     .name = "android",
     .manifest_version = 2,
-    .command_contract = ">=1.2.0 <1.2.1",
+    .command_contract = ">=1.2.0 <1.4.1",
     .namespace = "android",
     .targets = .{"android"},
     .commands = .{

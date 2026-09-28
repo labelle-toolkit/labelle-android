@@ -7,14 +7,15 @@
 //! directory `.labelle/<backend>_android/`:
 //!
 //!   zig-out/lib/libgame.so          the core build's output (input)
-//!   zig-out/apk/game.apk            `package` hook, after every build
+//!   zig-out/apk/game.apk            `package` hook, after the build of
+//!                                   `labelle build` and `labelle run`
 //!   zig-out/apk/symbols/<abi>/      the unstripped library of a release build
 //!   zig-out/apk/package.json        what game.apk was packaged from
 //!   zig-out/bundle/android/         `bundle` hook (or `--output`):
 //!       <package>-<versionName>.apk, its size report and symbols
 const std = @import("std");
 const builtin = @import("builtin");
-const contract = @import("contract.zig");
+const contract = @import("provider_contract.zig");
 const settings_mod = @import("settings.zig");
 const identity_mod = @import("project_identity.zig");
 const sdk = @import("sdk.zig");
@@ -59,12 +60,35 @@ fn stagingName(a: std.mem.Allocator, prefix: []const u8) ![]const u8 {
 
 // ── build/after: package ──────────────────────────────────────────────────
 
+/// Whether the `package` hook has nothing to do: under `labelle bundle`
+/// (contract `final_step = bundle`, wire 1.4.0+) the `bundle` replacement
+/// packages the release APK from this same build, so packaging the install
+/// APK too would make it twice (labelle-cli#443). An older CLI (wire 1.3.0
+/// or below) sends no `final_step`, and the hook packages as before.
+pub fn packageSkipped(ctx: contract.Context) bool {
+    return ctx.final_step == .bundle;
+}
+
 /// Package `zig-out/apk/game.apk` from this build. The previous
 /// `zig-out/apk/` is deleted first, so a failure leaves no APK: an older one
-/// is never presented as this build's.
+/// is never presented as this build's. Under `labelle bundle`
+/// (`packageSkipped`) only that deletion happens: an install APK from an
+/// earlier build may predate an asset, icon or identity change this build
+/// has, which its package record does not track, so `labelle android run`
+/// must ask for a `labelle build` rather than install it.
 pub fn packageHook(c: Context) !void {
     const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
     const dir = try apkDir(c.a, target_dir);
+    if (packageSkipped(c.ctx)) {
+        // Nothing replaces the old APK here, so failing to remove it (a
+        // locked file on Windows) must fail the hook, not leave it behind.
+        std.Io.Dir.cwd().deleteTree(c.io, dir) catch |err| {
+            std.debug.print("labelle-android: could not remove the previous install APK in {s}: {s}\n", .{ dir, @errorName(err) });
+            return err;
+        };
+        std.debug.print("labelle-android: not packaging zig-out/apk/game.apk: the bundle step packages the release APK\n", .{});
+        return;
+    }
     std.Io.Dir.cwd().deleteTree(c.io, dir) catch {};
     const strip = stripFor(c.ctx.optimize);
     const tools = try pkg.findTools(c.a, c.io, c.env, c.settings.target_sdk_version, strip);
@@ -183,6 +207,13 @@ pub fn deployHook(c: Context) !void {
     const target_dir = c.ctx.target_dir orelse return error.MissingTargetDir;
     const apk = try checkedApk(c, target_dir);
     const run = c.ctx.run orelse contract.RunContext{ .env = &.{}, .args = &.{}, .timeout_ms = null };
+    // The replacement declares no `.watch = true`, so the CLI refuses
+    // `labelle run --watch` before any build; a watch session reaching it
+    // anyway is refused rather than served once and reported as success.
+    if (run.watch != null) {
+        std.debug.print("labelle-android: run --watch is not supported: the deploy hook installs and launches once\n", .{});
+        return error.WatchNotSupported;
+    }
     if (run.args.len != 0)
         std.debug.print("labelle-android: note: {d} argument(s) after `--` ignored: a NativeActivity has no argv; use the run options (--scene, --screenshot, ...)\n", .{run.args.len});
     if (run.timeout_ms != null)
@@ -386,6 +417,31 @@ test "strip follows the optimize mode: every release mode strips, Debug copies" 
     try std.testing.expect(stripFor(.ReleaseSafe));
     try std.testing.expect(stripFor(.ReleaseFast));
     try std.testing.expect(stripFor(.ReleaseSmall));
+}
+
+test "packageSkipped: only a build whose command ends in bundle skips the install APK" {
+    const root = if (builtin.os.tag == .windows) "C:/p" else "/p";
+    var ctx: contract.Context = .{
+        .contract_version = contract.version,
+        .invocation = .{ .kind = .hook, .id = "package", .step = .build, .phase = .after },
+        .package_dir = root,
+        .project_dir = root,
+        .target = "android",
+        .lock_file = root,
+        .config_file = null,
+        .output_dir = root,
+        .zig_executable = root,
+        .optimize = .Debug,
+        .progress = .human,
+    };
+    // An older CLI's wire has no final_step: package as before.
+    try std.testing.expect(!packageSkipped(ctx));
+    for ([_]contract.Step{ .build, .run }) |final| {
+        ctx.final_step = final;
+        try std.testing.expect(!packageSkipped(ctx));
+    }
+    ctx.final_step = .bundle;
+    try std.testing.expect(packageSkipped(ctx));
 }
 
 test "versionCode: absent is 1; a positive integer up to 2100000000; nothing else" {

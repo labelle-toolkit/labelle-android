@@ -8,7 +8,7 @@
 //! the device, exactly as the CLI's own Android launch did.
 const std = @import("std");
 const builtin = @import("builtin");
-const contract = @import("contract.zig");
+const contract = @import("provider_contract.zig");
 const sdk = @import("sdk.zig");
 const proc = @import("proc.zig");
 
