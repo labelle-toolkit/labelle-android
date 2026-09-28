@@ -115,12 +115,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # labelle-cli `development` at the merge of PR #441 (#405 PR 3): contract
-      # 1.2.0, no reserved `android` namespace and no built-in Android code.
+      # labelle-cli v2.1.1: no reserved `android` namespace, no built-in
+      # Android code, and `labelle doctor --json` aggregates provider doctors
+      # (the e2e asserts it; --require-doctor-aggregation makes a skip fatal).
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 0c72c2ce6289270413a5c74cc54ac6d9f7e445dd
+          ref: v2.1.1
           path: .test-cli
           persist-credentials: false
       - run: zig build
@@ -134,7 +135,7 @@ jobs:
             zig_bin="$(cygpath -w "$zig_bin")"
             cli_bin="$cli_bin.exe"
           fi
-          python tests/provider/e2e.py --cli "$cli_bin" --zig "$zig_bin"
+          python tests/provider/e2e.py --cli "$cli_bin" --zig "$zig_bin" --require-doctor-aggregation
 
   # A real APK: the pinned CLI, the released assembler and bgfx backend, the
   # NDK and the SDK build-tools package a tiny bgfx project through this
@@ -167,11 +168,11 @@ jobs:
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
           echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
-      # The same labelle-cli pin as the provider job (#441 merged).
+      # The same labelle-cli pin as the provider job.
       - uses: actions/checkout@v4
         with:
           repository: labelle-toolkit/labelle-cli
-          ref: 0c72c2ce6289270413a5c74cc54ac6d9f7e445dd
+          ref: v2.1.1
           path: .test-cli
           persist-credentials: false
       - run: zig build

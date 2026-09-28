@@ -32,6 +32,8 @@ import zlib
 p = argparse.ArgumentParser()
 p.add_argument('--cli', required=True)
 p.add_argument('--zig', required=True)
+p.add_argument('--require-doctor-aggregation', action='store_true',
+               help='fail instead of skipping when the CLI predates `labelle doctor --json` provider aggregation')
 a = p.parse_args()
 cli, zig = str(Path(a.cli).resolve()), str(Path(a.zig).resolve())
 repo = Path(__file__).resolve().parents[2]
@@ -297,7 +299,10 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
         android_cap = [c for c in caps if c['id'] == 'android']
         assert len(android_cap) == 1 and android_cap[0]['ok'] is True, caps
         assert [i['id'] for i in android_cap[0]['items']] == item_ids, caps
+        print(f'checked: {cli_version.strip()} aggregates the android provider doctor into `labelle doctor --json`')
     else:
+        assert not a.require_doctor_aggregation, \
+            f'{cli_version.strip()} predates provider doctor aggregation (2.1.1) but --require-doctor-aggregation was given'
         print(f'note: {cli_version.strip()} predates provider doctor aggregation (2.1.1); skipped `labelle doctor --json`')
     run('android', 'nonexistent', ok=False)
     run('android', 'studio', ok=False)
