@@ -2,6 +2,18 @@
 //! report of every tool the provider uses (ported from labelle-cli
 //! `src/cli/android/doctor.zig`). A required miss makes the command fail;
 //! an optional one only warns.
+//!
+//! `--json` (labelle-android#18) prints one line on stdout instead: the
+//! capability object `labelle doctor --json` aggregates (labelle-cli
+//! `src/cli/provider_doctor_json.zig`, RFC cli#466 D7),
+//!
+//!     {"id":"android", "required":true, "ok":bool, "items":[...]}
+//!
+//! one item per probe in the shape labelle-studio's ToolchainGate reads
+//! (`id`, `name`, `ok`, `fixable`, `size_mb`, `action`, `detail`, `hint`).
+//! The capability is ok when every REQUIRED tool is present; an optional
+//! miss (llvm-strip) is an item with `ok: false` that does not fail it.
+//! The android provider owns the `android` id.
 const std = @import("std");
 const builtin = @import("builtin");
 const sdk = @import("sdk.zig");
@@ -10,6 +22,62 @@ pub const Summary = struct {
     failures: usize,
     warnings: usize,
 };
+
+/// The capability id this provider reports.
+pub const capability_id = "android";
+
+pub const Item = struct {
+    id: []const u8,
+    name: []const u8,
+    ok: bool,
+    fixable: bool,
+    size_mb: u32,
+    action: ?[]const u8,
+    detail: ?[]const u8,
+    hint: ?[]const u8,
+};
+
+pub const Capability = struct {
+    id: []const u8 = capability_id,
+    required: bool = true,
+    ok: bool,
+    items: []const Item,
+};
+
+fn summarize(report: sdk.Report) Summary {
+    var summary: Summary = .{ .failures = 0, .warnings = 0 };
+    for (report.checks) |check| {
+        if (check.path != null) continue;
+        if (check.required) summary.failures += 1 else summary.warnings += 1;
+    }
+    return summary;
+}
+
+/// The report as the capability object `--json` prints.
+pub fn capability(a: std.mem.Allocator, report: sdk.Report) !Capability {
+    const items = try a.alloc(Item, report.checks.len);
+    for (report.checks, items) |check, *item| item.* = .{
+        .id = check.id,
+        .name = check.name,
+        .ok = check.path != null,
+        // Nothing here installs Android tools: every fix is manual.
+        .fixable = false,
+        .size_mb = 0,
+        .action = null,
+        .detail = check.path,
+        .hint = if (check.path == null) check.hint else null,
+    };
+    return .{ .ok = summarize(report).failures == 0, .items = items };
+}
+
+/// Probe and write the capability object as one JSON line to `out`.
+pub fn runJson(a: std.mem.Allocator, io: std.Io, env: *const sdk.Env, opts: sdk.DetectOptions, out: *std.Io.Writer) !Summary {
+    const report = try sdk.detect(a, io, env, opts);
+    try std.json.Stringify.value(try capability(a, report), .{}, out);
+    try out.writeByte('\n');
+    try out.flush();
+    return summarize(report);
+}
 
 /// Probe and write the report to `out`. Returns the miss counts; the caller
 /// decides the exit status.
@@ -22,17 +90,15 @@ pub fn run(a: std.mem.Allocator, io: std.Io, env: *const sdk.Env, opts: sdk.Dete
         \\  target SDK: {d}
         \\
     , .{report.target_sdk_version});
-    var summary: Summary = .{ .failures = 0, .warnings = 0 };
+    const summary = summarize(report);
     for (report.checks) |check| {
         if (check.path) |path| {
             try out.print("  [  OK  ] {s}\n           {s}\n", .{ check.name, path });
             continue;
         }
         if (check.required) {
-            summary.failures += 1;
             try out.print("  [ FAIL ] {s}\n", .{check.name});
         } else {
-            summary.warnings += 1;
             try out.print("  [ WARN ] {s}\n", .{check.name});
         }
         if (check.hint) |hint| try out.print("           -> {s}\n", .{hint});
@@ -127,7 +193,31 @@ const Fake = struct {
     fn doctor(self: *Fake, opts: sdk.DetectOptions, out: *std.Io.Writer) !Summary {
         return run(self.arena.allocator(), std.testing.io, &self.env, opts, out);
     }
+
+    /// `doctor --json`: the summary, the raw line, and that line parsed
+    /// strictly (every key, nothing more) as the CLI's capability shape.
+    fn doctorJson(self: *Fake, opts: sdk.DetectOptions) !struct { Summary, []const u8, Capability } {
+        const a = self.arena.allocator();
+        var out: std.Io.Writer.Allocating = .init(a);
+        const summary = try runJson(a, std.testing.io, &self.env, opts, &out.writer);
+        const text = out.written();
+        // Exactly one line: the CLI reads the whole stdout as one object.
+        try std.testing.expect(std.mem.endsWith(u8, text, "\n"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+        const cap = try std.json.parseFromSliceLeaky(Capability, a, text, .{ .allocate = .alloc_always });
+        return .{ summary, text, cap };
+    }
 };
+
+fn findItem(cap: Capability, id: []const u8) !Item {
+    for (cap.items) |item| {
+        if (std.mem.eql(u8, item.id, id)) return item;
+    }
+    std.debug.print("no item '{s}' in the capability\n", .{id});
+    return error.TestItemMissing;
+}
+
+const all_item_ids = [_][]const u8{ "sdk-home", "adb", "build-tools", "aapt", "zipalign", "apksigner", "android-jar", "ndk-sysroot", "llvm-strip", "jar", "keytool" };
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
@@ -277,4 +367,89 @@ test "doctor: a symlinked build-tools revision is a candidate" {
     try fake.tmp.dir.symLink(std.testing.io, try fake.abs("store/missing"), "sdk/build-tools/99.0.0", .{ .is_directory = true });
     const again = (try sdk.findBuildTools(fake.arena.allocator(), std.testing.io, try fake.abs("sdk"))).?;
     try std.testing.expectEqualStrings("37.0.0", again.version);
+}
+
+test "doctor --json: a complete fake SDK is one ok android capability reporting every check" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    const summary, const text, const cap = try fake.doctorJson(.{});
+    try std.testing.expectEqual(@as(usize, 0), summary.failures);
+    // No human report leaks into the JSON line.
+    try std.testing.expect(std.mem.indexOf(u8, text, "labelle android doctor") == null);
+    try std.testing.expectEqualStrings("android", cap.id);
+    try std.testing.expect(cap.required);
+    try std.testing.expect(cap.ok);
+    try std.testing.expectEqual(all_item_ids.len, cap.items.len);
+    for (all_item_ids, cap.items) |id, item| {
+        try std.testing.expectEqualStrings(id, item.id);
+        try std.testing.expect(item.ok);
+        try std.testing.expect(item.name.len != 0);
+        try std.testing.expect(item.detail != null);
+        try std.testing.expectEqual(@as(?[]const u8, null), item.hint);
+    }
+    try std.testing.expectEqualStrings(try fake.abs("sdk/build-tools/34.0.0"), (try findItem(cap, "build-tools")).detail.?);
+    try std.testing.expectEqualStrings("android.jar (platform)", (try findItem(cap, "android-jar")).name);
+}
+
+test "doctor --json: a required miss fails the capability; the item carries the hint" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    const summary, _, const cap = try fake.doctorJson(.{ .target_sdk_version = 35 });
+    try std.testing.expectEqual(@as(usize, 1), summary.failures);
+    try std.testing.expect(!cap.ok);
+    const jar = try findItem(cap, "android-jar");
+    try std.testing.expect(!jar.ok);
+    try std.testing.expectEqual(@as(?[]const u8, null), jar.detail);
+    try expectContains(jar.hint.?, "platforms;android-35");
+    // Every other check is still reported, and ok.
+    try std.testing.expectEqual(all_item_ids.len, cap.items.len);
+    for (cap.items) |item| {
+        if (!std.mem.eql(u8, item.id, "android-jar")) try std.testing.expect(item.ok);
+    }
+}
+
+test "doctor --json: an optional miss is a failed item but an ok capability" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.populate();
+    const host = sdk.ndkHostTag(builtin.os.tag);
+    try fake.mkdir(try std.fmt.allocPrint(fake.arena.allocator(), "ndk-home/toolchains/llvm/prebuilt/{s}/sysroot", .{host}));
+    try fake.env.put("ANDROID_NDK_HOME", try fake.abs("ndk-home"));
+    const summary, _, const cap = try fake.doctorJson(.{});
+    try std.testing.expectEqual(@as(usize, 0), summary.failures);
+    try std.testing.expectEqual(@as(usize, 1), summary.warnings);
+    try std.testing.expect(cap.ok);
+    const strip = try findItem(cap, "llvm-strip");
+    try std.testing.expect(!strip.ok);
+    try std.testing.expect(strip.hint != null);
+}
+
+test "doctor --json: no SDK home still reports every check, all failed" {
+    const fake = try Fake.init();
+    defer fake.deinit();
+    try fake.env.put("PATH", try fake.abs("empty-path"));
+    const summary, _, const cap = try fake.doctorJson(.{});
+    try std.testing.expectEqual(@as(usize, 10), summary.failures);
+    try std.testing.expect(!cap.ok);
+    try std.testing.expectEqual(all_item_ids.len, cap.items.len);
+    for (all_item_ids, cap.items) |id, item| {
+        try std.testing.expectEqualStrings(id, item.id);
+        try std.testing.expect(!item.ok);
+    }
+    try expectContains((try findItem(cap, "adb")).hint.?, "resolve SDK home first");
+}
+
+test "the capability object keeps the studio item shape" {
+    const a = std.testing.allocator;
+    const items = [_]Item{
+        .{ .id = "adb", .name = "adb", .ok = true, .fixable = false, .size_mb = 0, .action = null, .detail = "/sdk/adb", .hint = null },
+        .{ .id = "jar", .name = "jar (JDK)", .ok = false, .fixable = false, .size_mb = 0, .action = null, .detail = null, .hint = "h" },
+    };
+    const bytes = try std.json.Stringify.valueAlloc(a, Capability{ .ok = false, .items = &items }, .{});
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings(
+        \\{"id":"android","required":true,"ok":false,"items":[{"id":"adb","name":"adb","ok":true,"fixable":false,"size_mb":0,"action":null,"detail":"/sdk/adb","hint":null},{"id":"jar","name":"jar (JDK)","ok":false,"fixable":false,"size_mb":0,"action":null,"detail":null,"hint":"h"}]}
+    , bytes);
 }

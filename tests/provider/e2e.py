@@ -246,6 +246,55 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
 
     out = run('android', 'doctor', '--bogus', ok=False)
     assert "unknown argument '--bogus'" in out, out
+
+    # `doctor --json` (labelle-android#18): ONE capability object on stdout,
+    # the shape labelle-cli's provider_doctor_json.zig validates.
+    item_ids = ['sdk-home', 'adb', 'build-tools', 'aapt', 'zipalign', 'apksigner', 'android-jar',
+                'ndk-sysroot', 'llvm-strip', 'jar', 'keytool']
+
+    def doctor_json(code):
+        result = subprocess.run([cli, 'android', 'doctor', '--json'], cwd=project, env=env, capture_output=True,
+                                timeout=900, encoding='utf-8', errors='replace')
+        assert result.returncode == code, (result.returncode, result.stdout, result.stderr)
+        lines = result.stdout.strip().splitlines()
+        assert len(lines) == 1, result.stdout
+        cap = json.loads(lines[0])
+        assert cap['id'] == 'android' and cap['required'] is True, cap
+        assert [i['id'] for i in cap['items']] == item_ids, cap
+        for item in cap['items']:
+            assert set(item) == {'id', 'name', 'ok', 'fixable', 'size_mb', 'action', 'detail', 'hint'}, item
+        assert 'labelle android doctor\n=====' not in result.stdout + result.stderr, result
+        return cap
+
+    cap = doctor_json(0)
+    assert cap['ok'] is True and all(i['ok'] for i in cap['items']), cap
+    assert str(jar) in {i['id']: i for i in cap['items']}['jar']['detail'], cap
+    shutil.rmtree(platform35)
+    cap = doctor_json(1)
+    assert cap['ok'] is False, cap
+    failed = [i for i in cap['items'] if not i['ok']]
+    assert [i['id'] for i in failed] == ['android-jar'] and 'platforms;android-35' in failed[0]['hint'], cap
+    platform35.mkdir(parents=True)
+    (platform35 / 'android.jar').write_text('')
+
+    # The aggregated `labelle doctor --json`, where the CLI aggregates
+    # provider doctors (labelle-cli >= 2.1.1; the core checks may fail on
+    # this host, so only the android entries are judged): the android
+    # capability is the provider's own report, never a failed synthetic
+    # `provider:android` entry.
+    result = subprocess.run([cli, 'doctor', '--json'], cwd=project, env=env, capture_output=True,
+                            timeout=900, encoding='utf-8', errors='replace')
+    try:
+        caps = json.loads(result.stdout)['capabilities']
+    except (ValueError, KeyError, TypeError):
+        caps = None
+    if caps is not None and any(c['id'] == 'android' or c['id'].startswith('provider:') for c in caps):
+        assert 'provider:android' not in [c['id'] for c in caps], caps
+        android_cap = [c for c in caps if c['id'] == 'android']
+        assert len(android_cap) == 1 and android_cap[0]['ok'] is True, caps
+        assert [i['id'] for i in android_cap[0]['items']] == item_ids, caps
+    else:
+        print('note: this labelle-cli does not aggregate provider doctors; skipped `labelle doctor --json`')
     run('android', 'nonexistent', ok=False)
     run('android', 'studio', ok=False)
 
