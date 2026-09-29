@@ -137,7 +137,12 @@ fn execute(init: std.process.Init, out: *std.Io.Writer) !bool {
                 doctor_json = true;
                 continue;
             }
-            try out.print("labelle-android: unknown argument '{s}' (usage: labelle android doctor [--json])\n", .{arg});
+            // `labelle doctor --fix` forwards `--fix` to every provider
+            // doctor (labelle-cli#471 D10); the Android toolchain is the
+            // user's to install, so there is nothing to fix here: accept
+            // and ignore it.
+            if (std.mem.eql(u8, arg, "--fix")) continue;
+            try out.print("labelle-android: unknown argument '{s}' (usage: labelle android doctor [--json] [--fix])\n", .{arg});
             return error.UnknownArgument;
         }
     }
