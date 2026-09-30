@@ -150,13 +150,48 @@ pub fn markStart(fs: anytype, current: Stamp) bool {
     return fs.write(start_file, text);
 }
 
-/// `beginVulkanStart`'s pure half: bump the generation, write the start mark,
-/// start the stable timer via `spawner.spawn(mine: u32) !void`. Fails
-/// CLOSED: if the timer cannot start, the mark is KEPT, so the next launch
-/// runs on GLES rather than an unguarded Vulkan start being forgotten.
-pub fn beginStart(fs: anytype, current: Stamp, generation: *std.atomic.Value(u32), spawner: anytype) void {
-    const mine = generation.fetchAdd(1, .acq_rel) + 1;
-    if (!markStart(fs, current)) {
+/// The start mark's ownership, shared by `beginStart` and every stable
+/// thread of the process. `lock` serialises the two steps that must not
+/// interleave:
+///   * `beginStart`: { generation += 1; write the start mark }
+///   * `settle`'s final step: { generation still == mine?; unlink the mark }
+/// so an old stable thread can never unlink a mark a newer launch just
+/// wrote (Codex review of labelle-android#33, labelle-bgfx#172 comment
+/// 5904658178). The frame counter and the clock are read OUTSIDE the lock.
+///
+/// `std.atomic.Mutex` spun on `tryLock` (Zig 0.16 has no `std.Thread.Mutex`,
+/// and `std.Io.Mutex` needs an `Io`): both critical sections are a few
+/// syscalls on a tiny file and contention needs two activity launches in
+/// the same instant, so a spin is fine.
+pub const StartState = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    /// Written only under `lock`; read without it (atomically) only for the
+    /// stable loop's early exit, which is advisory.
+    generation: u32 = 0,
+
+    fn acquire(self: *StartState) void {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn release(self: *StartState) void {
+        self.lock.unlock();
+    }
+    fn peek(self: *const StartState) u32 {
+        return @atomicLoad(u32, &self.generation, .acquire);
+    }
+};
+
+/// `beginVulkanStart`'s pure half: under `state.lock`, bump the generation
+/// and write the start mark; then start the stable thread via
+/// `spawner.spawn(mine: u32) !void`. Fails CLOSED: if the thread cannot
+/// start, the mark is KEPT, so the next launch runs on GLES rather than an
+/// unguarded Vulkan start being forgotten.
+pub fn beginStart(fs: anytype, current: Stamp, state: *StartState, spawner: anytype) void {
+    state.acquire();
+    const mine = state.generation +% 1;
+    @atomicStore(u32, &state.generation, mine, .release);
+    const written = markStart(fs, current);
+    state.release();
+    if (!written) {
         std.log.warn("android: crash guard: could not write {s}", .{start_file});
         return;
     }
@@ -165,12 +200,13 @@ pub fn beginStart(fs: anytype, current: Stamp, generation: *std.atomic.Value(u32
     };
 }
 
-/// The stable timer. Polls every `poll_interval_ns` and deletes the start
+/// The stable thread. Polls every `poll_interval_ns` and deletes the start
 /// mark once `stable_after_ns` has passed since it started AND
-/// `src.framesPresented()` is at least `stable_min_frames`. Stops without
-/// deleting when a newer `beginVulkanStart` (another activity launch in the
-/// same process) has taken over (`generation` moved past `mine`): its own
-/// timer owns the mark now.
+/// `src.framesPresented()` is at least `stable_min_frames`. A newer
+/// `beginStart` (another activity launch in the same process) takes the mark
+/// over: this thread then stops without deleting. The final check-and-unlink
+/// runs under `state.lock`, so it cannot interleave with a newer
+/// `beginStart`'s bump-and-write.
 ///
 /// Injected:
 ///   * `clock.now() u64` (monotonic ns) and `clock.sleep(ns) !void`; a fake
@@ -178,10 +214,11 @@ pub fn beginStart(fs: anytype, current: Stamp, generation: *std.atomic.Value(u32
 ///   * `src.framesPresented() ?u64`: null = the labelle-bgfx symbol is
 ///     missing → time-only rule; then `src.noteTimeOnly()` is called once
 ///     (the glue logs once per process).
-pub fn settle(fs: anytype, clock: anytype, src: anytype, generation: *const std.atomic.Value(u32), mine: u32) void {
+pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, mine: u32) void {
     const t0 = clock.now();
     var noted = false;
-    while (generation.load(.acquire) == mine) {
+    // Advisory early exit; the authoritative check is under the lock below.
+    while (state.peek() == mine) {
         const frames = src.framesPresented();
         if (frames == null and !noted) {
             noted = true;
@@ -190,7 +227,9 @@ pub fn settle(fs: anytype, clock: anytype, src: anytype, generation: *const std.
         const elapsed = clock.now() -% t0;
         const enough_frames = if (frames) |f| f >= stable_min_frames else true;
         if (elapsed >= stable_after_ns and enough_frames) {
-            fs.delete(start_file);
+            state.acquire();
+            defer state.release();
+            if (state.generation == mine) fs.delete(start_file);
             return;
         }
         clock.sleep(poll_interval_ns) catch return;
@@ -281,9 +320,8 @@ fn logOnce(flag: *std.atomic.Value(bool)) bool {
     return !flag.swap(true, .acq_rel);
 }
 
-/// Bumped by every `beginVulkanStart`; each stable thread only clears the
-/// mark if it is still the latest.
-var start_generation: std.atomic.Value(u32) = .init(0);
+/// The process's start-mark ownership (see `StartState`).
+var start_state: StartState = .{};
 
 /// Process-wide `versionCode` cache: it cannot change for the life of the
 /// process (an update kills it). -1 = not asked yet.
@@ -330,7 +368,7 @@ pub fn beginVulkanStart(activity: ?*const anyopaque, setting: []const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
     const fs = libcFs(a) orelse return;
-    beginStart(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_generation, ThreadSpawner{ .fs = fs });
+    beginStart(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_state, ThreadSpawner{ .fs = fs });
 }
 
 /// Spawns the detached stable-timer thread with its own copy of the fs.
@@ -343,7 +381,7 @@ const ThreadSpawner = struct {
 };
 
 fn stableThread(fs: LibcFs, mine: u32) void {
-    settle(&fs, LibcClock{}, DlsymFrames{}, &start_generation, mine);
+    settle(&fs, LibcClock{}, DlsymFrames{}, &start_state, mine);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -417,14 +455,15 @@ const FakeFrames = struct {
     missing: bool = false,
     notes: usize = 0,
     calls: usize = 0,
-    /// Bump this generation on the Nth `framesPresented` call (a newer
-    /// `beginVulkanStart` landing mid-poll).
-    supersede: ?struct { gen: *std.atomic.Value(u32), at_call: usize } = null,
+    /// Run a real `beginStart` (a newer launch in the same process: new
+    /// generation + new mark) inside the Nth `framesPresented` call, i.e.
+    /// after `settle`'s loop-entry check and before its stable decision.
+    restart: ?struct { at_call: usize, fs: *FakeFs, state: *StartState, stamp: Stamp } = null,
 
     pub fn framesPresented(self: *FakeFrames) ?u64 {
         self.calls += 1;
-        if (self.supersede) |sup| if (self.calls == sup.at_call) {
-            _ = sup.gen.fetchAdd(1, .acq_rel);
+        if (self.restart) |r| if (self.calls == r.at_call) {
+            beginStart(r.fs, r.stamp, r.state, NoSpawner{});
         };
         if (self.missing) return null;
         const done = self.init_done_ns orelse return 0;
@@ -436,24 +475,36 @@ const FakeFrames = struct {
     }
 };
 
+const NoSpawner = struct {
+    pub fn spawn(_: NoSpawner, _: u32) error{}!void {}
+};
+
 const v1_vulkan: Stamp = .{ .version_code = 1, .setting = "vulkan" };
+const v2_vulkan: Stamp = .{ .version_code = 2, .setting = "vulkan" };
 
 /// One Vulkan launch: check the guard; if clear, mark the start and run the
 /// stable thread on `clock` with a healthy 60 fps renderer.
-fn launchVulkan(fs: *FakeFs, clock: *FakeClock, gen: *std.atomic.Value(u32), stamp: Stamp) bool {
+fn launchVulkan(fs: *FakeFs, clock: *FakeClock, state: *StartState, stamp: Stamp) bool {
     if (checkAtLaunch(fs, stamp)) return false;
-    const mine = gen.fetchAdd(1, .acq_rel) + 1;
-    if (!markStart(fs, stamp)) return true;
+    var got: ?u32 = null;
+    beginStart(fs, stamp, state, RecordingSpawner{ .got = &got });
     var frames: FakeFrames = .{ .clock = clock };
-    settle(fs, clock, &frames, gen, mine);
+    if (got) |mine| settle(fs, clock, &frames, state, mine);
     return true;
 }
 
+const RecordingSpawner = struct {
+    got: *?u32,
+    pub fn spawn(self: RecordingSpawner, mine: u32) error{}!void {
+        self.got.* = mine;
+    }
+};
+
 /// Mark a start and run only the stable thread; returns the frame fake.
 fn runSettle(fs: *FakeFs, clock: *FakeClock, frames: *FakeFrames) void {
-    var gen: std.atomic.Value(u32) = .init(1);
-    _ = markStart(fs, v1_vulkan);
-    settle(fs, clock, frames, &gen, 1);
+    var state: StartState = .{};
+    beginStart(fs, v1_vulkan, &state, NoSpawner{});
+    settle(fs, clock, frames, &state, state.generation);
 }
 
 test "stamp: format and parse round-trip; junk is rejected" {
@@ -478,9 +529,9 @@ test "first start: nothing on disk, Vulkan allowed, start mark written" {
 
 test "a crash inside 10 s disables Vulkan at the next launch" {
     var fs: FakeFs = .{};
-    var gen: std.atomic.Value(u32) = .init(0);
+    var state: StartState = .{};
     var clock: FakeClock = .{ .dies_at_ns = stable_after_ns - 1 };
-    try testing.expect(launchVulkan(&fs, &clock, &gen, v1_vulkan));
+    try testing.expect(launchVulkan(&fs, &clock, &state, v1_vulkan));
     // The thread never saw 10 s, so the mark survived the "crash".
     try testing.expect(clock.slept_ns < stable_after_ns);
     try testing.expectEqualStrings("1 vulkan", fs.start.?);
@@ -521,9 +572,9 @@ test "a stable timer that cannot start keeps the start mark (fail closed)" {
         }
     };
     var fs: FakeFs = .{};
-    var gen: std.atomic.Value(u32) = .init(0);
+    var state: StartState = .{};
     var calls: usize = 0;
-    beginStart(&fs, v1_vulkan, &gen, FailingSpawner{ .calls = &calls });
+    beginStart(&fs, v1_vulkan, &state, FailingSpawner{ .calls = &calls });
     try testing.expectEqual(@as(usize, 1), calls);
     try testing.expectEqualStrings("1 vulkan", fs.start.?); // kept
     // The next launch treats it as an incomplete start: gles.
@@ -532,25 +583,19 @@ test "a stable timer that cannot start keeps the start mark (fail closed)" {
 }
 
 test "beginStart: mark written, timer spawned with the new generation" {
-    const RecordingSpawner = struct {
-        got: *?u32,
-        pub fn spawn(self: @This(), mine: u32) error{}!void {
-            self.got.* = mine;
-        }
-    };
     var fs: FakeFs = .{};
-    var gen: std.atomic.Value(u32) = .init(4);
+    var state: StartState = .{ .generation = 4 };
     var got: ?u32 = null;
-    beginStart(&fs, v1_vulkan, &gen, RecordingSpawner{ .got = &got });
+    beginStart(&fs, v1_vulkan, &state, RecordingSpawner{ .got = &got });
     try testing.expectEqual(@as(?u32, 5), got);
     try testing.expectEqualStrings("1 vulkan", fs.start.?);
 }
 
 test "surviving 10 s (with frames) clears the mark; the next launch tries Vulkan again" {
     var fs: FakeFs = .{};
-    var gen: std.atomic.Value(u32) = .init(0);
+    var state: StartState = .{};
     var clock: FakeClock = .{};
-    try testing.expect(launchVulkan(&fs, &clock, &gen, v1_vulkan));
+    try testing.expect(launchVulkan(&fs, &clock, &state, v1_vulkan));
     try testing.expectEqual(stable_after_ns, clock.now_ns);
     try testing.expect(fs.start == null and fs.disabled == null);
     try testing.expect(!checkAtLaunch(&fs, v1_vulkan));
@@ -559,16 +604,54 @@ test "surviving 10 s (with frames) clears the mark; the next launch tries Vulkan
 
 test "a superseded stable timer leaves the newer start mark alone" {
     var fs: FakeFs = .{};
-    var gen: std.atomic.Value(u32) = .init(0);
-    const first = gen.fetchAdd(1, .acq_rel) + 1;
-    try testing.expect(markStart(&fs, v1_vulkan));
+    var state: StartState = .{};
+    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    const first = state.generation;
     var clock: FakeClock = .{};
-    // A second beginVulkanStart lands on the 3rd poll, before 10 s.
-    var frames: FakeFrames = .{ .clock = &clock, .supersede = .{ .gen = &gen, .at_call = 3 } };
-    settle(&fs, &clock, &frames, &gen, first);
+    // A second beginStart lands on the 3rd poll, well before 10 s.
+    var frames: FakeFrames = .{ .clock = &clock, .restart = .{ .at_call = 3, .fs = &fs, .state = &state, .stamp = v2_vulkan } };
+    settle(&fs, &clock, &frames, &state, first);
     try testing.expectEqual(@as(usize, 3), frames.calls); // it polled...
     try testing.expect(clock.now_ns < stable_after_ns); // ...stopped early...
-    try testing.expect(fs.start != null); // ...and did not delete
+    try testing.expectEqualStrings("2 vulkan", fs.start.?); // ...and left the new mark
+}
+
+test "race: a newer start landing at the very poll that would clear keeps its mark" {
+    // Codex review (labelle-bgfx#172 comment 5904658178). Poll 21 is t = 10 s
+    // (500 ms polls from 0) with 600 frames at 60 fps, so it is the poll
+    // whose stable decision says "clear". The newer beginStart runs inside
+    // that poll, AFTER the loop-entry generation check. Without the locked
+    // re-check the old thread unlinks the new launch's mark (this test then
+    // fails: fs.start == null).
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    const first = state.generation;
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock, .restart = .{ .at_call = 21, .fs = &fs, .state = &state, .stamp = v2_vulkan } };
+    settle(&fs, &clock, &frames, &state, first);
+    try testing.expectEqual(@as(usize, 21), frames.calls);
+    try testing.expectEqual(stable_after_ns, clock.now_ns); // it reached the stable branch
+    try testing.expectEqual(first + 1, state.generation);
+    try testing.expect(fs.start != null); // the new mark survived...
+    try testing.expectEqualStrings("2 vulkan", fs.start.?); // ...and it IS the new one
+    try testing.expect(state.lock.tryLock()); // settle released the lock
+    state.release();
+}
+
+test "the stable thread's own clear still works under the lock" {
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock };
+    var state: StartState = .{};
+    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    try testing.expect(state.lock.tryLock()); // beginStart released it...
+    try testing.expect(!state.lock.tryLock()); // ...and it is exclusive
+    state.release();
+    settle(&fs, &clock, &frames, &state, state.generation);
+    try testing.expect(fs.start == null);
+    try testing.expect(state.lock.tryLock());
+    state.release();
 }
 
 test "stable: 120 frames but under 10 s -> not cleared" {
