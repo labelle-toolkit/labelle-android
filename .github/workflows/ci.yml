@@ -66,7 +66,7 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
-      # Compiles the three JNI C TUs against the NDK sysroot and the module's
+      # Compiles the JNI C TUs against the NDK sysroot and the module's
       # `extern "c"` / AAudio / MediaCodec bindings for aarch64 (object
       # emission; nothing runs).
       - name: Cross-build for Android

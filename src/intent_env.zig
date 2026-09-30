@@ -39,7 +39,20 @@ pub const keys = [_]Key{
     .{ .name = "LABELLE_PROFILE", .debuggable_only = false },
     .{ .name = "LABELLE_SCREENSHOT_PATH", .debuggable_only = true },
     .{ .name = "LABELLE_SCREENSHOT_AFTER_SEC", .debuggable_only = true },
+    // The renderer override (labelle-android#27, labelle-bgfx#172 D3): a
+    // test/debug channel, so debuggable builds only. `renderer.zig` decides
+    // the final `LABELLE_BGFX_RENDERER` after this runs (and re-applies the
+    // same gate and validates the value).
+    .{ .name = "LABELLE_BGFX_RENDERER", .debuggable_only = true },
 };
+
+/// Index of `name` in `keys` (comptime: a typo is a compile error).
+pub fn indexOf(comptime name: []const u8) usize {
+    inline for (keys, 0..) |k, i| {
+        if (comptime std.mem.eql(u8, k.name, name)) return i;
+    }
+    @compileError("not an allow-listed intent key: " ++ name);
+}
 
 /// Is `name` one of the keys copied from the intent?
 pub fn isAllowed(name: []const u8) bool {
@@ -189,15 +202,17 @@ fn extrasWith(pairs: []const struct { [:0]const u8, [:0]const u8 }) [keys.len]?[
     return out;
 }
 
-test "the allow-list is exactly the four run-option keys" {
+test "the allow-list is exactly the four run-option keys plus the renderer override" {
     try testing.expect(isAllowed("LABELLE_SCENE"));
     try testing.expect(isAllowed("LABELLE_PROFILE"));
     try testing.expect(isAllowed("LABELLE_SCREENSHOT_PATH"));
     try testing.expect(isAllowed("LABELLE_SCREENSHOT_AFTER_SEC"));
-    try testing.expectEqual(@as(usize, 4), keys.len);
+    try testing.expect(isAllowed("LABELLE_BGFX_RENDERER"));
+    try testing.expect(keys[indexOf("LABELLE_BGFX_RENDERER")].debuggable_only);
+    try testing.expectEqual(@as(usize, 5), keys.len);
     // Other labelle knobs and arbitrary env names are not copied.
     try testing.expect(!isAllowed("LABELLE_FIXED_DT"));
-    try testing.expect(!isAllowed("LABELLE_BGFX_RENDERER"));
+    try testing.expect(!isAllowed("LABELLE_BGFX_BACKEND"));
     try testing.expect(!isAllowed("LD_PRELOAD"));
     try testing.expect(!isAllowed("PATH"));
     // Exact match only: no prefix, case or whitespace slack.
@@ -246,6 +261,25 @@ test "screenshot extras need a debuggable apk; debuggable is asked once" {
     try testing.expectEqualStrings("/data/data/x/files/prefs", debug.get("LABELLE_SCREENSHOT_PATH").?);
     try testing.expectEqualStrings("2", debug.get("LABELLE_SCREENSHOT_AFTER_SEC").?);
     try testing.expectEqual(@as(usize, 1), debug.debuggable_calls);
+}
+
+test "the renderer override needs a debuggable apk and is reverted on a plain relaunch" {
+    const extras = extrasWith(&.{.{ "LABELLE_BGFX_RENDERER", "vulkan" }});
+
+    var state: State = .{};
+    var release: FakeEnv = .{ .is_debuggable = false };
+    apply(&state, extras, &release);
+    try testing.expect(release.get("LABELLE_BGFX_RENDERER") == null);
+    try testing.expectEqual(@as(usize, 1), release.debuggable_calls);
+
+    var state2: State = .{};
+    var debug: FakeEnv = .{ .is_debuggable = true };
+    apply(&state2, extras, &debug);
+    try testing.expectEqualStrings("vulkan", debug.get("LABELLE_BGFX_RENDERER").?);
+    try testing.expect(state2.set_by_intent[indexOf("LABELLE_BGFX_RENDERER")]);
+    apply(&state2, @splat(null), &debug);
+    try testing.expect(debug.get("LABELLE_BGFX_RENDERER") == null);
+    try testing.expect(!state2.set_by_intent[indexOf("LABELLE_BGFX_RENDERER")]);
 }
 
 test "an empty extra is treated as absent" {
