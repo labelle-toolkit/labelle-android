@@ -12,7 +12,8 @@
 //       getPackageManager().hasSystemFeature("android.hardware.vulkan.version",
 //                                            0x401000)   // Vulkan 1.1
 //   * for the crash guard (labelle-android#28): the package's version code
-//     and `ANativeActivity.internalDataPath`
+//     and `ANativeActivity.internalDataPath`, plus (not JNI) the runtime
+//     `dlsym` of labelle-bgfx's frame counter and a monotonic clock
 //
 // In C for the same reason as intent_extras.c: <jni.h> already declares the
 // JNI vtables. Off Android this is an empty TU.
@@ -20,8 +21,11 @@
 
 #include <android/log.h>
 #include <android/native_activity.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <time.h>
 
 // android.content.pm.PackageManager.GET_META_DATA (API 1).
 #define LABELLE_GET_META_DATA 0x00000080
@@ -233,6 +237,27 @@ int labelle_android_version_code(const void *activity_ptr, long long *out) {
 
     if (we_attached) (*vm)->DetachCurrentThread(vm);
     return result;
+}
+
+// The crash guard's stable rule (labelle-android#28) counts presented frames
+// through labelle-bgfx's generic export (labelle-toolkit/labelle-bgfx#182):
+//   uint64_t labelle_bgfx_frames_presented(void);
+// looked up at RUNTIME, so labelle-android has no build dependency on
+// labelle-bgfx and still links for other backends. Writes the count to
+// `*out` and returns 1, or returns 0 when the symbol is not exported.
+int labelle_android_frames_presented(uint64_t *out) {
+    typedef uint64_t (*frames_fn)(void);
+    frames_fn fn = (frames_fn)dlsym(RTLD_DEFAULT, "labelle_bgfx_frames_presented");
+    if (fn == NULL || out == NULL) return 0;
+    *out = fn();
+    return 1;
+}
+
+// CLOCK_MONOTONIC in nanoseconds (0 if the clock is unavailable).
+uint64_t labelle_android_monotonic_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 #endif /* __ANDROID__ */

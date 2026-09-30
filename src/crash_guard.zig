@@ -14,14 +14,18 @@
 //!     never reached "stable".
 //!
 //! Rules:
-//!   * Stable: a detached thread deletes `.labelle_vulkan_start` once the
-//!     process has lived `stable_after_ns` (10 s) after `beginVulkanStart`.
-//!     No labelle-bgfx signal (the generic-only rule).
-//!     TODO(#172 D11): the timer starts at `renderer.resolve`, BEFORE
-//!     `bgfx.init`, so a Vulkan init that hangs for more than 10 s clears the
-//!     mark and is not caught (Codex review of labelle-android#33,
-//!     labelle-bgfx#172 comment 5904099277). The fix needs a lifecycle
-//!     signal; waiting on an owner decision.
+//!   * Stable: a detached thread polls (every `poll_interval_ns`, 500 ms)
+//!     and deletes `.labelle_vulkan_start` once BOTH hold: at least
+//!     `stable_min_frames` (120) frames presented, and at least
+//!     `stable_after_ns` (10 s) since `beginVulkanStart`. The frame count is
+//!     labelle-bgfx's generic `labelle_bgfx_frames_presented()` export
+//!     (labelle-toolkit/labelle-bgfx#182; reset to 0 on every successful
+//!     `bgfx.init`, +1 per `bgfx.frame()`), looked up at RUNTIME with
+//!     `dlsym(RTLD_DEFAULT, ...)`: no build dependency on labelle-bgfx. A
+//!     Vulkan init that hangs never presents a frame, so the mark is never
+//!     cleared and the next launch uses GLES.
+//!     If the symbol is missing (another backend, or an older labelle-bgfx)
+//!     the rule falls back to time only (10 s), logged once per process.
 //!   * Disabled: while `.labelle_vulkan_disabled` exists and its stamp
 //!     matches the current `versionCode` and setting, `vulkanDisabled`
 //!     returns true and `renderer.decide` picks `gles` (source
@@ -37,9 +41,9 @@
 //!     timer cannot be started, the start mark is KEPT, so the next launch
 //!     is still guarded (it finds the mark again and goes to GLES).
 //!
-//! By design, anything that ends the process inside the stable window counts
-//! as an incomplete start, including a developer's early force-stop (e.g.
-//! `am start -S` within 10 s of the previous launch): the next launch runs
+//! By design, anything that ends the process before the start is stable
+//! counts as an incomplete start, including a developer's early force-stop
+//! (e.g. `am start -S` within 10 s of the previous launch): the next launch runs
 //! on GLES. To bypass the guard while iterating, launch a debuggable build
 //! with `--es LABELLE_BGFX_RENDERER vulkan` (the intent override).
 //!
@@ -54,6 +58,11 @@ pub const disabled_file = ".labelle_vulkan_disabled";
 /// How long the process must live after `beginVulkanStart` before the start
 /// counts as stable.
 pub const stable_after_ns: u64 = 10 * std.time.ns_per_s;
+/// How many frames must have been presented (labelle-bgfx#182's counter)
+/// before the start counts as stable.
+pub const stable_min_frames: u64 = 120;
+/// How often the stable thread re-checks.
+pub const poll_interval_ns: u64 = 500 * std.time.ns_per_ms;
 
 /// What both marker files contain: `<versionCode> <setting>`.
 pub const Stamp = struct {
@@ -156,19 +165,36 @@ pub fn beginStart(fs: anytype, current: Stamp, generation: *std.atomic.Value(u32
     };
 }
 
-/// The stable timer: sleep `stable_after_ns`, then delete the start mark,
-/// unless a newer `beginVulkanStart` (another activity launch in the same
-/// process) has taken over (`generation` moved past `mine`); its own timer
-/// will clear the mark.
-/// TODO(#172 D11): this runs from `renderer.resolve`, before `bgfx.init`, so
-/// a Vulkan init hanging past 10 s clears the mark (Codex review of
-/// labelle-android#33, labelle-bgfx#172 comment 5904099277). Needs a
-/// lifecycle signal; waiting on an owner decision. `clock.sleep(ns) !void` — a fake returns an error to
-/// model the process dying mid-sleep.
-pub fn settle(fs: anytype, clock: anytype, generation: *const std.atomic.Value(u32), mine: u32) void {
-    clock.sleep(stable_after_ns) catch return;
-    if (generation.load(.acquire) != mine) return;
-    fs.delete(start_file);
+/// The stable timer. Polls every `poll_interval_ns` and deletes the start
+/// mark once `stable_after_ns` has passed since it started AND
+/// `src.framesPresented()` is at least `stable_min_frames`. Stops without
+/// deleting when a newer `beginVulkanStart` (another activity launch in the
+/// same process) has taken over (`generation` moved past `mine`): its own
+/// timer owns the mark now.
+///
+/// Injected:
+///   * `clock.now() u64` (monotonic ns) and `clock.sleep(ns) !void`; a fake
+///     returns an error to model the process dying mid-sleep.
+///   * `src.framesPresented() ?u64`: null = the labelle-bgfx symbol is
+///     missing → time-only rule; then `src.noteTimeOnly()` is called once
+///     (the glue logs once per process).
+pub fn settle(fs: anytype, clock: anytype, src: anytype, generation: *const std.atomic.Value(u32), mine: u32) void {
+    const t0 = clock.now();
+    var noted = false;
+    while (generation.load(.acquire) == mine) {
+        const frames = src.framesPresented();
+        if (frames == null and !noted) {
+            noted = true;
+            src.noteTimeOnly();
+        }
+        const elapsed = clock.now() -% t0;
+        const enough_frames = if (frames) |f| f >= stable_min_frames else true;
+        if (elapsed >= stable_after_ns and enough_frames) {
+            fs.delete(start_file);
+            return;
+        }
+        clock.sleep(poll_interval_ns) catch return;
+    }
 }
 
 // ── Android glue ────────────────────────────────────────────────────────
@@ -176,6 +202,8 @@ pub fn settle(fs: anytype, clock: anytype, generation: *const std.atomic.Value(u
 // `jni/renderer_query.c`.
 extern "c" fn labelle_android_internal_data_path(activity: ?*const anyopaque) ?[*:0]const u8;
 extern "c" fn labelle_android_version_code(activity: ?*const anyopaque, out: *c_longlong) c_int;
+extern "c" fn labelle_android_frames_presented(out: *u64) c_int;
+extern "c" fn labelle_android_monotonic_ns() u64;
 // libc.
 const FILE = opaque {};
 extern "c" fn fopen(name: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
@@ -183,7 +211,7 @@ extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, f: *FILE) usize;
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *FILE) usize;
 extern "c" fn fclose(f: *FILE) c_int;
 extern "c" fn unlink(name: [*:0]const u8) c_int;
-extern "c" fn sleep(seconds: c_uint) c_uint;
+extern "c" fn usleep(usec: c_uint) c_int;
 
 /// Marker files under a copied `internalDataPath` (a value type, so the
 /// detached stable thread owns its own copy).
@@ -223,13 +251,35 @@ const LibcFs = struct {
 };
 
 const LibcClock = struct {
+    pub fn now(_: LibcClock) u64 {
+        return labelle_android_monotonic_ns();
+    }
     pub fn sleep(_: LibcClock, ns: u64) error{}!void {
-        var left: c_uint = @intCast(std.math.divCeil(u64, ns, std.time.ns_per_s) catch unreachable);
-        // `sleep` returns the unslept seconds when a signal interrupts it.
-        while (left > 0) left = sleep_c(left);
+        // A signal may cut it short; the poll loop re-checks either way.
+        _ = usleep(@intCast(@min(ns / std.time.ns_per_us, 1_000_000)));
     }
 };
-const sleep_c = sleep;
+
+/// Set once the time-only fallback has been logged (once per process).
+var time_only_logged: std.atomic.Value(bool) = .init(false);
+
+/// labelle-bgfx#182's frame counter via `dlsym` (`jni/renderer_query.c`).
+const DlsymFrames = struct {
+    pub fn framesPresented(_: DlsymFrames) ?u64 {
+        var n: u64 = 0;
+        return if (labelle_android_frames_presented(&n) != 0) n else null;
+    }
+    pub fn noteTimeOnly(_: DlsymFrames) void {
+        if (logOnce(&time_only_logged)) {
+            std.log.warn("crash guard: labelle_bgfx_frames_presented not found; using the time-only stable rule", .{});
+        }
+    }
+};
+
+/// True for exactly one caller over the flag's lifetime.
+fn logOnce(flag: *std.atomic.Value(bool)) bool {
+    return !flag.swap(true, .acq_rel);
+}
 
 /// Bumped by every `beginVulkanStart`; each stable thread only clears the
 /// mark if it is still the latest.
@@ -274,7 +324,8 @@ pub fn vulkanDisabled(activity: ?*const anyopaque, setting: []const u8) bool {
 }
 
 /// Called by `renderer.resolve` once Vulkan is chosen, before bgfx starts:
-/// write `.labelle_vulkan_start` and start the detached 10 s stable timer.
+/// write `.labelle_vulkan_start` and start the detached stable thread
+/// (120 frames and 10 s, or 10 s alone without labelle-bgfx#182).
 pub fn beginVulkanStart(activity: ?*const anyopaque, setting: []const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
@@ -292,7 +343,7 @@ const ThreadSpawner = struct {
 };
 
 fn stableThread(fs: LibcFs, mine: u32) void {
-    settle(&fs, LibcClock{}, &start_generation, mine);
+    settle(&fs, LibcClock{}, DlsymFrames{}, &start_generation, mine);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -343,6 +394,9 @@ const FakeClock = struct {
     dies_at_ns: ?u64 = null,
     slept_ns: u64 = 0,
 
+    pub fn now(self: *FakeClock) u64 {
+        return self.now_ns;
+    }
     pub fn sleep(self: *FakeClock, ns: u64) error{ProcessDied}!void {
         if (self.dies_at_ns) |d| if (self.now_ns + ns >= d) {
             self.now_ns = d;
@@ -353,16 +407,53 @@ const FakeClock = struct {
     }
 };
 
+/// labelle-bgfx#182's counter as a function of the fake clock: 0 until
+/// `init_done_ns` (null = init never finishes, i.e. hangs), then `fps`
+/// frames per second. `missing` = the symbol is not exported.
+const FakeFrames = struct {
+    clock: *FakeClock,
+    fps: u64 = 60,
+    init_done_ns: ?u64 = 0,
+    missing: bool = false,
+    notes: usize = 0,
+    calls: usize = 0,
+    /// Bump this generation on the Nth `framesPresented` call (a newer
+    /// `beginVulkanStart` landing mid-poll).
+    supersede: ?struct { gen: *std.atomic.Value(u32), at_call: usize } = null,
+
+    pub fn framesPresented(self: *FakeFrames) ?u64 {
+        self.calls += 1;
+        if (self.supersede) |sup| if (self.calls == sup.at_call) {
+            _ = sup.gen.fetchAdd(1, .acq_rel);
+        };
+        if (self.missing) return null;
+        const done = self.init_done_ns orelse return 0;
+        if (self.clock.now_ns < done) return 0;
+        return (self.clock.now_ns - done) * self.fps / std.time.ns_per_s;
+    }
+    pub fn noteTimeOnly(self: *FakeFrames) void {
+        self.notes += 1;
+    }
+};
+
 const v1_vulkan: Stamp = .{ .version_code = 1, .setting = "vulkan" };
 
 /// One Vulkan launch: check the guard; if clear, mark the start and run the
-/// stable timer on `clock`.
+/// stable thread on `clock` with a healthy 60 fps renderer.
 fn launchVulkan(fs: *FakeFs, clock: *FakeClock, gen: *std.atomic.Value(u32), stamp: Stamp) bool {
     if (checkAtLaunch(fs, stamp)) return false;
     const mine = gen.fetchAdd(1, .acq_rel) + 1;
     if (!markStart(fs, stamp)) return true;
-    settle(fs, clock, gen, mine);
+    var frames: FakeFrames = .{ .clock = clock };
+    settle(fs, clock, &frames, gen, mine);
     return true;
+}
+
+/// Mark a start and run only the stable thread; returns the frame fake.
+fn runSettle(fs: *FakeFs, clock: *FakeClock, frames: *FakeFrames) void {
+    var gen: std.atomic.Value(u32) = .init(1);
+    _ = markStart(fs, v1_vulkan);
+    settle(fs, clock, frames, &gen, 1);
 }
 
 test "stamp: format and parse round-trip; junk is rejected" {
@@ -390,8 +481,8 @@ test "a crash inside 10 s disables Vulkan at the next launch" {
     var gen: std.atomic.Value(u32) = .init(0);
     var clock: FakeClock = .{ .dies_at_ns = stable_after_ns - 1 };
     try testing.expect(launchVulkan(&fs, &clock, &gen, v1_vulkan));
-    // The timer never finished, so the mark survived the "crash".
-    try testing.expectEqual(@as(u64, 0), clock.slept_ns);
+    // The thread never saw 10 s, so the mark survived the "crash".
+    try testing.expect(clock.slept_ns < stable_after_ns);
     try testing.expectEqualStrings("1 vulkan", fs.start.?);
 
     // Next launch: the stale start becomes the disabled mark.
@@ -455,12 +546,12 @@ test "beginStart: mark written, timer spawned with the new generation" {
     try testing.expectEqualStrings("1 vulkan", fs.start.?);
 }
 
-test "surviving 10 s clears the mark; the next launch tries Vulkan again" {
+test "surviving 10 s (with frames) clears the mark; the next launch tries Vulkan again" {
     var fs: FakeFs = .{};
     var gen: std.atomic.Value(u32) = .init(0);
     var clock: FakeClock = .{};
     try testing.expect(launchVulkan(&fs, &clock, &gen, v1_vulkan));
-    try testing.expectEqual(stable_after_ns, clock.slept_ns);
+    try testing.expectEqual(stable_after_ns, clock.now_ns);
     try testing.expect(fs.start == null and fs.disabled == null);
     try testing.expect(!checkAtLaunch(&fs, v1_vulkan));
     try testing.expect(fs.disabled == null);
@@ -471,11 +562,84 @@ test "a superseded stable timer leaves the newer start mark alone" {
     var gen: std.atomic.Value(u32) = .init(0);
     const first = gen.fetchAdd(1, .acq_rel) + 1;
     try testing.expect(markStart(&fs, v1_vulkan));
-    _ = gen.fetchAdd(1, .acq_rel); // a second beginVulkanStart in the same process
     var clock: FakeClock = .{};
-    settle(&fs, &clock, &gen, first);
-    try testing.expectEqual(stable_after_ns, clock.slept_ns); // it did sleep...
-    try testing.expect(fs.start != null); // ...but did not delete
+    // A second beginVulkanStart lands on the 3rd poll, before 10 s.
+    var frames: FakeFrames = .{ .clock = &clock, .supersede = .{ .gen = &gen, .at_call = 3 } };
+    settle(&fs, &clock, &frames, &gen, first);
+    try testing.expectEqual(@as(usize, 3), frames.calls); // it polled...
+    try testing.expect(clock.now_ns < stable_after_ns); // ...stopped early...
+    try testing.expect(fs.start != null); // ...and did not delete
+}
+
+test "stable: 120 frames but under 10 s -> not cleared" {
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{ .dies_at_ns = stable_after_ns - 1 };
+    var frames: FakeFrames = .{ .clock = &clock, .fps = 1000 };
+    runSettle(&fs, &clock, &frames);
+    try testing.expect(frames.framesPresented().? >= stable_min_frames); // frames were there
+    try testing.expect(fs.start != null);
+    try testing.expectEqual(@as(usize, 0), frames.notes);
+}
+
+test "stable: 10 s but under 120 frames (a hung init) -> not cleared" {
+    var fs: FakeFs = .{};
+    // Init never finishes; the player kills it after a minute.
+    var clock: FakeClock = .{ .dies_at_ns = 60 * std.time.ns_per_s };
+    var frames: FakeFrames = .{ .clock = &clock, .init_done_ns = null };
+    runSettle(&fs, &clock, &frames);
+    try testing.expect(clock.now_ns >= stable_after_ns);
+    try testing.expect(fs.start != null);
+
+    // Init finished but only a few frames (a stall after the first frames).
+    var fs2: FakeFs = .{};
+    var clock2: FakeClock = .{ .dies_at_ns = 60 * std.time.ns_per_s };
+    var frames2: FakeFrames = .{ .clock = &clock2, .fps = 1, .init_done_ns = 0 };
+    runSettle(&fs2, &clock2, &frames2);
+    try testing.expect(frames2.framesPresented().? < stable_min_frames);
+    try testing.expect(fs2.start != null);
+}
+
+test "stable: both 120 frames and 10 s -> cleared, at whichever comes last" {
+    // Frames first (60 fps: 120 at 2 s), then time: cleared at 10 s.
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock };
+    runSettle(&fs, &clock, &frames);
+    try testing.expect(fs.start == null);
+    try testing.expectEqual(stable_after_ns, clock.now_ns);
+
+    // Time first (slow init: frames start at 9 s, 20 fps → 120 at 15 s).
+    var fs2: FakeFs = .{};
+    var clock2: FakeClock = .{};
+    var frames2: FakeFrames = .{ .clock = &clock2, .fps = 20, .init_done_ns = 9 * std.time.ns_per_s };
+    runSettle(&fs2, &clock2, &frames2);
+    try testing.expect(fs2.start == null);
+    try testing.expectEqual(15 * std.time.ns_per_s, clock2.now_ns);
+}
+
+test "stable: missing symbol -> time-only rule, noted once" {
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock, .missing = true };
+    runSettle(&fs, &clock, &frames);
+    try testing.expect(fs.start == null);
+    try testing.expectEqual(stable_after_ns, clock.now_ns);
+    try testing.expect(frames.calls > 1); // polled many times...
+    try testing.expectEqual(@as(usize, 1), frames.notes); // ...noted once
+
+    // Before 10 s it is still not cleared.
+    var fs2: FakeFs = .{};
+    var clock2: FakeClock = .{ .dies_at_ns = stable_after_ns - 1 };
+    var frames2: FakeFrames = .{ .clock = &clock2, .missing = true };
+    runSettle(&fs2, &clock2, &frames2);
+    try testing.expect(fs2.start != null);
+}
+
+test "logOnce: the time-only log fires for exactly one caller per process" {
+    var flag: std.atomic.Value(bool) = .init(false);
+    try testing.expect(logOnce(&flag));
+    try testing.expect(!logOnce(&flag));
+    try testing.expect(!logOnce(&flag));
 }
 
 test "a version bump resets both files and Vulkan is tried again" {

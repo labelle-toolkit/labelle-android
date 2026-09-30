@@ -142,6 +142,9 @@ pub fn build(b: *std.Build) void {
         });
         mod.linkSystemLibrary("android", .{});
         mod.linkSystemLibrary("log", .{});
+        // `dlsym` (crash_guard's runtime lookup of labelle-bgfx's frame
+        // counter, labelle-android#28).
+        mod.linkSystemLibrary("dl", .{});
         // `aaudio.zig` (the AAudio output device, phase 1c) is pure `extern fn`
         // against libaaudio (API 26+); the link propagates to any consumer
         // module that imports `labelle_android`.

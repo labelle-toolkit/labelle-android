@@ -21,8 +21,8 @@
 //!      `android.hardware.vulkan.version` >= 1.1 (0x401000), else `gles`.
 //!
 //! Then, when the result is `vulkan`, `crash_guard.beginVulkanStart` (the
-//! start mark + the 10 s stable timer); `setenv("LABELLE_BGFX_RENDERER",
-//! "vulkan"|"gles", 1)`; and one log line:
+//! start mark + the stable thread: 120 frames and 10 s);
+//! `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)`; and one log line:
 //! `renderer: <value> (source: intent|crash-guard|setting|auto)`, with
 //! `; previous Vulkan start did not complete` after `crash-guard`.
 //!
@@ -129,7 +129,9 @@ pub fn decide(q: anytype) Decision {
         // An empty extra counts as absent, as it does in `intent_env`.
         if (v.len > 0) {
             if (!q.debuggable()) {
-                std.log.info("android: ignoring intent extra {s}: the apk is not debuggable", .{env_name});
+                // Not logged here: `launch_intent.apply` (intent_env's
+                // debuggable-only gate) already logs "ignoring intent extra
+                // LABELLE_BGFX_RENDERER: the apk is not debuggable" once.
             } else if (parseRenderer(v)) |r| {
                 return .{ .renderer = r, .source = .intent };
             } else {
