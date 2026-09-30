@@ -2,7 +2,7 @@
 
 On Android, labelle-bgfx can render with **GLES** or **Vulkan**. labelle-android decides which one at launch and passes the choice to bgfx through the `LABELLE_BGFX_RENDERER` environment variable ([labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172), D1–D4 and D11).
 
-This page describes labelle-android ≥ the next release after 0.3.1. Earlier releases don't read the setting at launch; at most they stamp it into the manifest.
+This page describes labelle-android ≥ 0.4.0. Earlier releases don't read the setting at launch; at most they stamp it into the manifest.
 
 It also needs a labelle-bgfx that reads `LABELLE_BGFX_RENDERER` on every platform ([labelle-bgfx#176](https://github.com/labelle-toolkit/labelle-bgfx/issues/176)). The crash guard's frame-based stable rule needs `labelle_bgfx_frames_presented` ([labelle-bgfx#182](https://github.com/labelle-toolkit/labelle-bgfx/issues/182)); without it the guard uses a time-only rule.
 
