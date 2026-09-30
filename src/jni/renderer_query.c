@@ -11,6 +11,8 @@
 //   * `auto`'s device check:
 //       getPackageManager().hasSystemFeature("android.hardware.vulkan.version",
 //                                            0x401000)   // Vulkan 1.1
+//   * for the crash guard (labelle-android#28): the package's version code
+//     and `ANativeActivity.internalDataPath`
 //
 // In C for the same reason as intent_extras.c: <jni.h> already declares the
 // JNI vtables. Off Android this is an empty TU.
@@ -153,6 +155,84 @@ int labelle_android_has_system_feature(const void *activity_ptr, const char *nam
 
     if (we_attached) (*vm)->DetachCurrentThread(vm);
     return has;
+}
+
+// `ANativeActivity.internalDataPath` (the app's private files dir), or NULL.
+// The crash guard (labelle-android#28) keeps its two marker files there.
+const char *labelle_android_internal_data_path(const void *activity_ptr) {
+    const ANativeActivity *na = (const ANativeActivity *)activity_ptr;
+    return na != NULL ? na->internalDataPath : NULL;
+}
+
+// The running package's version code (labelle-android#28: a new app version
+// resets the crash guard):
+//   getPackageManager().getPackageInfo(getPackageName(), 0)
+//     .getLongVersionCode()     // API 28+
+//     .versionCode              // older: NoSuchMethodError -> the int field
+// Writes it to `*out` and returns 0, or returns -1 on any JNI failure
+// (`*out` untouched). Never leaves a Java exception pending and never leaks a
+// local ref. Callable from any thread (attached or not).
+int labelle_android_version_code(const void *activity_ptr, long long *out) {
+    const ANativeActivity *na = (const ANativeActivity *)activity_ptr;
+    if (na == NULL || na->vm == NULL || na->clazz == NULL || out == NULL) return -1;
+    JavaVM *vm = na->vm;
+    jobject activity = na->clazz;
+
+    int we_attached = 0;
+    JNIEnv *env = labelle_android_acquire_env(vm, &we_attached);
+    if (env == NULL) return -1;
+
+    int result = -1;
+    if ((*env)->PushLocalFrame(env, 16) == JNI_OK) {
+        jobject pm = package_manager(env, activity);
+        jclass activity_cls = (pm != NULL && !(*env)->ExceptionCheck(env)) ? (*env)->GetObjectClass(env, activity) : NULL;
+        jmethodID get_pkg = activity_cls ? (*env)->GetMethodID(env, activity_cls, "getPackageName", "()Ljava/lang/String;") : NULL;
+        jstring pkg = (get_pkg && !(*env)->ExceptionCheck(env)) ? (jstring)(*env)->CallObjectMethod(env, activity, get_pkg) : NULL;
+        jclass pm_cls = (pkg && !(*env)->ExceptionCheck(env)) ? (*env)->GetObjectClass(env, pm) : NULL;
+        // The (String, int) overload: deprecated from API 33 in favour of
+        // the PackageInfoFlags one, but still present and working.
+        jmethodID get_pkg_info = pm_cls ? (*env)->GetMethodID(env, pm_cls, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;") : NULL;
+        // Throws NameNotFoundException only if our own package vanished.
+        jobject pkg_info = (get_pkg_info && !(*env)->ExceptionCheck(env)) ? (*env)->CallObjectMethod(env, pm, get_pkg_info, pkg, (jint)0) : NULL;
+        if (pkg_info != NULL && !(*env)->ExceptionCheck(env)) {
+            jclass pi_cls = (*env)->GetObjectClass(env, pkg_info);
+            if (pi_cls != NULL && !(*env)->ExceptionCheck(env)) {
+                jmethodID get_long = (*env)->GetMethodID(env, pi_cls, "getLongVersionCode", "()J");
+                if (get_long != NULL && !(*env)->ExceptionCheck(env)) {
+                    jlong v = (*env)->CallLongMethod(env, pkg_info, get_long);
+                    if (!(*env)->ExceptionCheck(env)) {
+                        *out = (long long)v;
+                        result = 0;
+                    }
+                } else {
+                    // Below API 28: NoSuchMethodError. Clear it and read the
+                    // (deprecated) int field instead.
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                    jfieldID vc_fid = (*env)->GetFieldID(env, pi_cls, "versionCode", "I");
+                    if (vc_fid != NULL && !(*env)->ExceptionCheck(env)) {
+                        jint v = (*env)->GetIntField(env, pkg_info, vc_fid);
+                        if (!(*env)->ExceptionCheck(env)) {
+                            *out = (long long)v;
+                            result = 0;
+                        }
+                    }
+                }
+            }
+        }
+        // Any JNI call above may have raised; clear before popping so we
+        // never hand a pending exception back to the caller's thread.
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            result = -1;
+        }
+        (*env)->PopLocalFrame(env, NULL);
+    } else if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_WARN, "labelle-android", "version code: PushLocalFrame failed; exception cleared");
+    }
+
+    if (we_attached) (*vm)->DetachCurrentThread(vm);
+    return result;
 }
 
 #endif /* __ANDROID__ */

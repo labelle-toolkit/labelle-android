@@ -10,7 +10,9 @@
 //!      only in a debuggable apk (the same gate as the other debuggable-only
 //!      keys in `intent_env.zig`). Anything else is warned about and ignored.
 //!   2. `crash-guard`: Vulkan disabled after a crashed Vulkan start (D11,
-//!      `crash_guard.zig`; a stub until labelle-android#28) → `gles`.
+//!      `crash_guard.zig`, labelle-android#28) → `gles`. The guard is keyed
+//!      on the app's versionCode and the effective setting (rule 3), so a
+//!      new version or a changed setting tries Vulkan again.
 //!   3. `setting`: the provider setting, stamped into the manifest as
 //!      `<meta-data android:name="labelle.renderer" android:value="..."/>`
 //!      (labelle-android#26). Missing or unreadable → `gles`; an invalid
@@ -18,8 +20,11 @@
 //!   4. `auto` (the setting's third value): Vulkan when the device reports
 //!      `android.hardware.vulkan.version` >= 1.1 (0x401000), else `gles`.
 //!
-//! Then `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)` and one log
-//! line: `renderer: <value> (source: intent|crash-guard|setting|auto)`.
+//! Then, when the result is `vulkan`, `crash_guard.beginVulkanStart` (the
+//! start mark + the 10 s stable timer); `setenv("LABELLE_BGFX_RENDERER",
+//! "vulkan"|"gles", 1)`; and one log line:
+//! `renderer: <value> (source: intent|crash-guard|setting|auto)`, with
+//! `; previous Vulkan start did not complete` after `crash-guard`.
 //!
 //! ## Where it runs
 //!
@@ -71,12 +76,27 @@ pub const Source = enum {
             .auto => "auto",
         };
     }
+
+    /// Extra context after the label in the log line ("" for none).
+    pub fn detail(self: Source) []const u8 {
+        return switch (self) {
+            .crash_guard => "; previous Vulkan start did not complete",
+            else => "",
+        };
+    }
 };
 
 pub const Decision = struct { renderer: Renderer, source: Source };
 
 /// The provider setting's values.
 pub const Setting = enum { gles, vulkan, auto };
+
+/// The effective setting the crash guard's stamp records: the parsed
+/// meta-data, and `gles` for missing or invalid (which is what they mean).
+pub fn settingLabel(meta: ?[]const u8) []const u8 {
+    const raw = meta orelse return "gles";
+    return @tagName(parseSetting(raw) orelse .gles);
+}
 
 /// An explicit renderer (the intent extra). Exact, lower-case match only.
 pub fn parseRenderer(value: []const u8) ?Renderer {
@@ -144,6 +164,9 @@ const JniQuery = struct {
     activity: *const anyopaque,
     extra: ?[:0]const u8,
     meta_buf: [64]u8 = undefined,
+    /// The meta-data is asked for by the guard (for its stamp) and by the
+    /// setting rule; the JNI walk (and its log line) happens once.
+    meta: ?(?[]const u8) = null,
 
     pub fn intentExtra(self: *JniQuery) ?[]const u8 {
         return self.extra;
@@ -152,9 +175,15 @@ const JniQuery = struct {
         return debuggable_mod.isDebuggable(self.activity);
     }
     pub fn vulkanDisabled(self: *JniQuery) bool {
-        return crash_guard.isVulkanDisabled(self.activity);
+        return crash_guard.vulkanDisabled(self.activity, settingLabel(self.metaData()));
     }
     pub fn metaData(self: *JniQuery) ?[]const u8 {
+        if (self.meta) |m| return m;
+        const m = self.readMeta();
+        self.meta = m;
+        return m;
+    }
+    fn readMeta(self: *JniQuery) ?[]const u8 {
         const n = labelle_android_read_renderer_meta(self.activity, &self.meta_buf, self.meta_buf.len);
         switch (n) {
             -1 => {
@@ -187,10 +216,11 @@ pub fn resolve(activity: ?*const anyopaque, intent_extra: ?[:0]const u8) void {
     const a = activity orelse return;
     var q: JniQuery = .{ .activity = a, .extra = intent_extra };
     const d = decide(&q);
+    if (d.renderer == .vulkan) crash_guard.beginVulkanStart(a, settingLabel(q.metaData()));
     if (setenv(env_name.ptr, d.renderer.envValue().ptr, 1) != 0) {
         std.log.warn("android: could not set {s}={s}", .{ env_name, d.renderer.envValue() });
     }
-    std.log.info("renderer: {s} (source: {s})", .{ d.renderer.envValue(), d.source.label() });
+    std.log.info("renderer: {s} (source: {s}{s})", .{ d.renderer.envValue(), d.source.label(), d.source.detail() });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -324,6 +354,16 @@ test "env values and log labels" {
     try testing.expectEqualStrings("intent", Source.intent.label());
     try testing.expectEqualStrings("setting", Source.setting.label());
     try testing.expectEqualStrings("auto", Source.auto.label());
+    try testing.expectEqualStrings("; previous Vulkan start did not complete", Source.crash_guard.detail());
+    try testing.expectEqualStrings("", Source.setting.detail());
+}
+
+test "settingLabel: the effective setting for the crash guard's stamp" {
+    try testing.expectEqualStrings("vulkan", settingLabel("vulkan"));
+    try testing.expectEqualStrings("auto", settingLabel("auto"));
+    try testing.expectEqualStrings("gles", settingLabel("gles"));
+    try testing.expectEqualStrings("gles", settingLabel(null));
+    try testing.expectEqualStrings("gles", settingLabel("metal"));
 }
 
 test "resolve is a no-op off Android (and never touches the externs)" {
