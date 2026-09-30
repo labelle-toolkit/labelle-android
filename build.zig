@@ -137,6 +137,7 @@ pub fn build(b: *std.Build) void {
                 "src/jni/debuggable.c",
                 "src/jni/window_relayout.c",
                 "src/jni/renderer_query.c",
+                "src/jni/activity_finish.c",
             },
             .flags = &.{ "-std=c11", "-Wall" },
         });

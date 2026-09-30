@@ -19,6 +19,8 @@
 //!   * `renderer` — resolve the renderer at launch and export
 //!     `LABELLE_BGFX_RENDERER` (labelle-android#27, labelle-bgfx#172);
 //!     `crash_guard` is its D11 Vulkan crash guard (labelle-android#28).
+//!   * `activity` — finish the running activity when the game quits, then
+//!     end the process (moca-tecnologia/flying-platform-labelle#979).
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
@@ -52,6 +54,7 @@ pub const video = @import("video.zig");
 pub const immersive = @import("immersive.zig");
 pub const renderer = @import("renderer.zig");
 pub const crash_guard = @import("crash_guard.zig");
+pub const activity = @import("activity.zig");
 
 test {
     // Explicit refs: a lazily-referenced file's tests are otherwise never
@@ -65,4 +68,5 @@ test {
     _ = immersive;
     _ = renderer;
     _ = crash_guard;
+    _ = activity;
 }
