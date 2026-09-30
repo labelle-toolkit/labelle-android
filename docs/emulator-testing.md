@@ -91,7 +91,7 @@ adb shell am start -S -n <pkg>/android.app.NativeActivity --es LABELLE_BGFX_REND
 Use `gles` for GLES. A non-debuggable build ignores the extra. A later launch without the extra goes back to the provider setting. The extra also bypasses the Vulkan crash guard, which otherwise switches the next launch to GLES after an early force-stop (see [Crash guard](renderer.md#crash-guard)). Confirm which renderer started:
 
 ```sh
-adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash guard'
+adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash guard|LABELLE_BGFX_RENDERER|labelle.renderer'
 ```
 
 See [Choosing a renderer](renderer.md#log-lines) for what those lines mean.
