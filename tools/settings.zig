@@ -53,6 +53,31 @@ pub const Deploy = struct {
 
 pub const Channel = enum { stable, staging, preview, internal };
 
+/// The renderer the APK asks the runtime for (labelle-bgfx#172 D2). The
+/// packager stamps it into the manifest as `labelle.renderer` meta-data.
+pub const Renderer = enum {
+    /// OpenGL ES 3.0.
+    gles,
+    /// Vulkan; the runtime falls back to GLES when init fails (D4).
+    vulkan,
+    /// Vulkan when the device reports Vulkan >= 1.1, else GLES.
+    auto,
+
+    /// The manifest `android:value`: the tag name.
+    pub fn value(r: Renderer) []const u8 {
+        return @tagName(r);
+    }
+};
+
+/// `"gles", "vulkan", "auto"`, for the rejection message.
+const renderer_values = blk: {
+    var text: []const u8 = "";
+    for (std.meta.fieldNames(Renderer), 0..) |name, i| {
+        text = text ++ (if (i == 0) "" else ", ") ++ "\"" ++ name ++ "\"";
+    }
+    break :blk text;
+};
+
 pub const Settings = struct {
     schema_version: u32,
     package_name: []const u8,
@@ -66,6 +91,8 @@ pub const Settings = struct {
     abis: []const []const u8 = &.{supported_abi},
     signing: ?Signing = null,
     deploy: ?Deploy = null,
+    /// `gles` until the Vulkan production gate passes (D12 flips it).
+    renderer: Renderer = .gles,
 };
 
 pub const Error = error{
@@ -104,6 +131,11 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, diag: *Diagnostic) Error!S
         if (version != .integer or version.integer != schema_version)
             return fail(a, diag, "schema_version must be {d}", .{schema_version});
     } else return fail(a, diag, "missing required key 'schema_version'", .{});
+    // A typed decode only says `InvalidEnumTag`; name the allowed values.
+    if (object.get("renderer")) |renderer| {
+        const ok = renderer == .string and std.meta.stringToEnum(Renderer, renderer.string) != null;
+        if (!ok) return fail(a, diag, "renderer must be one of {s}", .{renderer_values});
+    }
 
     const settings = std.json.parseFromSliceLeaky(Settings, a, bytes, .{
         .duplicate_field_behavior = .@"error",
@@ -234,7 +266,8 @@ const full =
     \\  "abis": ["arm64-v8a"],
     \\  "signing": { "keystore": "keys/release.jks", "store_password": "env:FP_KS_PASS",
     \\               "key_alias": "labelle-release", "key_password": "file:keys/key.pass" },
-    \\  "deploy": { "repo": "owner/name", "channel": "staging" }
+    \\  "deploy": { "repo": "owner/name", "channel": "staging" },
+    \\  "renderer": "vulkan"
     \\}
 ;
 
@@ -252,6 +285,7 @@ test "the full schema parses into typed settings" {
     try std.testing.expectEqualStrings("env:FP_KS_PASS", s.signing.?.store_password);
     try std.testing.expectEqualStrings("file:keys/key.pass", s.signing.?.key_password.?);
     try std.testing.expectEqual(Channel.staging, s.deploy.?.channel);
+    try std.testing.expectEqual(Renderer.vulkan, s.renderer);
 }
 
 test "a minimal file gets today's defaults" {
@@ -267,6 +301,7 @@ test "a minimal file gets today's defaults" {
     try std.testing.expectEqual(@as(usize, 1), s.abis.len);
     try std.testing.expectEqualStrings("arm64-v8a", s.abis[0]);
     try std.testing.expect(s.signing == null and s.deploy == null);
+    try std.testing.expectEqual(Renderer.gles, s.renderer);
     // app_name falls back to the project title.
     try std.testing.expectEqualStrings("Project Title", appName(s, "Project Title"));
 }
@@ -285,6 +320,13 @@ test "every rejection names its reason" {
         .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"package_name\": \"com.a.c\"}", .reason = "DuplicateField" },
         .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"debuggable\": \"yes\"}", .reason = "UnexpectedToken" },
         .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"orientation\": \"sideways\"}", .reason = "InvalidEnumTag" },
+        // Renderer: the message lists the allowed values.
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": \"metal\"}", .reason = "renderer must be one of \"gles\", \"vulkan\", \"auto\"" },
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": \"Vulkan\"}", .reason = "renderer must be one of" },
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": \"\"}", .reason = "renderer must be one of" },
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": 1}", .reason = "renderer must be one of" },
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": null}", .reason = "renderer must be one of" },
+        .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": \"gles\", \"renderer\": \"vulkan\"}", .reason = "DuplicateField" },
         // Dropped from v0.2.0: studio returns with its own schema.
         .{ .json = "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"studio\": {\"output_dir\": \"x\"}}", .reason = "unknown key 'studio'" },
         // Nested blocks are strict too.
@@ -340,6 +382,17 @@ test "every rejection names its reason" {
             std.debug.print("case {s}\n  expected reason containing '{s}', got '{s}'\n", .{ case.json, case.reason, diag.message });
             return error.TestUnexpectedResult;
         }
+    }
+}
+
+test "renderer accepts gles, vulkan and auto" {
+    inline for (.{ .{ "gles", Renderer.gles }, .{ "vulkan", Renderer.vulkan }, .{ "auto", Renderer.auto } }) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var diag: Diagnostic = .{};
+        const s = try parse(arena.allocator(), "{\"schema_version\": 1, \"package_name\": \"com.a.b\", \"renderer\": \"" ++ case[0] ++ "\"}", &diag);
+        try std.testing.expectEqual(case[1], s.renderer);
+        try std.testing.expectEqualStrings(case[0], s.renderer.value());
     }
 }
 
