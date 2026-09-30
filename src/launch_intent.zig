@@ -26,10 +26,16 @@
 //!     which only that loop delivers, so the env is complete first.
 //!   * sokol: from the top of the generated `sokol_main()` on the UI thread
 //!     (already attached), before the render thread that runs `init` exists.
+//!
+//! `apply` ends with `renderer.resolve` (labelle-android#27), which decides
+//! and exports `LABELLE_BGFX_RENDERER`; it runs last so its value is final
+//! (it overrides whatever the raw intent extra set) and, like the extras, it
+//! lands before bgfx is initialised on the first INIT_WINDOW.
 
 const std = @import("std");
 const intent_env = @import("intent_env.zig");
 const debuggable_mod = @import("debuggable.zig");
+const renderer = @import("renderer.zig");
 const is_android = @import("root.zig").is_android;
 
 // `jni/intent_extras.c` — only referenced on Android, where build.zig
@@ -90,6 +96,7 @@ pub fn apply(activity: ?*const anyopaque) void {
         // Still revert what an earlier launch's intent set in this process
         // (all-absent extras only ever revert/keep, never set).
         intent_env.apply(&state, @splat(null), LibcEnv{ .activity = a });
+        renderer.resolve(a, null);
         return;
     }
     var extras: [intent_env.keys.len]?[:0]const u8 = @splat(null);
@@ -102,6 +109,9 @@ pub fn apply(activity: ?*const anyopaque) void {
         off += n + 1;
     }
     intent_env.apply(&state, extras, LibcEnv{ .activity = a });
+    // LAST: the renderer decision (intent override → crash guard → provider
+    // setting → auto) overwrites the raw extra with the validated value.
+    renderer.resolve(a, extras[intent_env.indexOf(renderer.env_name)]);
 }
 
 test "apply is a no-op off Android (and never touches the externs)" {
