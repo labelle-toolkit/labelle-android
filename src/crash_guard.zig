@@ -94,6 +94,39 @@ pub const Stamp = struct {
 /// Room for a stamp: a 20-digit i64, a space and the longest setting.
 const stamp_cap = 64;
 
+/// What this launch could OBSERVE of the current stamp. A null field is a
+/// READ FAILURE (JNI error), not a value: it can never count as a change,
+/// so it never resets the guard (Codex review of labelle-android#33,
+/// labelle-bgfx#172 comment 5904915798). An ABSENT `labelle.renderer` key is
+/// a successful read and arrives here as the default `gles`.
+pub const Observed = struct {
+    version_code: ?i64,
+    setting: ?[]const u8,
+
+    pub fn of(stamp: Stamp) Observed {
+        return .{ .version_code = stamp.version_code, .setting = stamp.setting };
+    }
+    /// The full stamp, when both halves were read.
+    pub fn full(self: Observed) ?Stamp {
+        return .{ .version_code = self.version_code orelse return null, .setting = self.setting orelse return null };
+    }
+};
+
+const Match = enum { same, changed, unknown };
+
+/// `changed` only on a SUCCESSFULLY read, different value; a failed read of
+/// either half otherwise gives `unknown`.
+fn compare(recorded: Stamp, now: Observed) Match {
+    if (now.version_code) |v| if (v != recorded.version_code) return .changed;
+    if (now.setting) |x| if (!std.mem.eql(u8, x, recorded.setting)) return .changed;
+    return if (now.full() == null) .unknown else .same;
+}
+
+/// The launch-time check with a fully read stamp (see `checkObserved`).
+pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
+    return checkObserved(fs, Observed.of(current));
+}
+
 /// The launch-time check. `fs` provides:
 ///   * `read(name: []const u8, buf: []u8) ?[]const u8` (null = absent or
 ///     unreadable)
@@ -102,38 +135,60 @@ const stamp_cap = 64;
 ///
 /// Returns true when this launch must not use Vulkan. Side effects, in order:
 ///   1. `.labelle_vulkan_disabled` present: matching stamp → true (and a
-///      leftover start mark is dropped); otherwise reset (both files go).
+///      leftover start mark is dropped); an observed change (or a garbled
+///      stamp) → reset (both files go), false.
 ///   2. `.labelle_vulkan_start` present (the previous Vulkan start did not
 ///      complete): matching stamp → write `.labelle_vulkan_disabled`, drop the
-///      start mark, true; otherwise reset. If the write fails, the start
-///      mark is KEPT (fail closed): the next launch finds it again and is
-///      still guarded.
+///      start mark, true; an observed change (or garbled) → reset, false. If
+///      the write fails, the start mark is KEPT (fail closed): the next
+///      launch finds it again and is still guarded.
 ///   3. Neither → false.
-pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
+/// A mark whose stamp cannot be compared because the version or setting
+/// could not be READ (`unknown`) is PRESERVED untouched and this launch is
+/// treated as guarded (true): the next launch that reads both decides.
+pub fn checkObserved(fs: anytype, current: Observed) bool {
     var buf: [stamp_cap]u8 = undefined;
     if (fs.read(disabled_file, &buf)) |bytes| {
-        if (Stamp.parse(bytes)) |s| if (s.eql(current)) {
-            fs.delete(start_file);
-            return true;
+        const s = Stamp.parse(bytes) orelse {
+            reset(fs);
+            return false;
         };
-        reset(fs);
-        return false;
+        switch (compare(s, current)) {
+            .same => {
+                fs.delete(start_file);
+                return true;
+            },
+            .unknown => return true,
+            .changed => {
+                reset(fs);
+                return false;
+            },
+        }
     }
     if (fs.read(start_file, &buf)) |bytes| {
-        if (Stamp.parse(bytes)) |s| if (s.eql(current)) {
-            var out: [stamp_cap]u8 = undefined;
-            const written = if (current.format(&out)) |text| fs.write(disabled_file, text) else false;
-            if (written) {
-                fs.delete(start_file);
-            } else {
-                // Fail closed: keep the start mark so the NEXT launch is
-                // still guarded. This launch is off Vulkan either way.
-                std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
-            }
-            return true;
+        const s = Stamp.parse(bytes) orelse {
+            reset(fs);
+            return false;
         };
-        reset(fs);
-        return false;
+        switch (compare(s, current)) {
+            .same => {
+                var out: [stamp_cap]u8 = undefined;
+                const written = if (s.format(&out)) |text| fs.write(disabled_file, text) else false;
+                if (written) {
+                    fs.delete(start_file);
+                } else {
+                    // Fail closed: keep the start mark so the NEXT launch is
+                    // still guarded. This launch is off Vulkan either way.
+                    std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
+                }
+                return true;
+            },
+            .unknown => return true,
+            .changed => {
+                reset(fs);
+                return false;
+            },
+        }
     }
     return false;
 }
@@ -324,18 +379,26 @@ fn logOnce(flag: *std.atomic.Value(bool)) bool {
 var start_state: StartState = .{};
 
 /// Process-wide `versionCode` cache: it cannot change for the life of the
-/// process (an update kills it). -1 = not asked yet.
+/// process (an update kills it). -1 = not read yet. Only a SUCCESSFUL read
+/// is cached, so a transient JNI failure is retried on the next call.
 var version_cache: std.atomic.Value(i64) = .init(-1);
+var version_failure_logged: std.atomic.Value(bool) = .init(false);
 
-fn versionCode(activity: *const anyopaque) i64 {
+/// The app's versionCode, or null when the JNI read failed (never a
+/// synthetic value: a fake 0 would look like a version change and reset the
+/// guard).
+fn versionCode(activity: *const anyopaque) ?i64 {
     const cached = version_cache.load(.acquire);
     if (cached >= 0) return cached;
     var v: c_longlong = 0;
-    const got: i64 = if (labelle_android_version_code(activity, &v) == 0 and v >= 0) v else 0;
-    // First store wins; only the winner logs, so the failure is logged once.
-    if (version_cache.cmpxchgStrong(-1, got, .acq_rel, .acquire)) |theirs| return theirs;
-    if (got == 0) std.log.warn("android: crash guard: could not read the app's versionCode; using 0", .{});
-    return got;
+    if (labelle_android_version_code(activity, &v) != 0 or v < 0) {
+        if (logOnce(&version_failure_logged)) {
+            std.log.warn("android: crash guard: could not read the app's versionCode; keeping the guard's marks as they are", .{});
+        }
+        return null;
+    }
+    version_cache.store(v, .release);
+    return v;
 }
 
 fn libcFs(activity: *const anyopaque) ?LibcFs {
@@ -353,22 +416,31 @@ fn libcFs(activity: *const anyopaque) ?LibcFs {
 /// version and `setting` are unchanged since), so this launch must use GLES.
 /// Also applies the reset rule. `activity` is the running `ANativeActivity*`
 /// (opaque); `setting` the effective provider setting (`gles`|`vulkan`|
-/// `auto`). Off Android, or with no activity or data dir: false.
-pub fn vulkanDisabled(activity: ?*const anyopaque, setting: []const u8) bool {
+/// `auto`), or null when the meta-data could not be READ (then, like a
+/// failed versionCode read, the marks are preserved: see `checkObserved`).
+/// Off Android, or with no activity or data dir: false.
+pub fn vulkanDisabled(activity: ?*const anyopaque, setting: ?[]const u8) bool {
     if (comptime !is_android) return false;
     const a = activity orelse return false;
     var fs = libcFs(a) orelse return false;
-    return checkAtLaunch(&fs, .{ .version_code = versionCode(a), .setting = setting });
+    return checkObserved(&fs, .{ .version_code = versionCode(a), .setting = setting });
 }
 
 /// Called by `renderer.resolve` once Vulkan is chosen, before bgfx starts:
 /// write `.labelle_vulkan_start` and start the detached stable thread
 /// (120 frames and 10 s, or 10 s alone without labelle-bgfx#182).
-pub fn beginVulkanStart(activity: ?*const anyopaque, setting: []const u8) void {
+/// `setting` null = the meta-data could not be read. A start mark needs the
+/// full stamp, so with either half unreadable no mark is written (logged).
+pub fn beginVulkanStart(activity: ?*const anyopaque, setting: ?[]const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
     const fs = libcFs(a) orelse return;
-    beginStart(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_state, ThreadSpawner{ .fs = fs });
+    const obs: Observed = .{ .version_code = versionCode(a), .setting = setting };
+    const stamp = obs.full() orelse {
+        std.log.warn("android: crash guard: versionCode or {s} unreadable; no start mark for this Vulkan start", .{"labelle.renderer"});
+        return;
+    };
+    beginStart(&fs, stamp, &start_state, ThreadSpawner{ .fs = fs });
 }
 
 /// Spawns the detached stable-timer thread with its own copy of the fs.
@@ -834,4 +906,115 @@ test "Android: the glue is analysed (compile-check only; nothing runs)" {
     _ = &beginVulkanStart;
     _ = &stableThread;
     _ = &@import("renderer.zig").resolve;
+}
+
+/// One launch through `renderer.decide` with the guard wired as the glue
+/// wires it: the meta-data read's outcome (`renderer.MetaRead`) and a
+/// versionCode read that may fail (null).
+const LaunchQuery = struct {
+    const renderer = @import("renderer.zig");
+    fs: *FakeFs,
+    meta: renderer.MetaRead,
+    version: ?i64,
+
+    pub fn intentExtra(_: *@This()) ?[]const u8 {
+        return null;
+    }
+    pub fn debuggable(_: *@This()) bool {
+        return false;
+    }
+    pub fn vulkanDisabled(self: *@This()) bool {
+        return checkObserved(self.fs, .{ .version_code = self.version, .setting = self.meta.guardSetting() });
+    }
+    pub fn metaData(self: *@This()) ?[]const u8 {
+        return self.meta.metaData();
+    }
+    pub fn hasVulkan(_: *@This()) bool {
+        return true;
+    }
+
+    fn run(fs: *FakeFs, meta: renderer.MetaRead, version: ?i64) renderer.Decision {
+        var q: LaunchQuery = .{ .fs = fs, .meta = meta, .version = version };
+        return renderer.decide(&q);
+    }
+};
+
+test "a failed meta-data read preserves the marks; the next good read is still guarded" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vulkan");
+    fs.set(start_file, "1 vulkan"); // a leftover start mark too
+
+    // Launch with a JNI read error: gles for this launch, marks untouched.
+    const d1 = LaunchQuery.run(&fs, .read_error, 1);
+    try testing.expectEqual(R.Renderer.gles, d1.renderer);
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?);
+
+    // Next launch reads the ORIGINAL setting: still disabled by the guard.
+    const d2 = LaunchQuery.run(&fs, .{ .value = "vulkan" }, 1);
+    try testing.expectEqual(R.Renderer.gles, d2.renderer);
+    try testing.expectEqual(R.Source.crash_guard, d2.source);
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+}
+
+test "a failed meta-data read also keeps a pending start mark for the next good read" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    fs.set(start_file, "1 auto"); // crashed on an auto-chosen Vulkan
+    _ = LaunchQuery.run(&fs, .read_error, 1);
+    try testing.expectEqualStrings("1 auto", fs.start.?);
+    try testing.expect(fs.disabled == null);
+    const d = LaunchQuery.run(&fs, .{ .value = "auto" }, 1);
+    try testing.expectEqual(R.Source.crash_guard, d.source);
+    try testing.expectEqualStrings("1 auto", fs.disabled.?);
+}
+
+test "a failed versionCode read preserves the marks; the next good read is still guarded" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "42 vulkan");
+
+    // versionCode unreadable: guarded this launch, marks untouched.
+    const d1 = LaunchQuery.run(&fs, .{ .value = "vulkan" }, null);
+    try testing.expectEqual(R.Renderer.gles, d1.renderer);
+    try testing.expectEqual(R.Source.crash_guard, d1.source);
+    try testing.expectEqualStrings("42 vulkan", fs.disabled.?);
+
+    const d2 = LaunchQuery.run(&fs, .{ .value = "vulkan" }, 42);
+    try testing.expectEqual(R.Source.crash_guard, d2.source);
+    try testing.expectEqualStrings("42 vulkan", fs.disabled.?);
+
+    // Same for a pending start mark.
+    var fs2: FakeFs = .{};
+    fs2.set(start_file, "42 vulkan");
+    try testing.expect(checkObserved(&fs2, .{ .version_code = null, .setting = "vulkan" }));
+    try testing.expectEqualStrings("42 vulkan", fs2.start.?);
+    try testing.expect(fs2.disabled == null);
+    const d3 = LaunchQuery.run(&fs2, .{ .value = "vulkan" }, 42);
+    try testing.expectEqual(R.Source.crash_guard, d3.source);
+    try testing.expectEqualStrings("42 vulkan", fs2.disabled.?);
+}
+
+test "an observed change still resets even when the OTHER half is unreadable" {
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vulkan");
+    // A successfully read new version, setting unreadable: a real change.
+    try testing.expect(!checkObserved(&fs, .{ .version_code = 2, .setting = null }));
+    try testing.expect(fs.disabled == null);
+    fs.set(disabled_file, "1 vulkan");
+    // A successfully read different setting, version unreadable.
+    try testing.expect(!checkObserved(&fs, .{ .version_code = null, .setting = "gles" }));
+    try testing.expect(fs.disabled == null);
+}
+
+test "an absent key is a successful read of the default gles: a real change vs a vulkan stamp" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vulkan");
+    fs.set(start_file, "1 vulkan");
+    const d = LaunchQuery.run(&fs, .absent, 1);
+    try testing.expectEqual(R.Renderer.gles, d.renderer);
+    try testing.expectEqual(R.Source.setting, d.source); // not the guard
+    try testing.expect(fs.disabled == null and fs.start == null); // reset
 }

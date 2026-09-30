@@ -48,6 +48,10 @@ static jobject package_manager(JNIEnv *env, jobject activity) {
 // Copy the `labelle.renderer` meta-data string into `buf` (NUL-terminated).
 // Returns its length (>= 0), -1 when the key is absent (or not a string),
 // -2 on any JNI failure, -3 when the value does not fit in `buf_cap`.
+// -1 (absent) and -2 (failure) MUST stay distinct: `renderer.MetaRead` maps
+// -1 to the default `gles` but -2 to "unknown", and the crash guard keeps its
+// marks on unknown rather than reading a transient failure as a setting
+// change (labelle-android#33 review).
 // Never leaves a Java exception pending and never leaks a local ref.
 // Callable from any thread (attached or not).
 int labelle_android_read_renderer_meta(const void *activity_ptr, char *buf, size_t buf_cap) {
@@ -174,7 +178,8 @@ const char *labelle_android_internal_data_path(const void *activity_ptr) {
 //     .getLongVersionCode()     // API 28+
 //     .versionCode              // older: NoSuchMethodError -> the int field
 // Writes it to `*out` and returns 0, or returns -1 on any JNI failure
-// (`*out` untouched). Never leaves a Java exception pending and never leaks a
+// (`*out` untouched; the Zig side treats it as "unknown", never as a
+// version, so a failure cannot reset the crash guard). Never leaves a Java exception pending and never leaks a
 // local ref. Callable from any thread (attached or not).
 int labelle_android_version_code(const void *activity_ptr, long long *out) {
     const ANativeActivity *na = (const ANativeActivity *)activity_ptr;
