@@ -18,7 +18,7 @@
 //!     desktop decoders share (FP#549; links `libmediandk`).
 //!   * `renderer` — resolve the renderer at launch and export
 //!     `LABELLE_BGFX_RENDERER` (labelle-android#27, labelle-bgfx#172);
-//!     `crash_guard` is its D11 seam (stub until labelle-android#28).
+//!     `crash_guard` is its D11 Vulkan crash guard (labelle-android#28).
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
