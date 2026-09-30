@@ -10,7 +10,9 @@
 //!      only in a debuggable apk (the same gate as the other debuggable-only
 //!      keys in `intent_env.zig`). Anything else is warned about and ignored.
 //!   2. `crash-guard`: Vulkan disabled after a crashed Vulkan start (D11,
-//!      `crash_guard.zig`; a stub until labelle-android#28) → `gles`.
+//!      `crash_guard.zig`, labelle-android#28) → `gles`. The guard is keyed
+//!      on the app's versionCode and the effective setting (rule 3), so a
+//!      new version or a changed setting tries Vulkan again.
 //!   3. `setting`: the provider setting, stamped into the manifest as
 //!      `<meta-data android:name="labelle.renderer" android:value="..."/>`
 //!      (labelle-android#26). Missing or unreadable → `gles`; an invalid
@@ -18,8 +20,14 @@
 //!   4. `auto` (the setting's third value): Vulkan when the device reports
 //!      `android.hardware.vulkan.version` >= 1.1 (0x401000), else `gles`.
 //!
-//! Then `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)` and one log
-//! line: `renderer: <value> (source: intent|crash-guard|setting|auto)`.
+//! Then, when the result is `vulkan`, `crash_guard.beginVulkanStart` (the
+//! start mark + the stable thread: 120 frames and 10 s). If the start mark
+//! cannot be recorded, `afterStart` switches this launch to `gles` (fail
+//! closed; not for an intent override). Then
+//! `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)` and one log line:
+//! `renderer: <value> (source: intent|crash-guard|setting|auto)`, with
+//! `; previous Vulkan start did not complete` (or `; could not record the
+//! Vulkan start`) after `crash-guard`.
 //!
 //! ## Where it runs
 //!
@@ -60,23 +68,100 @@ pub const Renderer = enum {
 pub const Source = enum {
     intent,
     crash_guard,
+    /// The guard could not record the Vulkan start (no start mark), so this
+    /// launch stays off Vulkan (`afterStart`).
+    crash_guard_unrecorded,
     setting,
     auto,
 
     pub fn label(self: Source) []const u8 {
         return switch (self) {
             .intent => "intent",
-            .crash_guard => "crash-guard",
+            .crash_guard, .crash_guard_unrecorded => "crash-guard",
             .setting => "setting",
             .auto => "auto",
+        };
+    }
+
+    /// Extra context after the label in the log line ("" for none).
+    pub fn detail(self: Source) []const u8 {
+        return switch (self) {
+            .crash_guard => "; previous Vulkan start did not complete",
+            .crash_guard_unrecorded => "; could not record the Vulkan start",
+            else => "",
         };
     }
 };
 
 pub const Decision = struct { renderer: Renderer, source: Source };
 
+/// After `crash_guard.beginVulkanStart` for a `vulkan` decision: when the
+/// start mark could NOT be recorded (`recorded` false), a Vulkan crash would
+/// go unnoticed, so the launch falls back to `gles` (fail closed). An intent
+/// override is a developer's explicit request and keeps Vulkan (warned).
+pub fn afterStart(d: Decision, recorded: bool) Decision {
+    if (d.renderer != .vulkan or recorded) return d;
+    if (d.source == .intent) {
+        std.log.warn("android: crash guard: Vulkan start not recorded; keeping vulkan for the intent override", .{});
+        return d;
+    }
+    return .{ .renderer = .gles, .source = .crash_guard_unrecorded };
+}
+
 /// The provider setting's values.
 pub const Setting = enum { gles, vulkan, auto };
+
+/// The three (four) outcomes of the `labelle.renderer` meta-data read. The
+/// JNI helper's return code carries them across the C boundary:
+/// `>= 0` = value length, `-1` = absent, `-3` = too long, `-2` (or any
+/// other negative) = read error.
+pub const MetaRead = union(enum) {
+    /// Read successfully (may still be an invalid value; `decide` warns).
+    value: []const u8,
+    /// Read successfully; the key is not there → the default, `gles`.
+    absent,
+    /// Read successfully; the value does not fit the buffer (so it is not a
+    /// valid setting) → `gles`, like any invalid value.
+    too_long,
+    /// The JNI walk failed: the setting is UNKNOWN.
+    read_error,
+
+    pub fn fromCode(n: c_int, buf: []const u8) MetaRead {
+        if (n >= 0) return .{ .value = buf[0..@intCast(n)] };
+        return switch (n) {
+            -1 => .absent,
+            -3 => .too_long,
+            else => .read_error,
+        };
+    }
+
+    /// What the setting rule sees: the value, or null (→ `gles`) otherwise.
+    /// For the RENDERER, a read error still means gles, as before.
+    pub fn metaData(self: MetaRead) ?[]const u8 {
+        return switch (self) {
+            .value => |v| v,
+            else => null,
+        };
+    }
+
+    /// The setting the crash guard compares/records: the effective setting
+    /// for every SUCCESSFUL read (absent/invalid/too long → `gles`), and null
+    /// for a read error, which the guard treats as unknown (marks kept).
+    pub fn guardSetting(self: MetaRead) ?[]const u8 {
+        return switch (self) {
+            .value => |v| settingLabel(v),
+            .absent, .too_long => "gles",
+            .read_error => null,
+        };
+    }
+};
+
+/// The effective setting the crash guard's stamp records: the parsed
+/// meta-data, and `gles` for missing or invalid (which is what they mean).
+pub fn settingLabel(meta: ?[]const u8) []const u8 {
+    const raw = meta orelse return "gles";
+    return @tagName(parseSetting(raw) orelse .gles);
+}
 
 /// An explicit renderer (the intent extra). Exact, lower-case match only.
 pub fn parseRenderer(value: []const u8) ?Renderer {
@@ -109,7 +194,9 @@ pub fn decide(q: anytype) Decision {
         // An empty extra counts as absent, as it does in `intent_env`.
         if (v.len > 0) {
             if (!q.debuggable()) {
-                std.log.info("android: ignoring intent extra {s}: the apk is not debuggable", .{env_name});
+                // Not logged here: `launch_intent.apply` (intent_env's
+                // debuggable-only gate) already logs "ignoring intent extra
+                // LABELLE_BGFX_RENDERER: the apk is not debuggable" once.
             } else if (parseRenderer(v)) |r| {
                 return .{ .renderer = r, .source = .intent };
             } else {
@@ -144,6 +231,9 @@ const JniQuery = struct {
     activity: *const anyopaque,
     extra: ?[:0]const u8,
     meta_buf: [64]u8 = undefined,
+    /// The meta-data is asked for by the guard (for its stamp) and by the
+    /// setting rule; the JNI walk (and its log line) happens once.
+    meta: ?MetaRead = null,
 
     pub fn intentExtra(self: *JniQuery) ?[]const u8 {
         return self.extra;
@@ -152,25 +242,23 @@ const JniQuery = struct {
         return debuggable_mod.isDebuggable(self.activity);
     }
     pub fn vulkanDisabled(self: *JniQuery) bool {
-        return crash_guard.isVulkanDisabled(self.activity);
+        return crash_guard.vulkanDisabled(self.activity, self.metaRead().guardSetting());
     }
     pub fn metaData(self: *JniQuery) ?[]const u8 {
+        return self.metaRead().metaData();
+    }
+    fn metaRead(self: *JniQuery) MetaRead {
+        if (self.meta) |m| return m;
         const n = labelle_android_read_renderer_meta(self.activity, &self.meta_buf, self.meta_buf.len);
-        switch (n) {
-            -1 => {
-                std.log.info("android: no {s} meta-data; using gles", .{meta_data_name});
-                return null;
-            },
-            -3 => {
-                std.log.warn("android: {s} meta-data too long; using gles", .{meta_data_name});
-                return null;
-            },
-            else => if (n < 0) {
-                std.log.warn("android: could not read the {s} meta-data; using gles", .{meta_data_name});
-                return null;
-            },
+        const m = MetaRead.fromCode(n, &self.meta_buf);
+        switch (m) {
+            .value => {},
+            .absent => std.log.info("android: no {s} meta-data; using gles", .{meta_data_name}),
+            .too_long => std.log.warn("android: {s} meta-data too long; using gles", .{meta_data_name}),
+            .read_error => std.log.warn("android: could not read the {s} meta-data; using gles (crash-guard marks kept)", .{meta_data_name}),
         }
-        return self.meta_buf[0..@intCast(n)];
+        self.meta = m;
+        return m;
     }
     pub fn hasVulkan(self: *JniQuery) bool {
         return labelle_android_has_system_feature(self.activity, "android.hardware.vulkan.version", vulkan_1_1) != 0;
@@ -185,12 +273,16 @@ const JniQuery = struct {
 pub fn resolve(activity: ?*const anyopaque, intent_extra: ?[:0]const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
+    // Every resolution supersedes this process's earlier Vulkan stable
+    // thread (whatever it picks), keeping its start mark "incomplete".
+    crash_guard.beginResolution();
     var q: JniQuery = .{ .activity = a, .extra = intent_extra };
-    const d = decide(&q);
+    var d = decide(&q);
+    if (d.renderer == .vulkan) d = afterStart(d, crash_guard.beginVulkanStart(a, q.metaRead().guardSetting()));
     if (setenv(env_name.ptr, d.renderer.envValue().ptr, 1) != 0) {
         std.log.warn("android: could not set {s}={s}", .{ env_name, d.renderer.envValue() });
     }
-    std.log.info("renderer: {s} (source: {s})", .{ d.renderer.envValue(), d.source.label() });
+    std.log.info("renderer: {s} (source: {s}{s})", .{ d.renderer.envValue(), d.source.label(), d.source.detail() });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -324,6 +416,48 @@ test "env values and log labels" {
     try testing.expectEqualStrings("intent", Source.intent.label());
     try testing.expectEqualStrings("setting", Source.setting.label());
     try testing.expectEqualStrings("auto", Source.auto.label());
+    try testing.expectEqualStrings("; previous Vulkan start did not complete", Source.crash_guard.detail());
+    try testing.expectEqualStrings("crash-guard", Source.crash_guard_unrecorded.label());
+    try testing.expectEqualStrings("; could not record the Vulkan start", Source.crash_guard_unrecorded.detail());
+    try testing.expectEqualStrings("", Source.setting.detail());
+}
+
+test "MetaRead: the JNI return code's outcomes, and what each side sees" {
+    const buf = "vulkanXXXX";
+    const v = MetaRead.fromCode(6, buf);
+    try testing.expectEqualStrings("vulkan", v.value);
+    try testing.expectEqualStrings("vulkan", v.metaData().?);
+    try testing.expectEqualStrings("vulkan", v.guardSetting().?);
+
+    // Absent: a successful read → default gles for both sides.
+    const a = MetaRead.fromCode(-1, buf);
+    try testing.expect(a == .absent);
+    try testing.expect(a.metaData() == null);
+    try testing.expectEqualStrings("gles", a.guardSetting().?);
+
+    // Too long: an (invalid) value → gles.
+    const t = MetaRead.fromCode(-3, buf);
+    try testing.expect(t == .too_long);
+    try testing.expectEqualStrings("gles", t.guardSetting().?);
+
+    // Read error: the renderer still gets gles, the guard gets UNKNOWN.
+    inline for (.{ -2, -7 }) |code| {
+        const e = MetaRead.fromCode(code, buf);
+        try testing.expect(e == .read_error);
+        try testing.expect(e.metaData() == null);
+        try testing.expect(e.guardSetting() == null);
+    }
+
+    // An invalid value is still a successful read: effective gles.
+    try testing.expectEqualStrings("gles", MetaRead.fromCode(5, "metal").guardSetting().?);
+}
+
+test "settingLabel: the effective setting for the crash guard's stamp" {
+    try testing.expectEqualStrings("vulkan", settingLabel("vulkan"));
+    try testing.expectEqualStrings("auto", settingLabel("auto"));
+    try testing.expectEqualStrings("gles", settingLabel("gles"));
+    try testing.expectEqualStrings("gles", settingLabel(null));
+    try testing.expectEqualStrings("gles", settingLabel("metal"));
 }
 
 test "resolve is a no-op off Android (and never touches the externs)" {
