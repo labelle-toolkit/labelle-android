@@ -22,7 +22,7 @@ sdkmanager "system-images;android-36;google_apis;arm64-v8a"
 
 Use the **`arm64-v8a`** image. The APK this provider packages carries only `lib/arm64-v8a` (`abis` accepts only `["arm64-v8a"]` in schema v1), so it can't start on an `x86_64` guest. On an Apple Silicon host the arm64 image runs natively.
 
-On an Intel or AMD host, an arm64 image needs ARM translation, which isn't supported or tested here. The Windows check in labelle-bgfx#172 used an `x86_64` AVD only by moving `libgame.so` into `lib/x86_64` and re-signing the APK by hand. That's a test-only workaround, not a supported path.
+On an Intel or AMD host, an arm64 image needs ARM translation, which isn't supported or tested here. The Windows check in labelle-bgfx#172 used an `x86_64` AVD with a hand-made APK: it **built `libgame.so` for x86_64** (`x86_64-linux-android`), moved that library into `lib/x86_64`, and re-aligned and re-signed the APK by hand. Moving the arm64 `libgame.so` into `lib/x86_64` doesn't work; the library itself has to be built for x86_64. That's a test-only workaround and unsupported.
 
 Create a tablet-sized AVD (1200×2000 at 240 dpi with 4 GB of RAM, which is close to the SM-T505 test tablet):
 
@@ -81,16 +81,17 @@ Under Vulkan, ASTC works natively: bgfx reports every ASTC format as `TEXTURE_2D
 
 ## 5. Launch with a renderer override
 
-In a **debuggable** build (`"debuggable": true` in `providers/android.json`), a launch extra overrides the renderer:
+In a **debuggable** build (`"debuggable": true` in `providers/android.json`), a launch extra overrides the renderer. Clear the log first, so the checks below only see this launch:
 
 ```sh
+adb logcat -c
 adb shell am start -S -n <pkg>/android.app.NativeActivity --es LABELLE_BGFX_RENDERER vulkan
 ```
 
-Use `gles` for GLES. A non-debuggable build ignores the extra. A later launch without the extra goes back to the provider setting. Confirm which renderer started:
+Use `gles` for GLES. A non-debuggable build ignores the extra. A later launch without the extra goes back to the provider setting. The extra also bypasses the Vulkan crash guard, which otherwise switches the next launch to GLES after an early force-stop (see [Crash guard](renderer.md#crash-guard)). Confirm which renderer started:
 
 ```sh
-adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer'
+adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash guard'
 ```
 
 See [Choosing a renderer](renderer.md#log-lines) for what those lines mean.
@@ -123,7 +124,7 @@ This needs a **debuggable** APK.
 
    With handle wrapping on (the default), the emulator's gfxstream driver crashes in `vkUpdateDescriptorSets` during gameplay (`get_host_u64_VkBuffer` ← `reservedmarshal_VkWriteDescriptorSet`). With it off, validation stays active through gameplay. The property resets when the emulator restarts, so set it again after each boot. Real devices don't need it.
 
-5. Launch the app (section 5), then check that the loader picked up the layer:
+5. Launch the app as in section 5 (which clears the log first), then check that the loader picked up the layer:
 
    ```sh
    adb logcat -d -s vulkan | grep 'Loaded layer'

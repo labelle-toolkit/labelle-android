@@ -4,7 +4,7 @@ On Android, labelle-bgfx can render with **GLES** or **Vulkan**. labelle-android
 
 This page describes labelle-android from the release that includes #27 and #28 (PRs [#32](https://github.com/labelle-toolkit/labelle-android/pull/32) and [#33](https://github.com/labelle-toolkit/labelle-android/pull/33)). Earlier releases only stamp the setting into the manifest; they don't read it at launch.
 
-Needs the launch-time resolution ([#27](https://github.com/labelle-toolkit/labelle-android/issues/27)), the crash guard ([#28](https://github.com/labelle-toolkit/labelle-android/issues/28)) and a labelle-bgfx that reads `LABELLE_BGFX_RENDERER` on every platform ([labelle-bgfx#176](https://github.com/labelle-toolkit/labelle-bgfx/issues/176)).
+It also needs a labelle-bgfx that reads `LABELLE_BGFX_RENDERER` on every platform ([labelle-bgfx#176](https://github.com/labelle-toolkit/labelle-bgfx/issues/176)). The crash guard's frame-based stable rule needs `labelle_bgfx_frames_presented` ([labelle-bgfx#182](https://github.com/labelle-toolkit/labelle-bgfx/issues/182)); without it the guard uses a time-only rule.
 
 ## The `renderer` setting
 
@@ -34,12 +34,12 @@ The packager stamps the setting into `AndroidManifest.xml`:
 With `gles`, the manifest is otherwise unchanged. To check a packaged APK (from the generated target directory, e.g. `.labelle/bgfx_android/`):
 
 ```sh
-SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
-AAPT2="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)/aapt2"
+SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+AAPT2="$SDK/build-tools/$(ls "$SDK"/build-tools | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)/aapt2"
 "$AAPT2" dump xmltree --file AndroidManifest.xml zig-out/apk/game.apk | grep -E -A2 'labelle.renderer|vulkan'
 ```
 
-This uses the newest installed build-tools revision. `$HOME/Library/Android/sdk` is the macOS default when `ANDROID_HOME` is unset; set `ANDROID_HOME` on other hosts.
+This uses the newest installed build-tools revision (a numeric sort, so it works with BSD and GNU `sort`). The SDK is `ANDROID_HOME`, else `ANDROID_SDK_ROOT`, else the macOS default `$HOME/Library/Android/sdk`.
 
 ## How the renderer is resolved at launch
 
@@ -76,19 +76,23 @@ A fallback is **not** a Vulkan pass: always check `actual=`, not just `requested
 
 ## Log lines
 
-All of these are logged under the `labelle` logcat tag:
+All of these are logged under the `labelle` logcat tag. Clear the log before the launch you're checking, so lines from an earlier launch can't pass for this one:
 
 ```sh
-adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer'
+adb logcat -c
+adb shell am start -S -n <pkg>/android.app.NativeActivity
+adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash guard'
 ```
 
 | Line | Meaning |
 |---|---|
 | `renderer: vulkan (source: setting)` | labelle-android's choice and the rule that made it: `intent`, `crash-guard`, `setting` or `auto`. Logged once per launch. |
 | `renderer: gles (source: crash-guard; previous Vulkan start did not complete)` | The crash guard switched this launch to GLES. |
+| `renderer: gles (source: crash-guard; could not record the Vulkan start)` | Vulkan was chosen, but the guard couldn't write its start mark, so this launch runs on GLES (fail closed). |
 | `android: ignoring intent extra LABELLE_BGFX_RENDERER: the apk is not debuggable` | The override was sent to a release build. |
 | `android: ignoring intent extra LABELLE_BGFX_RENDERER='<v>' (expected 'vulkan' or 'gles')` | Bad override value. The next rule decides. |
 | `android: invalid labelle.renderer meta-data '<v>' (expected 'gles', 'vulkan' or 'auto'); using gles` | The APK carries a bad setting. The strict setting parser should make this impossible. |
+| `android: could not read the labelle.renderer meta-data; using gles (crash-guard marks kept)` | The setting couldn't be read. The launch uses GLES and the guard's markers are left as they are. |
 | `bgfx: renderer requested=Vulkan actual=Vulkan` | bgfx started what was asked for. Logged on every init and resume. |
 | `bgfx: renderer fallback: requested Vulkan but bgfx started OpenGLES` | Vulkan init failed and bgfx fell back (warning). |
 | `bgfx: renderer requested=<X> came up as Noop (nothing would render); treating as an init failure` | bgfx started with no real renderer. It's shut down and treated as a failed init (error). |
@@ -96,26 +100,54 @@ adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer'
 
 ## Crash guard
 
-If the game crashes, or is killed, while starting on Vulkan, the next launch starts on GLES. That way a bad Vulkan driver can't leave the game unable to start.
+If the game crashes, hangs or is killed while starting on Vulkan, the next launch starts on GLES. That way a bad Vulkan driver can't leave the game unable to start.
 
-The guard keeps two marker files in the app's internal data directory (`ANativeActivity.internalDataPath`, normally `/data/user/0/<pkg>/files`). Each holds `<versionCode> <setting>`, where the setting is the effective `renderer` setting (a missing or invalid one counts as `gles`).
+### Markers
+
+The guard keeps two marker files in the app's no-backup directory (`Context.getNoBackupFilesDir()`, normally `/data/user/0/<pkg>/no_backup`), which Auto Backup and device transfer never copy. If that lookup fails, it falls back to `ANativeActivity.internalDataPath` (normally `/data/user/0/<pkg>/files`) and logs it once. Each marker holds `<versionCode> <setting>`, where the setting is the effective `renderer` setting (an absent or invalid one counts as `gles`). Both are written atomically, to `<name>.tmp` and then renamed.
 
 | File | Written | Removed |
 |---|---|---|
-| `.labelle_vulkan_start` | Whenever the resolved renderer is `vulkan` (intent override included), just before `setenv`. | By a background timer once the process has lived 10 s after that; or at the next launch, which then writes `.labelle_vulkan_disabled`. |
-| `.labelle_vulkan_disabled` | At launch, when `.labelle_vulkan_start` is still there with a matching stamp (the last Vulkan start never reached 10 s). | When the stamp no longer matches (see below). |
+| `.labelle_vulkan_start` | Whenever the resolved renderer is `vulkan` (intent override included), before `setenv`. | When this start becomes **stable** (below); or at the next launch, which then writes `.labelle_vulkan_disabled`. |
+| `.labelle_vulkan_disabled` | At launch, when a `.labelle_vulkan_start` left by a process that's gone has a matching stamp. | When its stamp is proven to have changed (see Reset). |
 
-**Rules:**
+### Rules
 
+- **Stable** means **both** of these, checked every 500 ms by a background thread:
+  - at least **120 frames presented since this start**, counted with labelle-bgfx's `labelle_bgfx_frames_presented` (looked up at runtime with `dlsym`), and
+  - at least **10 s** since the start.
+
+  A Vulkan init that hangs presents no frames, so its mark is never cleared, however long you wait. If the frame counter isn't available (an older labelle-bgfx or another backend), the rule falls back to 10 s alone, with a warning.
 - **Disabled:** while `.labelle_vulkan_disabled` exists with a stamp that matches the current `versionCode` and setting, every launch starts on GLES, with source `crash-guard`.
-- **Reset:** a new `versionCode` or a changed `renderer` setting deletes both files, so Vulkan is tried again. An unreadable stamp resets too.
-- **Override:** the debuggable intent extra (rule 1) is checked before the guard, so `--es LABELLE_BGFX_RENDERER vulkan` still starts on Vulkan.
-- **"Stable" is just time.** The guard doesn't wait for a frame or a bgfx signal. Any process death within 10 s of a Vulkan start counts, including a swipe-away or an `am start -S` relaunch. When testing, wait more than 10 s after a Vulkan launch before relaunching, or use the intent override.
+- **Reset:** each marker is judged on its own stamp. It's deleted only when a value was **read successfully** and differs: a new `versionCode` or a changed `renderer` setting. Vulkan is then tried again.
+- **Fail closed:**
+  - If the `versionCode` or the setting can't be read, no marker is reset and the launch stays guarded.
+  - A malformed marker never resets the guard. It counts as a match, and it's rewritten for the current stamp.
+  - If the disabled mark can't be written or the stable thread can't start, the start mark is kept, so the next launch is still guarded.
+  - If the start mark itself can't be written, this launch runs on GLES (`could not record the Vulkan start`).
+- **Same process:** an Activity relaunched in the same process takes over its own live start mark instead of reading it as a crash. A mark left by a dead process is a crash.
+- **Override:** the debuggable intent extra (rule 1) is checked before the guard, so `--es LABELLE_BGFX_RENDERER vulkan` still starts on Vulkan. Without the extra, debuggable builds are guarded too.
+- **Force-stop counts.** Anything that ends the process before the start is stable counts as a crashed start, including a swipe-away or an `am start -S` relaunch. When iterating on Vulkan, launch with the intent override.
 
-To see the guard's state on a debuggable build:
+The guard's own log lines (tag `labelle`):
+
+| Line | Meaning |
+|---|---|
+| `crash guard: labelle_bgfx_frames_presented not found; using the time-only stable rule` | No frame counter; stable is 10 s alone. |
+| `android: crash guard: could not get noBackupFilesDir; using internalDataPath (Auto Backup may copy the crash-guard markers)` | The markers are in the fallback directory. |
+| `android: crash guard: no internalDataPath; guard off` / `… internalDataPath unusable; guard off` | No usable directory; the guard is off. |
+| `android: crash guard: could not read the app's versionCode; keeping the guard's marks as they are` | Fail closed on an unreadable version. |
+| `android: crash guard: versionCode or labelle.renderer unreadable; cannot record this Vulkan start` | The start couldn't be recorded (see fail closed). |
+| `android: crash guard: could not write .labelle_vulkan_start` | The start mark couldn't be written. |
+| `android: crash guard: Vulkan start not recorded; keeping vulkan for the intent override` | The start wasn't recorded, but the intent override keeps Vulkan. |
+| `android: crash guard: could not write .labelle_vulkan_disabled; keeping .labelle_vulkan_start` | Fail closed on a failed disable. |
+| `android: crash guard: could not start the stable timer (<error>); keeping .labelle_vulkan_start, so the next launch uses gles` | Fail closed on a failed timer. |
+| `android: crash guard: malformed .labelle_vulkan_disabled; keeping the guard` | Fail closed on a malformed marker. |
+
+To see the guard's state on a debuggable build (the second directory is the fallback):
 
 ```sh
-adb shell run-as <pkg> ls -a files
+adb shell run-as <pkg> ls -a no_backup files
 ```
 
 ## Vulkan will become the default
