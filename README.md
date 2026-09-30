@@ -147,9 +147,14 @@ The project's plugin pin therefore decides which labelle-android runs, for bgfx 
 | `abis` | no | `["arm64-v8a"]` | exactly `["arm64-v8a"]` in v1 |
 | `signing` | no | debug keystore | `store_password`/`key_password` must be `env:VAR` or `file:PATH` (apksigner's forms); a `pass:` literal is rejected so no secret is committed |
 | `deploy` | no | | `repo` is `owner/name`; `channel` is `stable`, `staging`, `preview` or `internal` |
-| `renderer` | no | `"gles"` | `gles`, `vulkan` or `auto` (Vulkan when the device reports Vulkan ≥ 1.1, else GLES). Always stamped into the manifest as `<meta-data android:name="labelle.renderer">` on `<application>`; `vulkan` and `auto` also add the optional `android.hardware.vulkan.version` `0x401000` (Vulkan 1.1) feature. GLES 3.0 stays a required feature as the fallback ([labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172) D2/D7) |
+| `renderer` | no | `"gles"` | `gles`, `vulkan` or `auto` (Vulkan when the device reports Vulkan ≥ 1.1, else GLES). Always stamped into the manifest as `<meta-data android:name="labelle.renderer">` on `<application>`; `vulkan` and `auto` also add the optional `android.hardware.vulkan.version` `0x401000` (Vulkan 1.1) feature. GLES 3.0 stays a required feature as the fallback ([labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172) D2/D7). See [Choosing a renderer](docs/renderer.md) |
 
 The parse is strict: unknown keys, duplicate keys and wrong types are errors, and the file is validated before the provider does anything. `immersive_mode` and `load_assets_from_apk` are rejected here: the assembler reads them at generate time, so they stay in `project.labelle .android`. There is no `studio` block: `labelle android studio` is not part of this release. `version_name` names the bundle and stamps `android:versionName`; `versionCode` is `labelle bundle --build-number` (1 for `labelle build`).
+
+## Guides
+
+- [Choosing a renderer](docs/renderer.md): the `renderer` setting, how the renderer is resolved at launch, the GLES fallback, the log lines and the Vulkan crash guard.
+- [Android emulator testing](docs/emulator-testing.md): a rootable `google_apis` AVD, Vulkan and ASTC on the emulator, the validation layer, and a numeric colour check.
 
 ## Planned responsibilities
 
