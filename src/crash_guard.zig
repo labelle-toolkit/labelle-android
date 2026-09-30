@@ -3,43 +3,58 @@
 //! If the game crashes (or is killed) while starting on Vulkan, the next
 //! launch starts on GLES, so a bad Vulkan driver cannot brick the game.
 //!
-//! Two marker files in the app's internal data dir
-//! (`ANativeActivity.internalDataPath`), each containing
-//! `<versionCode> <setting>`:
+//! Two marker files, each containing `<versionCode> <setting>`, in the app's
+//! `Context.getNoBackupFilesDir()` (`<data>/no_backup`), which Android Auto
+//! Backup and device-to-device transfer never copy: a crash on one device's
+//! GPU must not disable Vulkan on another. If that JNI lookup fails, the
+//! glue falls back to `ANativeActivity.internalDataPath` (logged once).
 //!
 //!   * `.labelle_vulkan_start`: written by `beginVulkanStart`, just before a
 //!     Vulkan start (the resolved renderer is `vulkan`).
-//!   * `.labelle_vulkan_disabled`: written when a launch finds
-//!     `.labelle_vulkan_start` still there, i.e. the previous Vulkan start
-//!     never reached "stable".
+//!   * `.labelle_vulkan_disabled`: written when a launch finds a
+//!     `.labelle_vulkan_start` left by a process that is gone, i.e. a Vulkan
+//!     start that never reached "stable".
+//!
+//! Both are written atomically (`<name>.tmp` + `rename`), so a failed or
+//! partial write never leaves a malformed marker behind.
 //!
 //! Rules:
 //!   * Stable: a detached thread polls (every `poll_interval_ns`, 500 ms)
 //!     and deletes `.labelle_vulkan_start` once BOTH hold: at least
-//!     `stable_min_frames` (120) frames presented, and at least
-//!     `stable_after_ns` (10 s) since `beginVulkanStart`. The frame count is
-//!     labelle-bgfx's generic `labelle_bgfx_frames_presented()` export
-//!     (labelle-toolkit/labelle-bgfx#182; reset to 0 on every successful
-//!     `bgfx.init`, +1 per `bgfx.frame()`), looked up at RUNTIME with
-//!     `dlsym(RTLD_DEFAULT, ...)`: no build dependency on labelle-bgfx. A
-//!     Vulkan init that hangs never presents a frame, so the mark is never
-//!     cleared and the next launch uses GLES.
+//!     `stable_min_frames` (120) frames presented SINCE THIS START, and at
+//!     least `stable_after_ns` (10 s) since `beginVulkanStart`. The frame
+//!     count is labelle-bgfx's generic `labelle_bgfx_frames_presented()`
+//!     export (labelle-toolkit/labelle-bgfx#182; reset to 0 on every
+//!     successful `bgfx.init`, +1 per `bgfx.frame()`), looked up at RUNTIME
+//!     with `dlsym(RTLD_DEFAULT, ...)`: no build dependency on labelle-bgfx.
+//!     `beginStart` records the counter as a per-start baseline, so frames a
+//!     previous Activity of the same process presented never count; a value
+//!     below the baseline means bgfx re-initialised, and counting restarts
+//!     from 0. A Vulkan init that hangs never presents a frame, so the mark
+//!     is never cleared and the next launch uses GLES.
 //!     If the symbol is missing (another backend, or an older labelle-bgfx)
 //!     the rule falls back to time only (10 s), logged once per process.
+//!   * Same process: a start mark THIS process wrote and still owns
+//!     (`StartState.owned`) is not a crash: an Activity relaunched in the
+//!     same process supersedes it (new generation, new mark) instead.
 //!   * Disabled: while `.labelle_vulkan_disabled` exists and its stamp
 //!     matches the current `versionCode` and setting, `vulkanDisabled`
 //!     returns true and `renderer.decide` picks `gles` (source
 //!     `crash-guard`).
-//!   * Reset: a stamp that does NOT match (a new app version or a changed
-//!     `renderer` setting) deletes both files, so Vulkan is tried again. An
-//!     unreadable stamp resets too.
+//!   * Reset: each marker whose stamp does NOT match (a successfully read
+//!     new app version or changed `renderer` setting) is deleted on its own,
+//!     so Vulkan is tried again; a marker that still matches is kept and
+//!     applied. A value that could not be READ never counts as a change.
 //!   * Intent override: `renderer.decide` asks the debuggable-only intent
 //!     extra BEFORE the guard, so it wins (see the test at the bottom). The
 //!     guard itself stays ACTIVE in debuggable builds: only an explicit
 //!     extra bypasses it.
 //!   * Fails CLOSED: if the disabled mark cannot be written, or the stable
 //!     timer cannot be started, the start mark is KEPT, so the next launch
-//!     is still guarded (it finds the mark again and goes to GLES).
+//!     is still guarded (it finds the mark again and goes to GLES). A
+//!     malformed marker is treated as a match for the current stamp. If the
+//!     start mark cannot be written at all, `renderer.resolve` runs this
+//!     launch on GLES (unless the intent override asked for Vulkan).
 //!
 //! By design, anything that ends the process before the start is stable
 //! counts as an incomplete start, including a developer's early force-stop
@@ -47,9 +62,9 @@
 //! on GLES. To bypass the guard while iterating, launch a debuggable build
 //! with `--es LABELLE_BGFX_RENDERER vulkan` (the intent override).
 //!
-//! The PURE half (`checkAtLaunch`, `markStart`, `settle`) takes an injected
-//! filesystem and clock and is host-tested; the Android glue below it uses
-//! libc and the JNI helpers in `jni/renderer_query.c`.
+//! The PURE half (`checkObserved`, `beginStart`, `settle`) takes an injected
+//! filesystem, clock and frame source and is host-tested; the Android glue
+//! below it uses libc and the JNI helpers in `jni/renderer_query.c`.
 const std = @import("std");
 const is_android = @import("root.zig").is_android;
 
@@ -122,107 +137,123 @@ fn compare(recorded: Stamp, now: Observed) Match {
     return if (now.full() == null) .unknown else .same;
 }
 
-/// The launch-time check with a fully read stamp (see `checkObserved`).
+/// The launch-time check of a NEW process (fresh `StartState`) with a fully
+/// read stamp (see `checkObserved`).
 pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
-    return checkObserved(fs, Observed.of(current));
+    var fresh: StartState = .{};
+    return checkObserved(fs, Observed.of(current), &fresh);
 }
 
 /// The launch-time check. `fs` provides:
 ///   * `read(name: []const u8, buf: []u8) ?[]const u8` (null = absent or
 ///     unreadable)
 ///   * `write(name: []const u8, bytes: []const u8) bool`
+///   * `rename(from: []const u8, to: []const u8) bool` (replaces `to`)
 ///   * `delete(name: []const u8) void` (absent is fine)
 ///
-/// Returns true when this launch must not use Vulkan. Side effects, in order:
-///   1. `.labelle_vulkan_disabled` present: matching stamp → true (and a
-///      leftover start mark is dropped); an observed change (or a garbled
-///      stamp) → reset (both files go), false.
-///   2. `.labelle_vulkan_start` present (the previous Vulkan start did not
-///      complete): matching stamp → write `.labelle_vulkan_disabled`, drop the
-///      start mark, true; an observed change (or garbled) → reset, false. If
-///      the write fails, the start mark is KEPT (fail closed): the next
-///      launch finds it again and is still guarded.
-///   3. Neither → false.
-/// A mark whose stamp cannot be compared because the version or setting
-/// could not be READ (`unknown`) is PRESERVED untouched and this launch is
-/// treated as guarded (true): the next launch that reads both decides.
-pub fn checkObserved(fs: anytype, current: Observed) bool {
+/// Returns true when this launch must not use Vulkan. Each marker is judged
+/// on its own stamp (`compare`):
+///   * `.labelle_vulkan_disabled`: same → guarded; changed → deleted (only
+///     it); unknown (a value could not be read) → kept, guarded; malformed →
+///     guarded and rewritten with the current stamp (fail closed).
+///   * `.labelle_vulkan_start`, unless this process owns it
+///     (`state.owned`: a same-process relaunch, not a crash): same (or
+///     malformed) → a crashed start: write the disabled mark, then drop the
+///     start mark, guarded; if that write fails the start mark is KEPT, so
+///     the next launch is still guarded; changed → deleted (only it);
+///     unknown → kept, guarded.
+/// Runs under `state.lock`, like `beginStart` and `settle`'s unlink.
+pub fn checkObserved(fs: anytype, current: Observed, state: *StartState) bool {
+    state.acquire();
+    defer state.release();
+    var guarded = false;
     var buf: [stamp_cap]u8 = undefined;
     if (fs.read(disabled_file, &buf)) |bytes| {
-        const s = Stamp.parse(bytes) orelse {
-            reset(fs);
-            return false;
-        };
-        switch (compare(s, current)) {
-            .same => {
-                fs.delete(start_file);
-                return true;
-            },
-            .unknown => return true,
-            .changed => {
-                reset(fs);
-                return false;
-            },
+        if (Stamp.parse(bytes)) |s| switch (compare(s, current)) {
+            .same, .unknown => guarded = true,
+            .changed => fs.delete(disabled_file),
+        } else {
+            // Malformed: never a reset (that could lose a kept start mark).
+            // Fail closed and repair it for the current stamp.
+            std.log.warn("android: crash guard: malformed {s}; keeping the guard", .{disabled_file});
+            guarded = true;
+            if (current.full()) |cur| _ = writeStamp(fs, disabled_file, cur);
         }
     }
-    if (fs.read(start_file, &buf)) |bytes| {
-        const s = Stamp.parse(bytes) orelse {
-            reset(fs);
-            return false;
-        };
-        switch (compare(s, current)) {
+    if (!state.owned) if (fs.read(start_file, &buf)) |bytes| {
+        const parsed = Stamp.parse(bytes);
+        const m: Match = if (parsed) |s| compare(s, current) else .same;
+        switch (m) {
             .same => {
-                var out: [stamp_cap]u8 = undefined;
-                const written = if (s.format(&out)) |text| fs.write(disabled_file, text) else false;
-                if (written) {
-                    fs.delete(start_file);
-                } else {
-                    // Fail closed: keep the start mark so the NEXT launch is
-                    // still guarded. This launch is off Vulkan either way.
-                    std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
+                // A start that never became stable, left by a process that is
+                // gone (not this one: `state.owned` is false).
+                guarded = true;
+                if (current.full()) |cur| {
+                    if (writeStamp(fs, disabled_file, cur)) {
+                        fs.delete(start_file);
+                    } else {
+                        // Fail closed: keep the start mark so the NEXT launch
+                        // is still guarded. This launch is off Vulkan anyway.
+                        std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
+                    }
                 }
-                return true;
             },
-            .unknown => return true,
-            .changed => {
-                reset(fs);
-                return false;
-            },
+            .unknown => guarded = true,
+            .changed => fs.delete(start_file),
         }
+    };
+    return guarded;
+}
+
+/// Write `<name>.tmp`, then rename it over `name`: a failed or partial write
+/// never leaves a malformed `name` (the tmp is removed on failure).
+fn writeAtomic(fs: anytype, name: []const u8, bytes: []const u8) bool {
+    var tmp_buf: [64]u8 = undefined;
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{name}) catch return false;
+    if (!fs.write(tmp, bytes) or !fs.rename(tmp, name)) {
+        fs.delete(tmp);
+        return false;
     }
-    return false;
+    return true;
 }
 
-fn reset(fs: anytype) void {
-    fs.delete(start_file);
-    fs.delete(disabled_file);
-}
-
-/// Write `.labelle_vulkan_start` (called just before a Vulkan start).
-pub fn markStart(fs: anytype, current: Stamp) bool {
+fn writeStamp(fs: anytype, name: []const u8, stamp: Stamp) bool {
     var out: [stamp_cap]u8 = undefined;
-    const text = current.format(&out) orelse return false;
-    return fs.write(start_file, text);
+    const text = stamp.format(&out) orelse return false;
+    return writeAtomic(fs, name, text);
 }
 
-/// The start mark's ownership, shared by `beginStart` and every stable
-/// thread of the process. `lock` serialises the two steps that must not
-/// interleave:
-///   * `beginStart`: { generation += 1; write the start mark }
-///   * `settle`'s final step: { generation still == mine?; unlink the mark }
+/// Write `.labelle_vulkan_start` (atomically; called just before a Vulkan
+/// start).
+pub fn markStart(fs: anytype, current: Stamp) bool {
+    return writeStamp(fs, start_file, current);
+}
+
+/// The start mark's ownership, shared by `checkObserved`, `beginStart` and
+/// every stable thread of the process. `lock` serialises the steps that
+/// must not interleave:
+///   * `beginStart`: { generation += 1; write the start mark; owned = true }
+///   * `settle`'s final step: { generation still == mine?; unlink the mark;
+///     owned = false }
+///   * `checkObserved`: { read `owned`; judge the markers }
 /// so an old stable thread can never unlink a mark a newer launch just
 /// wrote (Codex review of labelle-android#33, labelle-bgfx#172 comment
-/// 5904658178). The frame counter and the clock are read OUTSIDE the lock.
+/// 5904658178), and a same-process relaunch never mistakes this process's
+/// own live mark for a crash. The frame counter and the clock are read
+/// OUTSIDE the lock.
 ///
 /// `std.atomic.Mutex` spun on `tryLock` (Zig 0.16 has no `std.Thread.Mutex`,
-/// and `std.Io.Mutex` needs an `Io`): both critical sections are a few
-/// syscalls on a tiny file and contention needs two activity launches in
+/// and `std.Io.Mutex` needs an `Io`): the critical sections are a few
+/// syscalls on tiny files and contention needs two activity launches in
 /// the same instant, so a spin is fine.
 pub const StartState = struct {
     lock: std.atomic.Mutex = .unlocked,
     /// Written only under `lock`; read without it (atomically) only for the
     /// stable loop's early exit, which is advisory.
     generation: u32 = 0,
+    /// Under `lock`: the start mark on disk was written by THIS process and
+    /// its stable thread has not cleared it yet.
+    owned: bool = false,
 
     fn acquire(self: *StartState) void {
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
@@ -235,33 +266,52 @@ pub const StartState = struct {
     }
 };
 
-/// `beginVulkanStart`'s pure half: under `state.lock`, bump the generation
-/// and write the start mark; then start the stable thread via
-/// `spawner.spawn(mine: u32) !void`. Fails CLOSED: if the thread cannot
-/// start, the mark is KEPT, so the next launch runs on GLES rather than an
-/// unguarded Vulkan start being forgotten.
-pub fn beginStart(fs: anytype, current: Stamp, state: *StartState, spawner: anytype) void {
+/// `beginVulkanStart`'s pure half. Reads the frame counter as this start's
+/// baseline (`src.framesPresented()`, outside the lock); under `state.lock`
+/// bumps the generation and writes the start mark; then starts the stable
+/// thread via `spawner.spawn(mine: u32, baseline: ?u64) !void`.
+///
+/// Returns false when the start mark could NOT be written: the caller then
+/// must not start Vulkan unguarded (`renderer.afterStart` → GLES). If only
+/// the thread cannot start, the mark is KEPT and this returns true: Vulkan
+/// runs, and the next launch is guarded (fail closed).
+pub fn beginStart(fs: anytype, current: Stamp, state: *StartState, src: anytype, spawner: anytype) bool {
+    const baseline = src.framesPresented();
     state.acquire();
     const mine = state.generation +% 1;
     @atomicStore(u32, &state.generation, mine, .release);
     const written = markStart(fs, current);
+    if (written) state.owned = true;
     state.release();
     if (!written) {
         std.log.warn("android: crash guard: could not write {s}", .{start_file});
-        return;
+        return false;
     }
-    spawner.spawn(mine) catch |err| {
+    spawner.spawn(mine, baseline) catch |err| {
         std.log.warn("android: crash guard: could not start the stable timer ({s}); keeping {s}, so the next launch uses gles", .{ @errorName(err), start_file });
     };
+    return true;
+}
+
+/// Frames presented since this start: the counter minus `baseline.*`. A
+/// counter BELOW the baseline means bgfx re-initialised (labelle-bgfx#182
+/// resets it on every successful init): the baseline drops to 0 for good.
+fn framesSince(raw: u64, baseline: *?u64) u64 {
+    const b = baseline.* orelse return raw;
+    if (raw < b) {
+        baseline.* = 0;
+        return raw;
+    }
+    return raw - b;
 }
 
 /// The stable thread. Polls every `poll_interval_ns` and deletes the start
-/// mark once `stable_after_ns` has passed since it started AND
-/// `src.framesPresented()` is at least `stable_min_frames`. A newer
-/// `beginStart` (another activity launch in the same process) takes the mark
-/// over: this thread then stops without deleting. The final check-and-unlink
-/// runs under `state.lock`, so it cannot interleave with a newer
-/// `beginStart`'s bump-and-write.
+/// mark once `stable_after_ns` has passed since it started AND at least
+/// `stable_min_frames` frames were presented since `baseline` (the counter
+/// at `beginStart`; see `framesSince`). A newer `beginStart` (another
+/// activity launch in the same process) takes the mark over: this thread
+/// then stops without deleting. The final check-and-unlink runs under
+/// `state.lock`, so it cannot interleave with a newer `beginStart`.
 ///
 /// Injected:
 ///   * `clock.now() u64` (monotonic ns) and `clock.sleep(ns) !void`; a fake
@@ -269,22 +319,26 @@ pub fn beginStart(fs: anytype, current: Stamp, state: *StartState, spawner: anyt
 ///   * `src.framesPresented() ?u64`: null = the labelle-bgfx symbol is
 ///     missing → time-only rule; then `src.noteTimeOnly()` is called once
 ///     (the glue logs once per process).
-pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, mine: u32) void {
+pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, mine: u32, baseline: ?u64) void {
     const t0 = clock.now();
     var noted = false;
+    var base = baseline;
     // Advisory early exit; the authoritative check is under the lock below.
     while (state.peek() == mine) {
-        const frames = src.framesPresented();
-        if (frames == null and !noted) {
+        const raw = src.framesPresented();
+        if (raw == null and !noted) {
             noted = true;
             src.noteTimeOnly();
         }
         const elapsed = clock.now() -% t0;
-        const enough_frames = if (frames) |f| f >= stable_min_frames else true;
+        const enough_frames = if (raw) |r| framesSince(r, &base) >= stable_min_frames else true;
         if (elapsed >= stable_after_ns and enough_frames) {
             state.acquire();
             defer state.release();
-            if (state.generation == mine) fs.delete(start_file);
+            if (state.generation == mine) {
+                fs.delete(start_file);
+                state.owned = false;
+            }
             return;
         }
         clock.sleep(poll_interval_ns) catch return;
@@ -295,6 +349,7 @@ pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, min
 
 // `jni/renderer_query.c`.
 extern "c" fn labelle_android_internal_data_path(activity: ?*const anyopaque) ?[*:0]const u8;
+extern "c" fn labelle_android_no_backup_dir(activity: ?*const anyopaque, buf: [*]u8, buf_cap: usize) c_int;
 extern "c" fn labelle_android_version_code(activity: ?*const anyopaque, out: *c_longlong) c_int;
 extern "c" fn labelle_android_frames_presented(out: *u64) c_int;
 extern "c" fn labelle_android_monotonic_ns() u64;
@@ -305,9 +360,10 @@ extern "c" fn fread(ptr: [*]u8, size: usize, n: usize, f: *FILE) usize;
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *FILE) usize;
 extern "c" fn fclose(f: *FILE) c_int;
 extern "c" fn unlink(name: [*:0]const u8) c_int;
+extern "c" fn rename(from: [*:0]const u8, to: [*:0]const u8) c_int;
 extern "c" fn usleep(usec: c_uint) c_int;
 
-/// Marker files under a copied `internalDataPath` (a value type, so the
+/// Marker files under a copied directory path (a value type, so the
 /// detached stable thread owns its own copy).
 const LibcFs = struct {
     dir_buf: [512]u8 = undefined,
@@ -338,11 +394,19 @@ const LibcFs = struct {
         const ok = fwrite(bytes.ptr, 1, bytes.len, f) == bytes.len;
         return fclose(f) == 0 and ok;
     }
+    pub fn rename(self: *const LibcFs, from: []const u8, to: []const u8) bool {
+        var pf: [600]u8 = undefined;
+        var pt: [600]u8 = undefined;
+        const f = self.full(from, &pf) orelse return false;
+        const t = self.full(to, &pt) orelse return false;
+        return rename_c(f.ptr, t.ptr) == 0;
+    }
     pub fn delete(self: *const LibcFs, name: []const u8) void {
         var p: [600]u8 = undefined;
         _ = unlink((self.full(name, &p) orelse return).ptr);
     }
 };
+const rename_c = rename;
 
 const LibcClock = struct {
     pub fn now(_: LibcClock) u64 {
@@ -401,7 +465,19 @@ fn versionCode(activity: *const anyopaque) ?i64 {
     return v;
 }
 
+var no_backup_failure_logged: std.atomic.Value(bool) = .init(false);
+
+/// The markers' directory: `getNoBackupFilesDir()` (never backed up or
+/// transferred), else `internalDataPath` with a one-time warning.
 fn libcFs(activity: *const anyopaque) ?LibcFs {
+    var nb: [512]u8 = undefined;
+    const n = labelle_android_no_backup_dir(activity, &nb, nb.len);
+    if (n > 0) {
+        if (LibcFs.init(nb[0..@intCast(n)])) |fs| return fs;
+    }
+    if (logOnce(&no_backup_failure_logged)) {
+        std.log.warn("android: crash guard: could not get noBackupFilesDir; using internalDataPath (Auto Backup may copy the crash-guard markers)", .{});
+    }
     const dir = labelle_android_internal_data_path(activity) orelse {
         std.log.warn("android: crash guard: no internalDataPath; guard off", .{});
         return null;
@@ -423,7 +499,7 @@ pub fn vulkanDisabled(activity: ?*const anyopaque, setting: ?[]const u8) bool {
     if (comptime !is_android) return false;
     const a = activity orelse return false;
     var fs = libcFs(a) orelse return false;
-    return checkObserved(&fs, .{ .version_code = versionCode(a), .setting = setting });
+    return checkObserved(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_state);
 }
 
 /// Called by `renderer.resolve` once Vulkan is chosen, before bgfx starts:
@@ -431,47 +507,55 @@ pub fn vulkanDisabled(activity: ?*const anyopaque, setting: ?[]const u8) bool {
 /// (120 frames and 10 s, or 10 s alone without labelle-bgfx#182).
 /// `setting` null = the meta-data could not be read. A start mark needs the
 /// full stamp, so with either half unreadable no mark is written (logged).
-pub fn beginVulkanStart(activity: ?*const anyopaque, setting: ?[]const u8) void {
-    if (comptime !is_android) return;
-    const a = activity orelse return;
-    const fs = libcFs(a) orelse return;
+/// Returns whether the start mark was recorded; when it was not,
+/// `renderer.afterStart` keeps this launch off Vulkan (fail closed).
+pub fn beginVulkanStart(activity: ?*const anyopaque, setting: ?[]const u8) bool {
+    if (comptime !is_android) return true;
+    const a = activity orelse return false;
+    const fs = libcFs(a) orelse return false;
     const obs: Observed = .{ .version_code = versionCode(a), .setting = setting };
     const stamp = obs.full() orelse {
-        std.log.warn("android: crash guard: versionCode or {s} unreadable; no start mark for this Vulkan start", .{"labelle.renderer"});
-        return;
+        std.log.warn("android: crash guard: versionCode or {s} unreadable; cannot record this Vulkan start", .{"labelle.renderer"});
+        return false;
     };
-    beginStart(&fs, stamp, &start_state, ThreadSpawner{ .fs = fs });
+    return beginStart(&fs, stamp, &start_state, DlsymFrames{}, ThreadSpawner{ .fs = fs });
 }
 
 /// Spawns the detached stable-timer thread with its own copy of the fs.
 const ThreadSpawner = struct {
     fs: LibcFs,
-    pub fn spawn(self: ThreadSpawner, mine: u32) std.Thread.SpawnError!void {
-        const t = try std.Thread.spawn(.{}, stableThread, .{ self.fs, mine });
+    pub fn spawn(self: ThreadSpawner, mine: u32, baseline: ?u64) std.Thread.SpawnError!void {
+        const t = try std.Thread.spawn(.{}, stableThread, .{ self.fs, mine, baseline });
         t.detach();
     }
 };
 
-fn stableThread(fs: LibcFs, mine: u32) void {
-    settle(&fs, LibcClock{}, DlsymFrames{}, &start_state, mine);
+fn stableThread(fs: LibcFs, mine: u32, baseline: ?u64) void {
+    settle(&fs, LibcClock{}, DlsymFrames{}, &start_state, mine, baseline);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-/// In-memory marker files, persisting across "launches" like internal
-/// storage does.
+/// In-memory marker files (and their `.tmp` siblings), persisting across
+/// "launches" like storage does.
 const FakeFs = struct {
     start: ?[]const u8 = null,
     disabled: ?[]const u8 = null,
-    start_buf: [stamp_cap]u8 = undefined,
-    disabled_buf: [stamp_cap]u8 = undefined,
+    start_tmp: ?[]const u8 = null,
+    disabled_tmp: ?[]const u8 = null,
+    bufs: [4][stamp_cap]u8 = undefined,
+    /// Every write fails without touching anything.
     fail_writes: bool = false,
+    /// Every write stores HALF the bytes, then reports failure (ENOSPC).
+    partial_writes: bool = false,
 
     fn slot(self: *FakeFs, name: []const u8) struct { *?[]const u8, []u8 } {
-        if (std.mem.eql(u8, name, start_file)) return .{ &self.start, &self.start_buf };
-        if (std.mem.eql(u8, name, disabled_file)) return .{ &self.disabled, &self.disabled_buf };
+        if (std.mem.eql(u8, name, start_file)) return .{ &self.start, &self.bufs[0] };
+        if (std.mem.eql(u8, name, disabled_file)) return .{ &self.disabled, &self.bufs[1] };
+        if (std.mem.eql(u8, name, start_file ++ ".tmp")) return .{ &self.start_tmp, &self.bufs[2] };
+        if (std.mem.eql(u8, name, disabled_file ++ ".tmp")) return .{ &self.disabled_tmp, &self.bufs[3] };
         @panic("unexpected file name");
     }
     pub fn read(self: *FakeFs, name: []const u8, buf: []u8) ?[]const u8 {
@@ -483,18 +567,27 @@ const FakeFs = struct {
     pub fn write(self: *FakeFs, name: []const u8, bytes: []const u8) bool {
         if (self.fail_writes) return false;
         const s = self.slot(name);
-        @memcpy(s[1][0..bytes.len], bytes);
-        s[0].* = s[1][0..bytes.len];
+        const n = if (self.partial_writes) bytes.len / 2 else bytes.len;
+        @memcpy(s[1][0..n], bytes[0..n]);
+        s[0].* = s[1][0..n];
+        return !self.partial_writes;
+    }
+    pub fn rename(self: *FakeFs, from: []const u8, to: []const u8) bool {
+        const f = self.slot(from);
+        const v = f[0].* orelse return false;
+        const t = self.slot(to);
+        @memcpy(t[1][0..v.len], v);
+        t[0].* = t[1][0..v.len];
+        f[0].* = null;
         return true;
     }
     pub fn delete(self: *FakeFs, name: []const u8) void {
         self.slot(name)[0].* = null;
     }
     fn set(self: *FakeFs, name: []const u8, bytes: []const u8) void {
-        const saved = self.fail_writes;
-        self.fail_writes = false;
-        _ = self.write(name, bytes);
-        self.fail_writes = saved;
+        const s = self.slot(name);
+        @memcpy(s[1][0..bytes.len], bytes);
+        s[0].* = s[1][0..bytes.len];
     }
 };
 
@@ -517,13 +610,16 @@ const FakeClock = struct {
     }
 };
 
-/// labelle-bgfx#182's counter as a function of the fake clock: 0 until
-/// `init_done_ns` (null = init never finishes, i.e. hangs), then `fps`
-/// frames per second. `missing` = the symbol is not exported.
+/// labelle-bgfx#182's counter as a function of the fake clock:
+/// `before_init` until `init_done_ns` (null = init never finishes, i.e.
+/// hangs; `before_init` > 0 = a previous Activity's frames), then from 0 at
+/// `fps` frames per second (the reset on a successful init). `missing` = the
+/// symbol is not exported.
 const FakeFrames = struct {
     clock: *FakeClock,
     fps: u64 = 60,
     init_done_ns: ?u64 = 0,
+    before_init: u64 = 0,
     missing: bool = false,
     notes: usize = 0,
     calls: usize = 0,
@@ -535,11 +631,11 @@ const FakeFrames = struct {
     pub fn framesPresented(self: *FakeFrames) ?u64 {
         self.calls += 1;
         if (self.restart) |r| if (self.calls == r.at_call) {
-            beginStart(r.fs, r.stamp, r.state, NoSpawner{});
+            _ = beginStart(r.fs, r.stamp, r.state, NoFrames{}, NoSpawner{});
         };
         if (self.missing) return null;
-        const done = self.init_done_ns orelse return 0;
-        if (self.clock.now_ns < done) return 0;
+        const done = self.init_done_ns orelse return self.before_init;
+        if (self.clock.now_ns < done) return self.before_init;
         return (self.clock.now_ns - done) * self.fps / std.time.ns_per_s;
     }
     pub fn noteTimeOnly(self: *FakeFrames) void {
@@ -548,8 +644,22 @@ const FakeFrames = struct {
 };
 
 const NoSpawner = struct {
-    pub fn spawn(_: NoSpawner, _: u32) error{}!void {}
+    pub fn spawn(_: NoSpawner, _: u32, _: ?u64) error{}!void {}
 };
+
+/// A frame source with no counter (for `beginStart`'s baseline read).
+const NoFrames = struct {
+    pub fn framesPresented(_: NoFrames) ?u64 {
+        return null;
+    }
+    pub fn noteTimeOnly(_: NoFrames) void {}
+};
+
+/// `checkObserved` as a NEW process (fresh in-process state).
+fn checkNew(fs: anytype, obs: Observed) bool {
+    var fresh: StartState = .{};
+    return checkObserved(fs, obs, &fresh);
+}
 
 const v1_vulkan: Stamp = .{ .version_code = 1, .setting = "vulkan" };
 const v2_vulkan: Stamp = .{ .version_code = 2, .setting = "vulkan" };
@@ -559,24 +669,26 @@ const v2_vulkan: Stamp = .{ .version_code = 2, .setting = "vulkan" };
 fn launchVulkan(fs: *FakeFs, clock: *FakeClock, state: *StartState, stamp: Stamp) bool {
     if (checkAtLaunch(fs, stamp)) return false;
     var got: ?u32 = null;
-    beginStart(fs, stamp, state, RecordingSpawner{ .got = &got });
+    _ = beginStart(fs, stamp, state, NoFrames{}, RecordingSpawner{ .got = &got });
     var frames: FakeFrames = .{ .clock = clock };
-    if (got) |mine| settle(fs, clock, &frames, state, mine);
+    if (got) |mine| settle(fs, clock, &frames, state, mine, null);
     return true;
 }
 
 const RecordingSpawner = struct {
     got: *?u32,
-    pub fn spawn(self: RecordingSpawner, mine: u32) error{}!void {
+    baseline: ?*?u64 = null,
+    pub fn spawn(self: RecordingSpawner, mine: u32, baseline: ?u64) error{}!void {
         self.got.* = mine;
+        if (self.baseline) |b| b.* = baseline;
     }
 };
 
 /// Mark a start and run only the stable thread; returns the frame fake.
 fn runSettle(fs: *FakeFs, clock: *FakeClock, frames: *FakeFrames) void {
     var state: StartState = .{};
-    beginStart(fs, v1_vulkan, &state, NoSpawner{});
-    settle(fs, clock, frames, &state, state.generation);
+    _ = beginStart(fs, v1_vulkan, &state, NoFrames{}, NoSpawner{});
+    settle(fs, clock, frames, &state, state.generation, null);
 }
 
 test "stamp: format and parse round-trip; junk is rejected" {
@@ -638,7 +750,7 @@ test "a failed disabled write keeps the start mark (fail closed): still guarded 
 test "a stable timer that cannot start keeps the start mark (fail closed)" {
     const FailingSpawner = struct {
         calls: *usize,
-        pub fn spawn(self: @This(), _: u32) error{SystemResources}!void {
+        pub fn spawn(self: @This(), _: u32, _: ?u64) error{SystemResources}!void {
             self.calls.* += 1;
             return error.SystemResources;
         }
@@ -646,7 +758,7 @@ test "a stable timer that cannot start keeps the start mark (fail closed)" {
     var fs: FakeFs = .{};
     var state: StartState = .{};
     var calls: usize = 0;
-    beginStart(&fs, v1_vulkan, &state, FailingSpawner{ .calls = &calls });
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, FailingSpawner{ .calls = &calls })); // mark written
     try testing.expectEqual(@as(usize, 1), calls);
     try testing.expectEqualStrings("1 vulkan", fs.start.?); // kept
     // The next launch treats it as an incomplete start: gles.
@@ -658,7 +770,7 @@ test "beginStart: mark written, timer spawned with the new generation" {
     var fs: FakeFs = .{};
     var state: StartState = .{ .generation = 4 };
     var got: ?u32 = null;
-    beginStart(&fs, v1_vulkan, &state, RecordingSpawner{ .got = &got });
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, RecordingSpawner{ .got = &got }));
     try testing.expectEqual(@as(?u32, 5), got);
     try testing.expectEqualStrings("1 vulkan", fs.start.?);
 }
@@ -677,12 +789,12 @@ test "surviving 10 s (with frames) clears the mark; the next launch tries Vulkan
 test "a superseded stable timer leaves the newer start mark alone" {
     var fs: FakeFs = .{};
     var state: StartState = .{};
-    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    _ = beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{});
     const first = state.generation;
     var clock: FakeClock = .{};
     // A second beginStart lands on the 3rd poll, well before 10 s.
     var frames: FakeFrames = .{ .clock = &clock, .restart = .{ .at_call = 3, .fs = &fs, .state = &state, .stamp = v2_vulkan } };
-    settle(&fs, &clock, &frames, &state, first);
+    settle(&fs, &clock, &frames, &state, first, null);
     try testing.expectEqual(@as(usize, 3), frames.calls); // it polled...
     try testing.expect(clock.now_ns < stable_after_ns); // ...stopped early...
     try testing.expectEqualStrings("2 vulkan", fs.start.?); // ...and left the new mark
@@ -697,11 +809,11 @@ test "race: a newer start landing at the very poll that would clear keeps its ma
     // fails: fs.start == null).
     var fs: FakeFs = .{};
     var state: StartState = .{};
-    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    _ = beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{});
     const first = state.generation;
     var clock: FakeClock = .{};
     var frames: FakeFrames = .{ .clock = &clock, .restart = .{ .at_call = 21, .fs = &fs, .state = &state, .stamp = v2_vulkan } };
-    settle(&fs, &clock, &frames, &state, first);
+    settle(&fs, &clock, &frames, &state, first, null);
     try testing.expectEqual(@as(usize, 21), frames.calls);
     try testing.expectEqual(stable_after_ns, clock.now_ns); // it reached the stable branch
     try testing.expectEqual(first + 1, state.generation);
@@ -716,11 +828,11 @@ test "the stable thread's own clear still works under the lock" {
     var clock: FakeClock = .{};
     var frames: FakeFrames = .{ .clock = &clock };
     var state: StartState = .{};
-    beginStart(&fs, v1_vulkan, &state, NoSpawner{});
+    _ = beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{});
     try testing.expect(state.lock.tryLock()); // beginStart released it...
     try testing.expect(!state.lock.tryLock()); // ...and it is exclusive
     state.release();
-    settle(&fs, &clock, &frames, &state, state.generation);
+    settle(&fs, &clock, &frames, &state, state.generation, null);
     try testing.expect(fs.start == null);
     try testing.expect(state.lock.tryLock());
     state.release();
@@ -823,14 +935,17 @@ test "a changed renderer setting resets both files" {
     try testing.expect(fs.start == null and fs.disabled == null);
 }
 
-test "an unreadable stamp resets" {
+test "a malformed marker is never a reset: fail closed, repaired for the current stamp" {
     var fs: FakeFs = .{};
     fs.set(disabled_file, "garbage");
-    try testing.expect(!checkAtLaunch(&fs, v1_vulkan));
-    try testing.expect(fs.disabled == null);
-    fs.set(start_file, "");
-    try testing.expect(!checkAtLaunch(&fs, v1_vulkan));
-    try testing.expect(fs.start == null);
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+
+    var fs2: FakeFs = .{};
+    fs2.set(start_file, "");
+    try testing.expect(checkAtLaunch(&fs2, v1_vulkan)); // an unfinished start
+    try testing.expect(fs2.start == null);
+    try testing.expectEqualStrings("1 vulkan", fs2.disabled.?);
 }
 
 test "a disabled launch drops a leftover start mark" {
@@ -895,7 +1010,7 @@ test "the Android entry points are no-ops off Android" {
     if (comptime is_android) return error.SkipZigTest;
     try testing.expect(!vulkanDisabled(null, "vulkan"));
     try testing.expect(!vulkanDisabled(@ptrFromInt(0x1000), "vulkan"));
-    beginVulkanStart(@ptrFromInt(0x1000), "vulkan");
+    try testing.expect(beginVulkanStart(@ptrFromInt(0x1000), "vulkan"));
 }
 
 test "Android: the glue is analysed (compile-check only; nothing runs)" {
@@ -924,7 +1039,7 @@ const LaunchQuery = struct {
         return false;
     }
     pub fn vulkanDisabled(self: *@This()) bool {
-        return checkObserved(self.fs, .{ .version_code = self.version, .setting = self.meta.guardSetting() });
+        return checkNew(self.fs, .{ .version_code = self.version, .setting = self.meta.guardSetting() });
     }
     pub fn metaData(self: *@This()) ?[]const u8 {
         return self.meta.metaData();
@@ -988,7 +1103,7 @@ test "a failed versionCode read preserves the marks; the next good read is still
     // Same for a pending start mark.
     var fs2: FakeFs = .{};
     fs2.set(start_file, "42 vulkan");
-    try testing.expect(checkObserved(&fs2, .{ .version_code = null, .setting = "vulkan" }));
+    try testing.expect(checkNew(&fs2, .{ .version_code = null, .setting = "vulkan" }));
     try testing.expectEqualStrings("42 vulkan", fs2.start.?);
     try testing.expect(fs2.disabled == null);
     const d3 = LaunchQuery.run(&fs2, .{ .value = "vulkan" }, 42);
@@ -1000,11 +1115,11 @@ test "an observed change still resets even when the OTHER half is unreadable" {
     var fs: FakeFs = .{};
     fs.set(disabled_file, "1 vulkan");
     // A successfully read new version, setting unreadable: a real change.
-    try testing.expect(!checkObserved(&fs, .{ .version_code = 2, .setting = null }));
+    try testing.expect(!checkNew(&fs, .{ .version_code = 2, .setting = null }));
     try testing.expect(fs.disabled == null);
     fs.set(disabled_file, "1 vulkan");
     // A successfully read different setting, version unreadable.
-    try testing.expect(!checkObserved(&fs, .{ .version_code = null, .setting = "gles" }));
+    try testing.expect(!checkNew(&fs, .{ .version_code = null, .setting = "gles" }));
     try testing.expect(fs.disabled == null);
 }
 
@@ -1017,4 +1132,163 @@ test "an absent key is a successful read of the default gles: a real change vs a
     try testing.expectEqual(R.Renderer.gles, d.renderer);
     try testing.expectEqual(R.Source.setting, d.source); // not the guard
     try testing.expect(fs.disabled == null and fs.start == null); // reset
+}
+
+// ── Codex bot findings on labelle-android#33 (final round) ─────────────
+
+test "same-process relaunch before stable supersedes its own mark (no disable)" {
+    var fs: FakeFs = .{};
+    var state: StartState = .{}; // ONE process
+    try testing.expect(!checkObserved(&fs, Observed.of(v1_vulkan), &state));
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{}));
+    const first = state.generation;
+    try testing.expect(state.owned);
+
+    // The Activity is relaunched in the same process 3 s later: its own live
+    // mark is not a crash.
+    try testing.expect(!checkObserved(&fs, Observed.of(v1_vulkan), &state));
+    try testing.expect(fs.disabled == null);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?);
+    // It supersedes: new generation, new mark.
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{}));
+    try testing.expectEqual(first + 1, state.generation);
+
+    // The old timer, even when stable, cannot delete the new mark.
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock };
+    settle(&fs, &clock, &frames, &state, first, null);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?);
+    try testing.expect(state.owned);
+    // The new one can, and gives up ownership.
+    var clock2: FakeClock = .{};
+    var frames2: FakeFrames = .{ .clock = &clock2 };
+    settle(&fs, &clock2, &frames2, &state, first + 1, null);
+    try testing.expect(fs.start == null);
+    try testing.expect(!state.owned);
+}
+
+test "a mark left by a different (dead) process is still a crash" {
+    var fs: FakeFs = .{};
+    var dead: StartState = .{};
+    try testing.expect(beginStart(&fs, v1_vulkan, &dead, NoFrames{}, NoSpawner{}));
+    // The process dies; a NEW process (fresh state) launches.
+    var next: StartState = .{};
+    try testing.expect(checkObserved(&fs, Observed.of(v1_vulkan), &next));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+    try testing.expect(fs.start == null);
+}
+
+test "frame baseline: a hung new start is not cleared by the previous Activity's frames" {
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    var clock: FakeClock = .{ .dies_at_ns = 60 * std.time.ns_per_s };
+    // The previous Activity presented 600 frames; the new init hangs, so the
+    // counter stays at 600 (never reset).
+    var frames: FakeFrames = .{ .clock = &clock, .init_done_ns = null, .before_init = 600 };
+    var got: ?u32 = null;
+    var baseline: ?u64 = null;
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, &frames, RecordingSpawner{ .got = &got, .baseline = &baseline }));
+    try testing.expectEqual(@as(?u64, 600), baseline);
+    settle(&fs, &clock, &frames, &state, got.?, baseline);
+    try testing.expect(clock.now_ns >= stable_after_ns);
+    try testing.expect(fs.start != null); // not cleared: the process is killed with the mark
+}
+
+test "frame baseline: a counter reset by the new init counts from 0" {
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    var clock: FakeClock = .{};
+    // 600 old frames; the new init completes at 1 s (counter → 0), then 60 fps.
+    var frames: FakeFrames = .{ .clock = &clock, .init_done_ns = std.time.ns_per_s, .before_init = 600 };
+    var got: ?u32 = null;
+    var baseline: ?u64 = null;
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, &frames, RecordingSpawner{ .got = &got, .baseline = &baseline }));
+    settle(&fs, &clock, &frames, &state, got.?, baseline);
+    try testing.expect(fs.start == null);
+    try testing.expectEqual(stable_after_ns, clock.now_ns); // 540 new frames by then
+
+    // framesSince itself: under the baseline = reset (sticky), else the delta.
+    var b: ?u64 = 600;
+    try testing.expectEqual(@as(u64, 0), framesSince(600, &b));
+    try testing.expectEqual(@as(u64, 10), framesSince(610, &b));
+    try testing.expectEqual(@as(u64, 5), framesSince(5, &b));
+    try testing.expectEqual(@as(?u64, 0), b);
+    try testing.expectEqual(@as(u64, 700), framesSince(700, &b));
+    var none: ?u64 = null;
+    try testing.expectEqual(@as(u64, 42), framesSince(42, &none));
+}
+
+test "a version change deletes only the mismatching marker; a matching start mark still counts" {
+    // v1 disabled (stale); an intent launch on v2 wrote a v2 start mark and
+    // crashed. The next ordinary v2 launch must still be guarded.
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vulkan");
+    fs.set(start_file, "2 vulkan");
+    try testing.expect(checkAtLaunch(&fs, v2_vulkan));
+    try testing.expectEqualStrings("2 vulkan", fs.disabled.?); // rewritten for v2
+    try testing.expect(fs.start == null);
+
+    // A stale start mark with a still-matching disabled mark: only the start
+    // mark goes.
+    var fs2: FakeFs = .{};
+    fs2.set(disabled_file, "2 vulkan");
+    fs2.set(start_file, "1 vulkan");
+    try testing.expect(checkAtLaunch(&fs2, v2_vulkan));
+    try testing.expectEqualStrings("2 vulkan", fs2.disabled.?);
+    try testing.expect(fs2.start == null);
+}
+
+test "a malformed disabled mark keeps the guard and does not lose a kept start mark" {
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vul"); // a partial write from an older build
+    fs.set(start_file, "1 vulkan");
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?); // rewritten
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan)); // and stays guarded
+}
+
+test "atomic writes: a partial disabled write leaves no malformed marker" {
+    var fs: FakeFs = .{};
+    fs.set(start_file, "1 vulkan");
+    fs.partial_writes = true; // ENOSPC mid-write
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expect(fs.disabled == null); // never a truncated marker
+    try testing.expect(fs.disabled_tmp == null); // the tmp is cleaned up
+    try testing.expectEqualStrings("1 vulkan", fs.start.?); // kept (fail closed)
+    // Space comes back: the next launch converts it.
+    fs.partial_writes = false;
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+    try testing.expect(fs.start == null);
+}
+
+test "a start mark that cannot be written falls back to gles (unless the intent asked)" {
+    const R = @import("renderer.zig");
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    fs.partial_writes = true;
+    var calls: usize = 0;
+    const CountingSpawner = struct {
+        calls: *usize,
+        pub fn spawn(self: @This(), _: u32, _: ?u64) error{}!void {
+            self.calls.* += 1;
+        }
+    };
+    const recorded = beginStart(&fs, v1_vulkan, &state, NoFrames{}, CountingSpawner{ .calls = &calls });
+    try testing.expect(!recorded);
+    try testing.expect(fs.start == null and fs.start_tmp == null);
+    try testing.expectEqual(@as(usize, 0), calls); // no timer for no mark
+    try testing.expect(!state.owned);
+
+    const d = R.afterStart(.{ .renderer = .vulkan, .source = .setting }, recorded);
+    try testing.expectEqual(R.Renderer.gles, d.renderer);
+    try testing.expectEqual(R.Source.crash_guard_unrecorded, d.source);
+    const a = R.afterStart(.{ .renderer = .vulkan, .source = .auto }, recorded);
+    try testing.expectEqual(R.Renderer.gles, a.renderer);
+    // The intent override keeps Vulkan; a recorded start changes nothing.
+    const i = R.afterStart(.{ .renderer = .vulkan, .source = .intent }, recorded);
+    try testing.expectEqual(R.Renderer.vulkan, i.renderer);
+    const ok = R.afterStart(.{ .renderer = .vulkan, .source = .setting }, true);
+    try testing.expectEqual(R.Renderer.vulkan, ok.renderer);
+    try testing.expectEqual(R.Source.setting, ok.source);
 }

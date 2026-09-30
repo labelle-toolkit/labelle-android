@@ -165,8 +165,62 @@ int labelle_android_has_system_feature(const void *activity_ptr, const char *nam
     return has;
 }
 
+// `activity.getNoBackupFilesDir().getAbsolutePath()` (API 21) into `buf`
+// (NUL-terminated): the crash guard's marker directory (labelle-android#28),
+// which Android Auto Backup and device-to-device transfer never copy.
+// Returns its length (> 0), -1 on any JNI failure, -3 when it does not fit
+// `buf_cap`. Never leaves a Java exception pending and never leaks a local
+// ref. Callable from any thread (attached or not).
+int labelle_android_no_backup_dir(const void *activity_ptr, char *buf, size_t buf_cap) {
+    const ANativeActivity *na = (const ANativeActivity *)activity_ptr;
+    if (na == NULL || na->vm == NULL || na->clazz == NULL || buf == NULL || buf_cap == 0) return -1;
+    JavaVM *vm = na->vm;
+    jobject activity = na->clazz;
+
+    int we_attached = 0;
+    JNIEnv *env = labelle_android_acquire_env(vm, &we_attached);
+    if (env == NULL) return -1;
+
+    int result = -1;
+    if ((*env)->PushLocalFrame(env, 8) == JNI_OK) {
+        jclass activity_cls = (*env)->GetObjectClass(env, activity);
+        jmethodID get_dir = (activity_cls && !(*env)->ExceptionCheck(env)) ? (*env)->GetMethodID(env, activity_cls, "getNoBackupFilesDir", "()Ljava/io/File;") : NULL;
+        jobject dir = (get_dir && !(*env)->ExceptionCheck(env)) ? (*env)->CallObjectMethod(env, activity, get_dir) : NULL;
+        jclass file_cls = (dir && !(*env)->ExceptionCheck(env)) ? (*env)->GetObjectClass(env, dir) : NULL;
+        jmethodID get_path = (file_cls && !(*env)->ExceptionCheck(env)) ? (*env)->GetMethodID(env, file_cls, "getAbsolutePath", "()Ljava/lang/String;") : NULL;
+        jstring jpath = (get_path && !(*env)->ExceptionCheck(env)) ? (jstring)(*env)->CallObjectMethod(env, dir, get_path) : NULL;
+        if (jpath != NULL && !(*env)->ExceptionCheck(env)) {
+            jsize chars = (*env)->GetStringLength(env, jpath);
+            jsize bytes = (*env)->GetStringUTFLength(env, jpath);
+            if (bytes <= 0) {
+                result = -1;
+            } else if ((size_t)bytes + 1 > buf_cap) {
+                result = -3;
+            } else {
+                (*env)->GetStringUTFRegion(env, jpath, 0, chars, buf);
+                if (!(*env)->ExceptionCheck(env)) {
+                    buf[bytes] = 0;
+                    result = (int)bytes;
+                }
+            }
+        }
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+            result = -1;
+        }
+        (*env)->PopLocalFrame(env, NULL);
+    } else if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        __android_log_print(ANDROID_LOG_WARN, "labelle-android", "no-backup dir: PushLocalFrame failed; exception cleared");
+    }
+
+    if (we_attached) (*vm)->DetachCurrentThread(vm);
+    return result;
+}
+
 // `ANativeActivity.internalDataPath` (the app's private files dir), or NULL.
-// The crash guard (labelle-android#28) keeps its two marker files there.
+// The crash guard's fallback marker directory (labelle-android#28) when
+// `labelle_android_no_backup_dir` fails.
 const char *labelle_android_internal_data_path(const void *activity_ptr) {
     const ANativeActivity *na = (const ANativeActivity *)activity_ptr;
     return na != NULL ? na->internalDataPath : NULL;

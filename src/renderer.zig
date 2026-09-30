@@ -21,10 +21,13 @@
 //!      `android.hardware.vulkan.version` >= 1.1 (0x401000), else `gles`.
 //!
 //! Then, when the result is `vulkan`, `crash_guard.beginVulkanStart` (the
-//! start mark + the stable thread: 120 frames and 10 s);
-//! `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)`; and one log line:
+//! start mark + the stable thread: 120 frames and 10 s). If the start mark
+//! cannot be recorded, `afterStart` switches this launch to `gles` (fail
+//! closed; not for an intent override). Then
+//! `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)` and one log line:
 //! `renderer: <value> (source: intent|crash-guard|setting|auto)`, with
-//! `; previous Vulkan start did not complete` after `crash-guard`.
+//! `; previous Vulkan start did not complete` (or `; could not record the
+//! Vulkan start`) after `crash-guard`.
 //!
 //! ## Where it runs
 //!
@@ -65,13 +68,16 @@ pub const Renderer = enum {
 pub const Source = enum {
     intent,
     crash_guard,
+    /// The guard could not record the Vulkan start (no start mark), so this
+    /// launch stays off Vulkan (`afterStart`).
+    crash_guard_unrecorded,
     setting,
     auto,
 
     pub fn label(self: Source) []const u8 {
         return switch (self) {
             .intent => "intent",
-            .crash_guard => "crash-guard",
+            .crash_guard, .crash_guard_unrecorded => "crash-guard",
             .setting => "setting",
             .auto => "auto",
         };
@@ -81,12 +87,26 @@ pub const Source = enum {
     pub fn detail(self: Source) []const u8 {
         return switch (self) {
             .crash_guard => "; previous Vulkan start did not complete",
+            .crash_guard_unrecorded => "; could not record the Vulkan start",
             else => "",
         };
     }
 };
 
 pub const Decision = struct { renderer: Renderer, source: Source };
+
+/// After `crash_guard.beginVulkanStart` for a `vulkan` decision: when the
+/// start mark could NOT be recorded (`recorded` false), a Vulkan crash would
+/// go unnoticed, so the launch falls back to `gles` (fail closed). An intent
+/// override is a developer's explicit request and keeps Vulkan (warned).
+pub fn afterStart(d: Decision, recorded: bool) Decision {
+    if (d.renderer != .vulkan or recorded) return d;
+    if (d.source == .intent) {
+        std.log.warn("android: crash guard: Vulkan start not recorded; keeping vulkan for the intent override", .{});
+        return d;
+    }
+    return .{ .renderer = .gles, .source = .crash_guard_unrecorded };
+}
 
 /// The provider setting's values.
 pub const Setting = enum { gles, vulkan, auto };
@@ -254,8 +274,8 @@ pub fn resolve(activity: ?*const anyopaque, intent_extra: ?[:0]const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
     var q: JniQuery = .{ .activity = a, .extra = intent_extra };
-    const d = decide(&q);
-    if (d.renderer == .vulkan) crash_guard.beginVulkanStart(a, q.metaRead().guardSetting());
+    var d = decide(&q);
+    if (d.renderer == .vulkan) d = afterStart(d, crash_guard.beginVulkanStart(a, q.metaRead().guardSetting()));
     if (setenv(env_name.ptr, d.renderer.envValue().ptr, 1) != 0) {
         std.log.warn("android: could not set {s}={s}", .{ env_name, d.renderer.envValue() });
     }
@@ -394,6 +414,8 @@ test "env values and log labels" {
     try testing.expectEqualStrings("setting", Source.setting.label());
     try testing.expectEqualStrings("auto", Source.auto.label());
     try testing.expectEqualStrings("; previous Vulkan start did not complete", Source.crash_guard.detail());
+    try testing.expectEqualStrings("crash-guard", Source.crash_guard_unrecorded.label());
+    try testing.expectEqualStrings("; could not record the Vulkan start", Source.crash_guard_unrecorded.detail());
     try testing.expectEqualStrings("", Source.setting.detail());
 }
 
