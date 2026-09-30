@@ -95,7 +95,7 @@ adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash
 | `android: invalid labelle.renderer meta-data '<v>' (expected 'gles', 'vulkan' or 'auto'); using gles` | The APK carries a bad setting. The strict setting parser should make this impossible. |
 | `android: no labelle.renderer meta-data; using gles` | The APK has no setting (built before the setting existed). |
 | `android: labelle.renderer meta-data too long; using gles` | The value doesn't fit the reader's buffer. |
-| `android: could not read the labelle.renderer meta-data; using gles (crash-guard marks kept)` | The setting couldn't be read. The launch uses GLES and the guard's markers are left as they are. |
+| `android: could not read the labelle.renderer meta-data; using gles (crash-guard marks kept)` | The setting couldn't be read, and the launch uses GLES. The unreadable setting can't itself reset a marker; a marker is still reset if the `versionCode` was read and changed. |
 | `android: could not set LABELLE_BGFX_RENDERER=<v>` | `setenv` failed; bgfx uses its platform default. |
 | `bgfx: renderer requested=Vulkan actual=Vulkan` | bgfx started what was asked for. Logged on every init and resume. |
 | `bgfx: renderer fallback: requested Vulkan but bgfx started OpenGLES` | Vulkan init failed and bgfx fell back (warning). |
@@ -136,7 +136,7 @@ Writes are atomic (`<name>.tmp`, then renamed), so a failed write never leaves a
 - **Reset:** each marker is judged on its own stamp. It's deleted only when a value was **read successfully** and differs: a new `versionCode` or a changed `renderer` setting. Vulkan is then tried again.
 - **Fail closed:**
   - If a marker can't be read (a read error, not "absent"), the launch is guarded and nothing is written or deleted.
-  - If the `versionCode` or the setting can't be read, no marker is reset and the launch stays guarded.
+  - A `versionCode` or setting that can't be read can't itself reset a marker. If the other value was read successfully and changed, that still resets the marker. Otherwise the marker is kept and the launch stays guarded.
   - A malformed marker never resets the guard. It counts as a match, and it's rewritten for the current stamp.
   - If the disabled mark can't be written or the stable thread can't start, the start mark is kept, so the next launch is still guarded.
   - If the start mark itself can't be written, this launch runs on GLES (`could not record the Vulkan start`), unless the intent override asked for Vulkan.
@@ -172,7 +172,7 @@ These are logged under the game's `labelle` tag:
 | `android: crash guard: could not read a marker; keeping the guard (nothing changed)` | A marker read error; guarded, nothing written or deleted. |
 | `android: crash guard: malformed .labelle_vulkan_disabled; keeping the guard` | Guarded; the marker is rewritten for the current stamp. |
 | `android: crash guard: could not write .labelle_vulkan_disabled; keeping .labelle_vulkan_start` | The disable failed; the start mark stays, so the next launch is still guarded. |
-| `android: crash guard: could not read the app's versionCode; keeping the guard's marks as they are` | Unreadable version; nothing reset. |
+| `android: crash guard: could not read the app's versionCode; keeping the guard's marks as they are` | The unreadable version can't itself reset a marker; a marker is still reset if the setting was read and changed. |
 | `android: crash guard: could not get noBackupFilesDir; using internalDataPath for this process (Auto Backup may copy the crash-guard markers)` | The fallback directory is the primary for this process. |
 | `android: crash guard: no usable internalDataPath; guard off` | No usable directory; the guard is off. |
 
