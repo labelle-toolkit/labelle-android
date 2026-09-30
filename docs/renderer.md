@@ -35,11 +35,13 @@ With `gles`, the manifest is otherwise unchanged. To check a packaged APK (from 
 
 ```sh
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
-AAPT2="$SDK/build-tools/$(ls "$SDK"/build-tools | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)/aapt2"
+for v in $(ls "$SDK"/build-tools | sort -t. -k1,1nr -k2,2nr -k3,3nr); do
+  [ -x "$SDK/build-tools/$v/aapt2" ] && AAPT2="$SDK/build-tools/$v/aapt2" && break
+done
 "$AAPT2" dump xmltree --file AndroidManifest.xml zig-out/apk/game.apk | grep -E -A2 'labelle.renderer|vulkan'
 ```
 
-This uses the newest installed build-tools revision (a numeric sort, so it works with BSD and GNU `sort`). The SDK is `ANDROID_HOME`, else `ANDROID_SDK_ROOT`, else the macOS default `$HOME/Library/Android/sdk`.
+This uses the newest installed build-tools revision **that actually contains `aapt2`** (a numeric version sort, so it works with BSD and GNU `sort`). A newer revision left incomplete by an interrupted install is skipped, as `labelle android doctor` does. The SDK is `ANDROID_HOME`, else `ANDROID_SDK_ROOT`, else the macOS default `$HOME/Library/Android/sdk`.
 
 ## How the renderer is resolved at launch
 
