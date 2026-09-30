@@ -163,6 +163,7 @@ pub fn package(
             .version_code = in.version_code,
             .version_name = s.version_name,
             .has_launcher_icon = has_icon,
+            .renderer = s.renderer,
         });
         try cwd.writeFile(io, .{ .sub_path = manifest_path, .data = xml });
     }
