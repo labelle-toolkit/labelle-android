@@ -7,7 +7,11 @@
 //! `Context.getNoBackupFilesDir()` (`<data>/no_backup`), which Android Auto
 //! Backup and device-to-device transfer never copy: a crash on one device's
 //! GPU must not disable Vulkan on another. If that JNI lookup fails, the
-//! glue falls back to `ANativeActivity.internalDataPath` (logged once).
+//! glue falls back to `ANativeActivity.internalDataPath` (logged). The
+//! directory is resolved ONCE per process (`markerDirs`) and every write
+//! goes there; the launch check ALSO reads the other location
+//! (`internalDataPath`, or the derived `<data>/no_backup` after a fallback),
+//! and a marker found in either is effective (`checkDirs`).
 //!
 //!   * `.labelle_vulkan_start`: written by `beginVulkanStart`, just before a
 //!     Vulkan start (the resolved renderer is `vulkan`).
@@ -37,6 +41,14 @@
 //!   * Same process: a start mark THIS process wrote and still owns
 //!     (`StartState.owned`) is not a crash: an Activity relaunched in the
 //!     same process supersedes it (new generation, new mark) instead.
+//!     EVERY renderer resolution (`beginResolution`, whatever it picks)
+//!     bumps the generation, so an earlier Vulkan start's thread stops and
+//!     its mark stays "incomplete": only a Vulkan start that itself reaches
+//!     the threshold clears it (a GLES relaunch's frames never do).
+//!   * Stable unlink failure: ownership is kept and the unlink retried each
+//!     poll while the process lives (logged once).
+//!   * Marker READ ERRORS (not "absent") fail closed: guarded, and nothing
+//!     is written or deleted.
 //!   * Disabled: while `.labelle_vulkan_disabled` exists and its stamp
 //!     matches the current `versionCode` and setting, `vulkanDisabled`
 //!     returns true and `renderer.decide` picks `gles` (source
@@ -137,71 +149,121 @@ fn compare(recorded: Stamp, now: Observed) Match {
     return if (now.full() == null) .unknown else .same;
 }
 
+/// A marker read: its bytes, a known-absent file, or a READ ERROR (the file
+/// may exist but could not be read). Read errors fail closed.
+pub const ReadResult = union(enum) {
+    present: []const u8,
+    absent,
+    read_error,
+};
+
 /// The launch-time check of a NEW process (fresh `StartState`) with a fully
-/// read stamp (see `checkObserved`).
+/// read stamp, in a single marker directory (see `checkDirs`).
 pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
     var fresh: StartState = .{};
     return checkObserved(fs, Observed.of(current), &fresh);
 }
 
-/// The launch-time check. `fs` provides:
-///   * `read(name: []const u8, buf: []u8) ?[]const u8` (null = absent or
-///     unreadable)
+/// `checkDirs` with only the primary marker directory.
+pub fn checkObserved(fs: anytype, current: Observed, state: *StartState) bool {
+    return checkDirs(fs, @as(?@TypeOf(fs), null), current, state);
+}
+
+/// The launch-time check. `primary` is the marker directory this process
+/// writes to; `secondary` (optional) is the OTHER possible directory (a
+/// marker from an older build or a fallback launch may be there): it is
+/// read, and its markers are just as effective, but never written. Each fs
+/// provides:
+///   * `read(name: []const u8, buf: []u8) ReadResult`
 ///   * `write(name: []const u8, bytes: []const u8) bool`
 ///   * `rename(from: []const u8, to: []const u8) bool` (replaces `to`)
-///   * `delete(name: []const u8) void` (absent is fine)
+///   * `delete(name: []const u8) bool` (true = gone, incl. already absent)
 ///
-/// Returns true when this launch must not use Vulkan. Each marker is judged
-/// on its own stamp (`compare`):
-///   * `.labelle_vulkan_disabled`: same → guarded; changed → deleted (only
-///     it); unknown (a value could not be read) → kept, guarded; malformed →
-///     guarded and rewritten with the current stamp (fail closed).
-///   * `.labelle_vulkan_start`, unless this process owns it
-///     (`state.owned`: a same-process relaunch, not a crash): same (or
-///     malformed) → a crashed start: write the disabled mark, then drop the
-///     start mark, guarded; if that write fails the start mark is KEPT, so
-///     the next launch is still guarded; changed → deleted (only it);
-///     unknown → kept, guarded.
+/// Returns true when this launch must not use Vulkan.
+///   * Any marker READ ERROR in either directory: guarded, and NOTHING is
+///     written or deleted (fail closed; the next launch re-reads).
+///   * Otherwise each marker in each directory is judged on its own stamp
+///     (`compare`):
+///       - `.labelle_vulkan_disabled`: same → guarded; changed → deleted
+///         (only it); unknown (a value could not be read) → kept, guarded;
+///         malformed → guarded and rewritten in `primary` for the current
+///         stamp (fail closed).
+///       - `.labelle_vulkan_start`, unless it is `primary`'s and this process
+///         owns it (`state.owned`: a same-process relaunch, not a crash):
+///         same (or malformed) → a crashed start: write the disabled mark in
+///         `primary`, then drop this start mark, guarded; if that write
+///         fails the start mark is KEPT, so the next launch is still
+///         guarded; changed → deleted (only it); unknown → kept, guarded.
 /// Runs under `state.lock`, like `beginStart` and `settle`'s unlink.
-pub fn checkObserved(fs: anytype, current: Observed, state: *StartState) bool {
+pub fn checkDirs(primary: anytype, secondary: ?@TypeOf(primary), current: Observed, state: *StartState) bool {
     state.acquire();
     defer state.release();
-    var guarded = false;
-    var buf: [stamp_cap]u8 = undefined;
-    if (fs.read(disabled_file, &buf)) |bytes| {
-        if (Stamp.parse(bytes)) |s| switch (compare(s, current)) {
-            .same, .unknown => guarded = true,
-            .changed => fs.delete(disabled_file),
-        } else {
-            // Malformed: never a reset (that could lose a kept start mark).
-            // Fail closed and repair it for the current stamp.
-            std.log.warn("android: crash guard: malformed {s}; keeping the guard", .{disabled_file});
-            guarded = true;
-            if (current.full()) |cur| _ = writeStamp(fs, disabled_file, cur);
-        }
+
+    const Dir = struct { fs: @TypeOf(primary), is_primary: bool };
+    var dirs_buf: [2]Dir = undefined;
+    dirs_buf[0] = .{ .fs = primary, .is_primary = true };
+    var n: usize = 1;
+    if (secondary) |sec| {
+        dirs_buf[1] = .{ .fs = sec, .is_primary = false };
+        n = 2;
     }
-    if (!state.owned) if (fs.read(start_file, &buf)) |bytes| {
-        const parsed = Stamp.parse(bytes);
-        const m: Match = if (parsed) |s| compare(s, current) else .same;
-        switch (m) {
-            .same => {
-                // A start that never became stable, left by a process that is
-                // gone (not this one: `state.owned` is false).
+    const dirs = dirs_buf[0..n];
+
+    // Read everything first: a read error anywhere means "don't touch".
+    var bufs: [2][2][stamp_cap]u8 = undefined;
+    var reads: [2][2]ReadResult = undefined; // [dir][0 = disabled, 1 = start]
+    for (dirs, 0..) |d, i| {
+        reads[i][0] = d.fs.read(disabled_file, &bufs[i][0]);
+        reads[i][1] = d.fs.read(start_file, &bufs[i][1]);
+        for (reads[i]) |r| if (r == .read_error) {
+            std.log.warn("android: crash guard: could not read a marker; keeping the guard (nothing changed)", .{});
+            return true;
+        };
+    }
+
+    var guarded = false;
+    for (dirs, 0..) |d, i| {
+        switch (reads[i][0]) {
+            .absent, .read_error => {},
+            .present => |bytes| if (Stamp.parse(bytes)) |s| switch (compare(s, current)) {
+                .same, .unknown => guarded = true,
+                .changed => _ = d.fs.delete(disabled_file),
+            } else {
+                // Malformed: never a reset (that could lose a kept start
+                // mark). Fail closed and repair it for the current stamp.
+                std.log.warn("android: crash guard: malformed {s}; keeping the guard", .{disabled_file});
                 guarded = true;
                 if (current.full()) |cur| {
-                    if (writeStamp(fs, disabled_file, cur)) {
-                        fs.delete(start_file);
-                    } else {
-                        // Fail closed: keep the start mark so the NEXT launch
-                        // is still guarded. This launch is off Vulkan anyway.
-                        std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
-                    }
+                    if (writeStamp(primary, disabled_file, cur) and !d.is_primary) _ = d.fs.delete(disabled_file);
                 }
             },
-            .unknown => guarded = true,
-            .changed => fs.delete(start_file),
         }
-    };
+        if (d.is_primary and state.owned) continue;
+        switch (reads[i][1]) {
+            .absent, .read_error => {},
+            .present => |bytes| {
+                const m: Match = if (Stamp.parse(bytes)) |s| compare(s, current) else .same;
+                switch (m) {
+                    .same => {
+                        // A start that never became stable, left by a process
+                        // that is gone (not this one: not owned).
+                        guarded = true;
+                        if (current.full()) |cur| {
+                            if (writeStamp(primary, disabled_file, cur)) {
+                                _ = d.fs.delete(start_file);
+                            } else {
+                                // Fail closed: keep the start mark so the
+                                // NEXT launch is still guarded.
+                                std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
+                            }
+                        }
+                    },
+                    .unknown => guarded = true,
+                    .changed => _ = d.fs.delete(start_file),
+                }
+            },
+        }
+    }
     return guarded;
 }
 
@@ -211,7 +273,7 @@ fn writeAtomic(fs: anytype, name: []const u8, bytes: []const u8) bool {
     var tmp_buf: [64]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{name}) catch return false;
     if (!fs.write(tmp, bytes) or !fs.rename(tmp, name)) {
-        fs.delete(tmp);
+        _ = fs.delete(tmp);
         return false;
     }
     return true;
@@ -293,6 +355,19 @@ pub fn beginStart(fs: anytype, current: Stamp, state: *StartState, src: anytype,
     return true;
 }
 
+/// A new renderer resolution in this process (whatever it picks): bump the
+/// generation so every earlier stable thread stops, WITHOUT touching the
+/// start mark. A Vulkan start that was superseded before it reached the
+/// threshold stays "incomplete" (the mark, still `owned`, is only cleared by
+/// a Vulkan start that itself becomes stable); otherwise a GLES relaunch's
+/// frames (after bgfx re-init resets the counter) could clear the Vulkan
+/// mark of a start that never presented 120 frames.
+pub fn supersede(state: *StartState) void {
+    state.acquire();
+    defer state.release();
+    @atomicStore(u32, &state.generation, state.generation +% 1, .release);
+}
+
 /// Frames presented since this start: the counter minus `baseline.*`. A
 /// counter BELOW the baseline means bgfx re-initialised (labelle-bgfx#182
 /// resets it on every successful init): the baseline drops to 0 for good.
@@ -322,6 +397,7 @@ fn framesSince(raw: u64, baseline: *?u64) u64 {
 pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, mine: u32, baseline: ?u64) void {
     const t0 = clock.now();
     var noted = false;
+    var unlink_failure_logged = false;
     var base = baseline;
     // Advisory early exit; the authoritative check is under the lock below.
     while (state.peek() == mine) {
@@ -334,12 +410,18 @@ pub fn settle(fs: anytype, clock: anytype, src: anytype, state: *StartState, min
         const enough_frames = if (raw) |r| framesSince(r, &base) >= stable_min_frames else true;
         if (elapsed >= stable_after_ns and enough_frames) {
             state.acquire();
-            defer state.release();
-            if (state.generation == mine) {
-                fs.delete(start_file);
+            const done = if (state.generation != mine) true else if (fs.delete(start_file)) blk: {
                 state.owned = false;
+                break :blk true;
+            } else false;
+            state.release();
+            if (done) return;
+            // The unlink failed: the mark is still ours (owned stays true),
+            // so retry on the next poll for as long as the process lives.
+            if (!unlink_failure_logged) {
+                unlink_failure_logged = true;
+                std.log.warn("android: crash guard: could not delete {s}; retrying", .{start_file});
             }
-            return;
         }
         clock.sleep(poll_interval_ns) catch return;
     }
@@ -361,6 +443,10 @@ extern "c" fn fwrite(ptr: [*]const u8, size: usize, n: usize, f: *FILE) usize;
 extern "c" fn fclose(f: *FILE) c_int;
 extern "c" fn unlink(name: [*:0]const u8) c_int;
 extern "c" fn rename(from: [*:0]const u8, to: [*:0]const u8) c_int;
+extern "c" fn ferror(f: *FILE) c_int;
+/// bionic's `errno` location.
+extern "c" fn __errno() *c_int;
+const enoent: c_int = 2;
 extern "c" fn usleep(usec: c_uint) c_int;
 
 /// Marker files under a copied directory path (a value type, so the
@@ -381,12 +467,15 @@ const LibcFs = struct {
         return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ self.dir_buf[0..self.dir_len], name }) catch null;
     }
 
-    pub fn read(self: *const LibcFs, name: []const u8, buf: []u8) ?[]const u8 {
+    pub fn read(self: *const LibcFs, name: []const u8, buf: []u8) ReadResult {
         var p: [600]u8 = undefined;
-        const f = fopen((self.full(name, &p) orelse return null).ptr, "rb") orelse return null;
+        const path_z = self.full(name, &p) orelse return .read_error;
+        const f = fopen(path_z.ptr, "rb") orelse
+            return if (__errno().* == enoent) .absent else .read_error;
         defer _ = fclose(f);
         const n = fread(buf.ptr, 1, buf.len, f);
-        return buf[0..n];
+        if (ferror(f) != 0) return .read_error;
+        return .{ .present = buf[0..n] };
     }
     pub fn write(self: *const LibcFs, name: []const u8, bytes: []const u8) bool {
         var p: [600]u8 = undefined;
@@ -401,9 +490,10 @@ const LibcFs = struct {
         const t = self.full(to, &pt) orelse return false;
         return rename_c(f.ptr, t.ptr) == 0;
     }
-    pub fn delete(self: *const LibcFs, name: []const u8) void {
+    pub fn delete(self: *const LibcFs, name: []const u8) bool {
         var p: [600]u8 = undefined;
-        _ = unlink((self.full(name, &p) orelse return).ptr);
+        const path_z = self.full(name, &p) orelse return false;
+        return unlink(path_z.ptr) == 0 or __errno().* == enoent;
     }
 };
 const rename_c = rename;
@@ -465,27 +555,49 @@ fn versionCode(activity: *const anyopaque) ?i64 {
     return v;
 }
 
-var no_backup_failure_logged: std.atomic.Value(bool) = .init(false);
+/// `<internal>/../no_backup`: where `getNoBackupFilesDir()` lives next to
+/// `internalDataPath` (`<data>/files`). Only used to READ markers a process
+/// that did get the JNI answer may have left there.
+fn siblingNoBackup(internal: []const u8, buf: []u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, internal, "/");
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return null;
+    if (slash == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/no_backup", .{trimmed[0..slash]}) catch null;
+}
 
-/// The markers' directory: `getNoBackupFilesDir()` (never backed up or
-/// transferred), else `internalDataPath` with a one-time warning.
-fn libcFs(activity: *const anyopaque) ?LibcFs {
+/// The marker directories, resolved ONCE per process: `primary` is where
+/// markers are written, `secondary` the other location, read at launch.
+const MarkerDirs = struct { primary: LibcFs, secondary: ?LibcFs };
+
+var marker_dirs: ?MarkerDirs = null;
+var marker_dirs_lock: std.atomic.Mutex = .unlocked;
+var marker_dirs_resolved: bool = false;
+
+/// `getNoBackupFilesDir()` (never backed up or transferred) is primary and
+/// `internalDataPath` secondary; if the JNI lookup fails, `internalDataPath`
+/// is primary (logged) and the derived `<data>/no_backup` secondary.
+fn markerDirs(activity: *const anyopaque) ?MarkerDirs {
+    while (!marker_dirs_lock.tryLock()) std.atomic.spinLoopHint();
+    defer marker_dirs_lock.unlock();
+    if (marker_dirs_resolved) return marker_dirs;
+    marker_dirs_resolved = true;
+
+    const internal: ?LibcFs = if (labelle_android_internal_data_path(activity)) |d| LibcFs.init(std.mem.span(d)) else null;
     var nb: [512]u8 = undefined;
     const n = labelle_android_no_backup_dir(activity, &nb, nb.len);
-    if (n > 0) {
-        if (LibcFs.init(nb[0..@intCast(n)])) |fs| return fs;
-    }
-    if (logOnce(&no_backup_failure_logged)) {
-        std.log.warn("android: crash guard: could not get noBackupFilesDir; using internalDataPath (Auto Backup may copy the crash-guard markers)", .{});
-    }
-    const dir = labelle_android_internal_data_path(activity) orelse {
-        std.log.warn("android: crash guard: no internalDataPath; guard off", .{});
+    if (n > 0) if (LibcFs.init(nb[0..@intCast(n)])) |no_backup| {
+        marker_dirs = .{ .primary = no_backup, .secondary = internal };
+        return marker_dirs;
+    };
+    std.log.warn("android: crash guard: could not get noBackupFilesDir; using internalDataPath for this process (Auto Backup may copy the crash-guard markers)", .{});
+    const primary = internal orelse {
+        std.log.warn("android: crash guard: no usable internalDataPath; guard off", .{});
         return null;
     };
-    return LibcFs.init(std.mem.span(dir)) orelse {
-        std.log.warn("android: crash guard: internalDataPath unusable; guard off", .{});
-        return null;
-    };
+    var sib: [512]u8 = undefined;
+    const secondary: ?LibcFs = if (siblingNoBackup(primary.dir_buf[0..primary.dir_len], &sib)) |d| LibcFs.init(d) else null;
+    marker_dirs = .{ .primary = primary, .secondary = secondary };
+    return marker_dirs;
 }
 
 /// True when a previous launch crashed during a Vulkan start (and the app
@@ -498,8 +610,17 @@ fn libcFs(activity: *const anyopaque) ?LibcFs {
 pub fn vulkanDisabled(activity: ?*const anyopaque, setting: ?[]const u8) bool {
     if (comptime !is_android) return false;
     const a = activity orelse return false;
-    var fs = libcFs(a) orelse return false;
-    return checkObserved(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_state);
+    var dirs = markerDirs(a) orelse return false;
+    const sec: ?*LibcFs = if (dirs.secondary) |*s2| s2 else null;
+    return checkDirs(&dirs.primary, sec, .{ .version_code = versionCode(a), .setting = setting }, &start_state);
+}
+
+/// Called by `renderer.resolve` at the start of EVERY renderer resolution:
+/// stops earlier stable threads of this process without clearing their
+/// start mark (see `supersede`).
+pub fn beginResolution() void {
+    if (comptime !is_android) return;
+    supersede(&start_state);
 }
 
 /// Called by `renderer.resolve` once Vulkan is chosen, before bgfx starts:
@@ -512,7 +633,7 @@ pub fn vulkanDisabled(activity: ?*const anyopaque, setting: ?[]const u8) bool {
 pub fn beginVulkanStart(activity: ?*const anyopaque, setting: ?[]const u8) bool {
     if (comptime !is_android) return true;
     const a = activity orelse return false;
-    const fs = libcFs(a) orelse return false;
+    const fs = (markerDirs(a) orelse return false).primary;
     const obs: Observed = .{ .version_code = versionCode(a), .setting = setting };
     const stamp = obs.full() orelse {
         std.log.warn("android: crash guard: versionCode or {s} unreadable; cannot record this Vulkan start", .{"labelle.renderer"});
@@ -550,6 +671,10 @@ const FakeFs = struct {
     fail_writes: bool = false,
     /// Every write stores HALF the bytes, then reports failure (ENOSPC).
     partial_writes: bool = false,
+    /// Reads of this file name report a read error (EIO, EMFILE, ...).
+    read_error_on: ?[]const u8 = null,
+    /// The next N deletes of an EXISTING file fail (the file stays).
+    failing_deletes: usize = 0,
 
     fn slot(self: *FakeFs, name: []const u8) struct { *?[]const u8, []u8 } {
         if (std.mem.eql(u8, name, start_file)) return .{ &self.start, &self.bufs[0] };
@@ -558,11 +683,12 @@ const FakeFs = struct {
         if (std.mem.eql(u8, name, disabled_file ++ ".tmp")) return .{ &self.disabled_tmp, &self.bufs[3] };
         @panic("unexpected file name");
     }
-    pub fn read(self: *FakeFs, name: []const u8, buf: []u8) ?[]const u8 {
+    pub fn read(self: *FakeFs, name: []const u8, buf: []u8) ReadResult {
+        if (self.read_error_on) |bad| if (std.mem.eql(u8, bad, name)) return .read_error;
         const s = self.slot(name);
-        const v = s[0].* orelse return null;
+        const v = s[0].* orelse return .absent;
         @memcpy(buf[0..v.len], v);
-        return buf[0..v.len];
+        return .{ .present = buf[0..v.len] };
     }
     pub fn write(self: *FakeFs, name: []const u8, bytes: []const u8) bool {
         if (self.fail_writes) return false;
@@ -581,8 +707,14 @@ const FakeFs = struct {
         f[0].* = null;
         return true;
     }
-    pub fn delete(self: *FakeFs, name: []const u8) void {
-        self.slot(name)[0].* = null;
+    pub fn delete(self: *FakeFs, name: []const u8) bool {
+        const s = self.slot(name);
+        if (s[0].* != null and self.failing_deletes > 0) {
+            self.failing_deletes -= 1;
+            return false;
+        }
+        s[0].* = null;
+        return true;
     }
     fn set(self: *FakeFs, name: []const u8, bytes: []const u8) void {
         const s = self.slot(name);
@@ -1291,4 +1423,168 @@ test "a start mark that cannot be written falls back to gles (unless the intent 
     const ok = R.afterStart(.{ .renderer = .vulkan, .source = .setting }, true);
     try testing.expectEqual(R.Renderer.vulkan, ok.renderer);
     try testing.expectEqual(R.Source.setting, ok.source);
+}
+
+// ── Codex VERDICT at 7c28035 (labelle-bgfx#172 comments 5909398772 / 5909522964) ──
+
+test "GLES same-process relaunch: the old Vulkan timer can no longer clear the mark" {
+    // Vulkan start (gen N, mark written) → the Activity is relaunched in the
+    // same process and resolves to GLES → GLES init resets the counter and
+    // its frames pass 120. The gen-N thread must NOT clear the Vulkan mark.
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    supersede(&state); // resolution 1
+    var got: ?u32 = null;
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, RecordingSpawner{ .got = &got }));
+    const vulkan_gen = got.?;
+
+    // Resolution 2 (GLES): only supersede, no beginStart.
+    var clock: FakeClock = .{};
+    const Relaunch = struct {
+        inner: FakeFrames,
+        state: *StartState,
+        pub fn framesPresented(self: *@This()) ?u64 {
+            // The GLES relaunch lands on the 2nd poll (0.5 s).
+            if (self.inner.calls == 1) supersede(self.state);
+            return self.inner.framesPresented();
+        }
+        pub fn noteTimeOnly(self: *@This()) void {
+            self.inner.noteTimeOnly();
+        }
+    };
+    // GLES init at 1 s resets the counter, then 60 fps (540 frames by 10 s).
+    var frames: Relaunch = .{ .inner = .{ .clock = &clock, .init_done_ns = std.time.ns_per_s }, .state = &state };
+    settle(&fs, &clock, &frames, &state, vulkan_gen, 0);
+    try testing.expect(clock.now_ns < stable_after_ns); // it stopped early...
+    try testing.expectEqualStrings("1 vulkan", fs.start.?); // ...and kept the mark
+    try testing.expect(state.owned); // still this process's incomplete start
+
+    // The process later exits normally without another Vulkan start: the
+    // next process treats the Vulkan start as incomplete.
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+}
+
+test "a later Vulkan start in the same process can still clear the mark itself" {
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, NoSpawner{}));
+    supersede(&state); // a GLES relaunch
+    // Vulkan again (same process): its own mark is not a crash...
+    try testing.expect(!checkObserved(&fs, Observed.of(v1_vulkan), &state));
+    var got: ?u32 = null;
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, RecordingSpawner{ .got = &got }));
+    // ...and once THIS start is stable, it clears the mark.
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock };
+    settle(&fs, &clock, &frames, &state, got.?, null);
+    try testing.expect(fs.start == null);
+    try testing.expect(!state.owned);
+}
+
+test "a marker read error fails closed: guarded, nothing written or deleted" {
+    // Disabled marker unreadable (EIO): guarded even though a start-free,
+    // version-bumped launch would otherwise reset.
+    var fs: FakeFs = .{};
+    fs.set(disabled_file, "1 vulkan");
+    fs.read_error_on = disabled_file;
+    try testing.expect(checkAtLaunch(&fs, v2_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?); // not deleted
+
+    // Start marker unreadable, with a stale disabled marker that would reset.
+    var fs2: FakeFs = .{};
+    fs2.set(disabled_file, "1 vulkan");
+    fs2.set(start_file, "2 vulkan");
+    fs2.read_error_on = start_file;
+    try testing.expect(checkAtLaunch(&fs2, v2_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs2.disabled.?); // untouched
+    try testing.expectEqualStrings("2 vulkan", fs2.start.?);
+
+    // Readable again: the normal rules apply (the v2 start is a crash).
+    fs2.read_error_on = null;
+    try testing.expect(checkAtLaunch(&fs2, v2_vulkan));
+    try testing.expectEqualStrings("2 vulkan", fs2.disabled.?);
+}
+
+test "a failed unlink keeps ownership and retries; stable start is not left 'incomplete'" {
+    var fs: FakeFs = .{};
+    var state: StartState = .{};
+    var got: ?u32 = null;
+    try testing.expect(beginStart(&fs, v1_vulkan, &state, NoFrames{}, RecordingSpawner{ .got = &got }));
+    fs.failing_deletes = 3; // three transient unlink failures
+    var clock: FakeClock = .{};
+    var frames: FakeFrames = .{ .clock = &clock };
+    settle(&fs, &clock, &frames, &state, got.?, null);
+    try testing.expect(fs.start == null); // cleared on the 4th attempt
+    try testing.expect(!state.owned);
+    try testing.expectEqual(stable_after_ns + 3 * poll_interval_ns, clock.now_ns);
+
+    // While it keeps failing, ownership is kept, so a same-process relaunch
+    // does not read this stable start as a crash.
+    var fs2: FakeFs = .{};
+    var state2: StartState = .{};
+    got = null;
+    try testing.expect(beginStart(&fs2, v1_vulkan, &state2, NoFrames{}, RecordingSpawner{ .got = &got }));
+    fs2.failing_deletes = std.math.maxInt(usize);
+    var clock2: FakeClock = .{ .dies_at_ns = 20 * std.time.ns_per_s };
+    var frames2: FakeFrames = .{ .clock = &clock2 };
+    settle(&fs2, &clock2, &frames2, &state2, got.?, null);
+    try testing.expect(state2.owned);
+    try testing.expect(fs2.start != null);
+    fs2.failing_deletes = 0;
+    try testing.expect(!checkObserved(&fs2, Observed.of(v1_vulkan), &state2));
+    try testing.expect(fs2.disabled == null);
+}
+
+test "both marker dirs are checked; writes go only to the primary" {
+    // A disabled marker in the OTHER dir (older build / fallback launch).
+    var primary: FakeFs = .{};
+    var other: FakeFs = .{};
+    other.set(disabled_file, "1 vulkan");
+    var st: StartState = .{};
+    try testing.expect(checkDirs(&primary, &other, Observed.of(v1_vulkan), &st));
+    try testing.expect(primary.disabled == null); // nothing copied/written
+    try testing.expectEqualStrings("1 vulkan", other.disabled.?);
+
+    // A crashed start in the other dir: the disabled marker goes to the
+    // primary, the start mark is removed from the other dir.
+    var p2: FakeFs = .{};
+    var o2: FakeFs = .{};
+    o2.set(start_file, "1 vulkan");
+    var st2: StartState = .{};
+    try testing.expect(checkDirs(&p2, &o2, Observed.of(v1_vulkan), &st2));
+    try testing.expectEqualStrings("1 vulkan", p2.disabled.?);
+    try testing.expect(o2.start == null and o2.disabled == null);
+
+    // A read error in the other dir fails closed too.
+    var p3: FakeFs = .{};
+    var o3: FakeFs = .{ .read_error_on = start_file };
+    var st3: StartState = .{};
+    try testing.expect(checkDirs(&p3, &o3, Observed.of(v1_vulkan), &st3));
+
+    // A stale marker in the other dir is reset there; nothing else happens.
+    var p4: FakeFs = .{};
+    var o4: FakeFs = .{};
+    o4.set(disabled_file, "1 vulkan");
+    var st4: StartState = .{};
+    try testing.expect(!checkDirs(&p4, &o4, Observed.of(v2_vulkan), &st4));
+    try testing.expect(o4.disabled == null);
+
+    // The primary's OWN live mark is skipped (same process), but a start
+    // mark in the other dir is never "owned".
+    var p5: FakeFs = .{};
+    var o5: FakeFs = .{};
+    var st5: StartState = .{};
+    try testing.expect(beginStart(&p5, v1_vulkan, &st5, NoFrames{}, NoSpawner{}));
+    try testing.expect(!checkDirs(&p5, &o5, Observed.of(v1_vulkan), &st5));
+    o5.set(start_file, "1 vulkan");
+    try testing.expect(checkDirs(&p5, &o5, Observed.of(v1_vulkan), &st5));
+}
+
+test "siblingNoBackup derives <data>/no_backup from internalDataPath" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("/data/user/0/com.x/no_backup", siblingNoBackup("/data/user/0/com.x/files", &buf).?);
+    try testing.expectEqualStrings("/data/user/0/com.x/no_backup", siblingNoBackup("/data/user/0/com.x/files/", &buf).?);
+    try testing.expect(siblingNoBackup("/files", &buf) == null);
+    try testing.expect(siblingNoBackup("files", &buf) == null);
 }

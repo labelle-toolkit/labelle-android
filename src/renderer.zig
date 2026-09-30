@@ -273,6 +273,9 @@ const JniQuery = struct {
 pub fn resolve(activity: ?*const anyopaque, intent_extra: ?[:0]const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
+    // Every resolution supersedes this process's earlier Vulkan stable
+    // thread (whatever it picks), keeping its start mark "incomplete".
+    crash_guard.beginResolution();
     var q: JniQuery = .{ .activity = a, .extra = intent_extra };
     var d = decide(&q);
     if (d.renderer == .vulkan) d = afterStart(d, crash_guard.beginVulkanStart(a, q.metaRead().guardSetting()));
