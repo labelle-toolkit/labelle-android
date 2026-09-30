@@ -21,6 +21,8 @@
 //!     `crash_guard` is its D11 Vulkan crash guard (labelle-android#28).
 //!   * `activity` — finish the running activity when the game quits, then
 //!     end the process (moca-tecnologia/flying-platform-labelle#979).
+//!   * `assets` — open a bundled APK asset as a file descriptor for the fd
+//!     decoders above (labelle-bgfx#168).
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
@@ -55,6 +57,7 @@ pub const immersive = @import("immersive.zig");
 pub const renderer = @import("renderer.zig");
 pub const crash_guard = @import("crash_guard.zig");
 pub const activity = @import("activity.zig");
+pub const assets = @import("assets.zig");
 
 test {
     // Explicit refs: a lazily-referenced file's tests are otherwise never
@@ -69,4 +72,5 @@ test {
     _ = renderer;
     _ = crash_guard;
     _ = activity;
+    _ = assets;
 }
