@@ -17,6 +17,11 @@
 //!   * Stable: a detached thread deletes `.labelle_vulkan_start` once the
 //!     process has lived `stable_after_ns` (10 s) after `beginVulkanStart`.
 //!     No labelle-bgfx signal (the generic-only rule).
+//!     TODO(#172 D11): the timer starts at `renderer.resolve`, BEFORE
+//!     `bgfx.init`, so a Vulkan init that hangs for more than 10 s clears the
+//!     mark and is not caught (Codex review of labelle-android#33,
+//!     labelle-bgfx#172 comment 5904099277). The fix needs a lifecycle
+//!     signal; waiting on an owner decision.
 //!   * Disabled: while `.labelle_vulkan_disabled` exists and its stamp
 //!     matches the current `versionCode` and setting, `vulkanDisabled`
 //!     returns true and `renderer.decide` picks `gles` (source
@@ -25,7 +30,18 @@
 //!     `renderer` setting) deletes both files, so Vulkan is tried again. An
 //!     unreadable stamp resets too.
 //!   * Intent override: `renderer.decide` asks the debuggable-only intent
-//!     extra BEFORE the guard, so it wins (see the test at the bottom).
+//!     extra BEFORE the guard, so it wins (see the test at the bottom). The
+//!     guard itself stays ACTIVE in debuggable builds: only an explicit
+//!     extra bypasses it.
+//!   * Fails CLOSED: if the disabled mark cannot be written, or the stable
+//!     timer cannot be started, the start mark is KEPT, so the next launch
+//!     is still guarded (it finds the mark again and goes to GLES).
+//!
+//! By design, anything that ends the process inside the stable window counts
+//! as an incomplete start, including a developer's early force-stop (e.g.
+//! `am start -S` within 10 s of the previous launch): the next launch runs
+//! on GLES. To bypass the guard while iterating, launch a debuggable build
+//! with `--es LABELLE_BGFX_RENDERER vulkan` (the intent override).
 //!
 //! The PURE half (`checkAtLaunch`, `markStart`, `settle`) takes an injected
 //! filesystem and clock and is host-tested; the Android glue below it uses
@@ -80,7 +96,9 @@ const stamp_cap = 64;
 ///      leftover start mark is dropped); otherwise reset (both files go).
 ///   2. `.labelle_vulkan_start` present (the previous Vulkan start did not
 ///      complete): matching stamp → write `.labelle_vulkan_disabled`, drop the
-///      start mark, true; otherwise reset.
+///      start mark, true; otherwise reset. If the write fails, the start
+///      mark is KEPT (fail closed): the next launch finds it again and is
+///      still guarded.
 ///   3. Neither → false.
 pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
     var buf: [stamp_cap]u8 = undefined;
@@ -95,14 +113,14 @@ pub fn checkAtLaunch(fs: anytype, current: Stamp) bool {
     if (fs.read(start_file, &buf)) |bytes| {
         if (Stamp.parse(bytes)) |s| if (s.eql(current)) {
             var out: [stamp_cap]u8 = undefined;
-            if (current.format(&out)) |text| {
-                if (!fs.write(disabled_file, text)) {
-                    std.log.warn("android: crash guard: could not write {s}", .{disabled_file});
-                }
+            const written = if (current.format(&out)) |text| fs.write(disabled_file, text) else false;
+            if (written) {
+                fs.delete(start_file);
+            } else {
+                // Fail closed: keep the start mark so the NEXT launch is
+                // still guarded. This launch is off Vulkan either way.
+                std.log.warn("android: crash guard: could not write {s}; keeping {s}", .{ disabled_file, start_file });
             }
-            fs.delete(start_file);
-            // Disabled for THIS launch even if the write failed: the crash
-            // just happened, so do not retry Vulkan right away.
             return true;
         };
         reset(fs);
@@ -123,10 +141,29 @@ pub fn markStart(fs: anytype, current: Stamp) bool {
     return fs.write(start_file, text);
 }
 
+/// `beginVulkanStart`'s pure half: bump the generation, write the start mark,
+/// start the stable timer via `spawner.spawn(mine: u32) !void`. Fails
+/// CLOSED: if the timer cannot start, the mark is KEPT, so the next launch
+/// runs on GLES rather than an unguarded Vulkan start being forgotten.
+pub fn beginStart(fs: anytype, current: Stamp, generation: *std.atomic.Value(u32), spawner: anytype) void {
+    const mine = generation.fetchAdd(1, .acq_rel) + 1;
+    if (!markStart(fs, current)) {
+        std.log.warn("android: crash guard: could not write {s}", .{start_file});
+        return;
+    }
+    spawner.spawn(mine) catch |err| {
+        std.log.warn("android: crash guard: could not start the stable timer ({s}); keeping {s}, so the next launch uses gles", .{ @errorName(err), start_file });
+    };
+}
+
 /// The stable timer: sleep `stable_after_ns`, then delete the start mark,
 /// unless a newer `beginVulkanStart` (another activity launch in the same
 /// process) has taken over (`generation` moved past `mine`); its own timer
-/// will clear the mark. `clock.sleep(ns) !void` — a fake returns an error to
+/// will clear the mark.
+/// TODO(#172 D11): this runs from `renderer.resolve`, before `bgfx.init`, so
+/// a Vulkan init hanging past 10 s clears the mark (Codex review of
+/// labelle-android#33, labelle-bgfx#172 comment 5904099277). Needs a
+/// lifecycle signal; waiting on an owner decision. `clock.sleep(ns) !void` — a fake returns an error to
 /// model the process dying mid-sleep.
 pub fn settle(fs: anytype, clock: anytype, generation: *const std.atomic.Value(u32), mine: u32) void {
     clock.sleep(stable_after_ns) catch return;
@@ -242,21 +279,17 @@ pub fn beginVulkanStart(activity: ?*const anyopaque, setting: []const u8) void {
     if (comptime !is_android) return;
     const a = activity orelse return;
     const fs = libcFs(a) orelse return;
-    const mine = start_generation.fetchAdd(1, .acq_rel) + 1;
-    if (!markStart(&fs, .{ .version_code = versionCode(a), .setting = setting })) {
-        std.log.warn("android: crash guard: could not write {s}", .{start_file});
-        return;
-    }
-    const t = std.Thread.spawn(.{}, stableThread, .{ fs, mine }) catch |err| {
-        // No timer: the mark stays and the NEXT launch uses GLES. Safer to
-        // drop the mark now and run unguarded than to disable Vulkan for a
-        // start that may well succeed.
-        std.log.warn("android: crash guard: could not start the stable timer ({s}); guard off for this launch", .{@errorName(err)});
-        fs.delete(start_file);
-        return;
-    };
-    t.detach();
+    beginStart(&fs, .{ .version_code = versionCode(a), .setting = setting }, &start_generation, ThreadSpawner{ .fs = fs });
 }
+
+/// Spawns the detached stable-timer thread with its own copy of the fs.
+const ThreadSpawner = struct {
+    fs: LibcFs,
+    pub fn spawn(self: ThreadSpawner, mine: u32) std.Thread.SpawnError!void {
+        const t = try std.Thread.spawn(.{}, stableThread, .{ self.fs, mine });
+        t.detach();
+    }
+};
 
 fn stableThread(fs: LibcFs, mine: u32) void {
     settle(&fs, LibcClock{}, &start_generation, mine);
@@ -371,12 +404,55 @@ test "a crash inside 10 s disables Vulkan at the next launch" {
     try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
 }
 
-test "a failed disabled write still keeps THIS launch off Vulkan" {
+test "a failed disabled write keeps the start mark (fail closed): still guarded next launch" {
     var fs: FakeFs = .{};
     fs.set(start_file, "1 vulkan");
     fs.fail_writes = true;
     try testing.expect(checkAtLaunch(&fs, v1_vulkan));
-    try testing.expect(fs.start == null and fs.disabled == null);
+    try testing.expect(fs.disabled == null);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?); // kept
+    // Next launch: still guarded by the kept start mark...
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.start.?);
+    // ...and once writes work again, it converts to the disabled mark.
+    fs.fail_writes = false;
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expect(fs.start == null);
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+}
+
+test "a stable timer that cannot start keeps the start mark (fail closed)" {
+    const FailingSpawner = struct {
+        calls: *usize,
+        pub fn spawn(self: @This(), _: u32) error{SystemResources}!void {
+            self.calls.* += 1;
+            return error.SystemResources;
+        }
+    };
+    var fs: FakeFs = .{};
+    var gen: std.atomic.Value(u32) = .init(0);
+    var calls: usize = 0;
+    beginStart(&fs, v1_vulkan, &gen, FailingSpawner{ .calls = &calls });
+    try testing.expectEqual(@as(usize, 1), calls);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?); // kept
+    // The next launch treats it as an incomplete start: gles.
+    try testing.expect(checkAtLaunch(&fs, v1_vulkan));
+    try testing.expectEqualStrings("1 vulkan", fs.disabled.?);
+}
+
+test "beginStart: mark written, timer spawned with the new generation" {
+    const RecordingSpawner = struct {
+        got: *?u32,
+        pub fn spawn(self: @This(), mine: u32) error{}!void {
+            self.got.* = mine;
+        }
+    };
+    var fs: FakeFs = .{};
+    var gen: std.atomic.Value(u32) = .init(4);
+    var got: ?u32 = null;
+    beginStart(&fs, v1_vulkan, &gen, RecordingSpawner{ .got = &got });
+    try testing.expectEqual(@as(?u32, 5), got);
+    try testing.expectEqualStrings("1 vulkan", fs.start.?);
 }
 
 test "surviving 10 s clears the mark; the next launch tries Vulkan again" {
@@ -480,6 +556,13 @@ test "an intent override beats the guard (renderer.decide asks the intent first)
     try testing.expectEqual(renderer.Renderer.vulkan, d.renderer);
     try testing.expectEqual(renderer.Source.intent, d.source);
     try testing.expectEqual(@as(usize, 0), q.guard_calls);
+
+    // Debuggable WITHOUT the extra: the guard stays active (option c).
+    var n: Q = .{ .fs = &fs, .extra = null, .is_debuggable = true };
+    const g = renderer.decide(&n);
+    try testing.expectEqual(renderer.Renderer.gles, g.renderer);
+    try testing.expectEqual(renderer.Source.crash_guard, g.source);
+    try testing.expectEqual(@as(usize, 1), n.guard_calls);
 
     // Not debuggable: the extra is ignored and the guard wins.
     var r: Q = .{ .fs = &fs, .extra = "vulkan", .is_debuggable = false };
