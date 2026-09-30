@@ -2,6 +2,8 @@
 
 On Android, labelle-bgfx can render with **GLES** or **Vulkan**. labelle-android decides which one at launch and passes the choice to bgfx through the `LABELLE_BGFX_RENDERER` environment variable ([labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172), D1–D4 and D11).
 
+This page describes labelle-android from the release that includes #27 and #28 (PRs [#32](https://github.com/labelle-toolkit/labelle-android/pull/32) and [#33](https://github.com/labelle-toolkit/labelle-android/pull/33)). Earlier releases only stamp the setting into the manifest; they don't read it at launch.
+
 Needs the launch-time resolution ([#27](https://github.com/labelle-toolkit/labelle-android/issues/27)), the crash guard ([#28](https://github.com/labelle-toolkit/labelle-android/issues/28)) and a labelle-bgfx that reads `LABELLE_BGFX_RENDERER` on every platform ([labelle-bgfx#176](https://github.com/labelle-toolkit/labelle-bgfx/issues/176)).
 
 ## The `renderer` setting
@@ -32,8 +34,12 @@ The packager stamps the setting into `AndroidManifest.xml`:
 With `gles`, the manifest is otherwise unchanged. To check a packaged APK (from the generated target directory, e.g. `.labelle/bgfx_android/`):
 
 ```sh
-"$ANDROID_HOME"/build-tools/36.0.0/aapt2 dump xmltree --file AndroidManifest.xml zig-out/apk/game.apk | grep -E -A2 'labelle.renderer|vulkan'
+SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+AAPT2="$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)/aapt2"
+"$AAPT2" dump xmltree --file AndroidManifest.xml zig-out/apk/game.apk | grep -E -A2 'labelle.renderer|vulkan'
 ```
+
+This uses the newest installed build-tools revision. `$HOME/Library/Android/sdk` is the macOS default when `ANDROID_HOME` is unset; set `ANDROID_HOME` on other hosts.
 
 ## How the renderer is resolved at launch
 

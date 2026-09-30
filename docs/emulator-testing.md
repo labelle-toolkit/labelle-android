@@ -20,7 +20,9 @@ sdkmanager --list | grep "system-images;android-36;google_apis;arm64-v8a"
 sdkmanager "system-images;android-36;google_apis;arm64-v8a"
 ```
 
-Use `x86_64` in place of `arm64-v8a` on an Intel or AMD host.
+Use the **`arm64-v8a`** image. The APK this provider packages carries only `lib/arm64-v8a` (`abis` accepts only `["arm64-v8a"]` in schema v1), so it can't start on an `x86_64` guest. On an Apple Silicon host the arm64 image runs natively.
+
+On an Intel or AMD host, an arm64 image needs ARM translation, which isn't supported or tested here. The Windows check in labelle-bgfx#172 used an `x86_64` AVD only by moving `libgame.so` into `lib/x86_64` and re-signing the APK by hand. That's a test-only workaround, not a supported path.
 
 Create a tablet-sized AVD (1200×2000 at 240 dpi with 4 GB of RAM, which is close to the SM-T505 test tablet):
 
