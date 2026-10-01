@@ -14,7 +14,9 @@
 //! and a marker found in either is effective (`checkDirs`).
 //!
 //!   * `.labelle_vulkan_start`: written by `beginVulkanStart`, just before a
-//!     Vulkan start (the resolved renderer is `vulkan`).
+//!     Vulkan start (the resolved renderer is `vulkan`, whichever rule chose
+//!     it: an explicit `vulkan`, an explicit `auto`, the DEFAULT `auto` of a
+//!     missing meta-data, or the intent).
 //!   * `.labelle_vulkan_disabled`: written when a launch finds a
 //!     `.labelle_vulkan_start` left by a process that is gone, i.e. a Vulkan
 //!     start that never reached "stable".
@@ -125,7 +127,8 @@ const stamp_cap = 64;
 /// READ FAILURE (JNI error), not a value: it can never count as a change,
 /// so it never resets the guard (Codex review of labelle-android#33,
 /// labelle-bgfx#172 comment 5904915798). An ABSENT `labelle.renderer` key is
-/// a successful read and arrives here as the default `gles`.
+/// a successful read and arrives here as the default `auto`
+/// (labelle-android#30).
 pub const Observed = struct {
     version_code: ?i64,
     setting: ?[]const u8,
@@ -1106,8 +1109,8 @@ test "an intent override beats the guard (renderer.decide asks the intent first)
             self.guard_calls += 1;
             return checkAtLaunch(self.fs, v1_vulkan);
         }
-        pub fn metaData(_: *@This()) ?[]const u8 {
-            return "vulkan";
+        pub fn metaData(_: *@This()) renderer.MetaRead {
+            return .{ .value = "vulkan" };
         }
         pub fn hasVulkan(_: *@This()) bool {
             return true;
@@ -1163,6 +1166,8 @@ const LaunchQuery = struct {
     fs: *FakeFs,
     meta: renderer.MetaRead,
     version: ?i64,
+    /// The device's Vulkan 1.1 feature (`auto`'s check).
+    vulkan: bool = true,
 
     pub fn intentExtra(_: *@This()) ?[]const u8 {
         return null;
@@ -1173,16 +1178,35 @@ const LaunchQuery = struct {
     pub fn vulkanDisabled(self: *@This()) bool {
         return checkNew(self.fs, .{ .version_code = self.version, .setting = self.meta.guardSetting() });
     }
-    pub fn metaData(self: *@This()) ?[]const u8 {
-        return self.meta.metaData();
+    pub fn metaData(self: *@This()) renderer.MetaRead {
+        return self.meta;
     }
-    pub fn hasVulkan(_: *@This()) bool {
-        return true;
+    pub fn hasVulkan(self: *@This()) bool {
+        return self.vulkan;
     }
 
     fn run(fs: *FakeFs, meta: renderer.MetaRead, version: ?i64) renderer.Decision {
         var q: LaunchQuery = .{ .fs = fs, .meta = meta, .version = version };
         return renderer.decide(&q);
+    }
+
+    /// A whole launch in a NEW process, the way `renderer.resolve` wires it:
+    /// decide (guard first), then for `vulkan` the start mark + stable
+    /// thread (`beginStart`, keyed on the same `guardSetting`) and
+    /// `afterStart`. The stable thread runs on `clock` at 60 fps; a
+    /// `clock.dies_at_ns` before stable is a crash.
+    fn launch(fs: *FakeFs, clock: *FakeClock, meta: renderer.MetaRead, version: i64, vulkan: bool) renderer.Decision {
+        var q: LaunchQuery = .{ .fs = fs, .meta = meta, .version = version, .vulkan = vulkan };
+        var d = renderer.decide(&q);
+        if (d.renderer == .vulkan) {
+            var state: StartState = .{};
+            var got: ?u32 = null;
+            const stamp: Stamp = .{ .version_code = version, .setting = meta.guardSetting().? };
+            d = renderer.afterStart(d, beginStart(fs, stamp, &state, NoFrames{}, RecordingSpawner{ .got = &got }));
+            var frames: FakeFrames = .{ .clock = clock };
+            if (got) |mine| settle(fs, clock, &frames, &state, mine, null);
+        }
+        return d;
     }
 };
 
@@ -1255,15 +1279,92 @@ test "an observed change still resets even when the OTHER half is unreadable" {
     try testing.expect(fs.disabled == null);
 }
 
-test "an absent key is a successful read of the default gles: a real change vs a vulkan stamp" {
+test "an absent key is a successful read of the default auto: a real change vs a vulkan stamp" {
     const R = LaunchQuery.renderer;
     var fs: FakeFs = .{};
     fs.set(disabled_file, "1 vulkan");
     fs.set(start_file, "1 vulkan");
     const d = LaunchQuery.run(&fs, .absent, 1);
-    try testing.expectEqual(R.Renderer.gles, d.renderer);
-    try testing.expectEqual(R.Source.setting, d.source); // not the guard
+    try testing.expectEqual(R.Renderer.vulkan, d.renderer);
+    try testing.expectEqual(R.Source.auto_default, d.source); // not the guard
     try testing.expect(fs.disabled == null and fs.start == null); // reset
+}
+
+// ── labelle-android#30: the default `auto` is guarded like an explicit `vulkan` ──
+
+test "default auto: Vulkan start is marked before init and the mark is stamped 'auto'" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    // The process dies right after the mark (before any stable poll).
+    var clock: FakeClock = .{ .dies_at_ns = 1 };
+    const d = LaunchQuery.launch(&fs, &clock, .absent, 1, true);
+    try testing.expectEqual(R.Renderer.vulkan, d.renderer);
+    try testing.expectEqual(R.Source.auto_default, d.source);
+    try testing.expectEqualStrings("1 auto", fs.start.?);
+}
+
+test "default auto: a crashed Vulkan start flips the next launch to gles (crash-guard)" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{ .dies_at_ns = stable_after_ns - 1 };
+    _ = LaunchQuery.launch(&fs, &clock, .absent, 1, true);
+    try testing.expectEqualStrings("1 auto", fs.start.?); // never stable
+
+    var clock2: FakeClock = .{};
+    const d = LaunchQuery.launch(&fs, &clock2, .absent, 1, true);
+    try testing.expectEqual(R.Renderer.gles, d.renderer);
+    try testing.expectEqual(R.Source.crash_guard, d.source);
+    try testing.expectEqualStrings("1 auto", fs.disabled.?);
+    try testing.expect(fs.start == null);
+    // ...and stays there, exactly as for an explicit `vulkan`.
+    const again = LaunchQuery.launch(&fs, &clock2, .absent, 1, true);
+    try testing.expectEqual(R.Source.crash_guard, again.source);
+
+    // The packaged default and the runtime default are the same setting: an
+    // APK that stamps `auto` explicitly is guarded by the same marker.
+    const explicit = LaunchQuery.launch(&fs, &clock2, .{ .value = "auto" }, 1, true);
+    try testing.expectEqual(R.Source.crash_guard, explicit.source);
+
+    // Opting out to gles is a changed setting: the marker is reset.
+    const opt_out = LaunchQuery.launch(&fs, &clock2, .{ .value = "gles" }, 1, true);
+    try testing.expectEqual(R.Renderer.gles, opt_out.renderer);
+    try testing.expectEqual(R.Source.setting, opt_out.source);
+    try testing.expect(fs.disabled == null and fs.start == null);
+}
+
+test "default auto: a stable Vulkan start clears its mark; the next launch is Vulkan again" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{};
+    const d1 = LaunchQuery.launch(&fs, &clock, .absent, 1, true);
+    try testing.expectEqual(R.Source.auto_default, d1.source);
+    try testing.expectEqual(stable_after_ns, clock.now_ns); // cleared at the threshold
+    try testing.expect(fs.start == null and fs.disabled == null);
+
+    var clock2: FakeClock = .{};
+    const d2 = LaunchQuery.launch(&fs, &clock2, .absent, 1, true);
+    try testing.expectEqual(R.Renderer.vulkan, d2.renderer);
+    try testing.expectEqual(R.Source.auto_default, d2.source);
+}
+
+test "default auto: an unrecordable start falls back to gles like an explicit vulkan" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    fs.partial_writes = true;
+    var clock: FakeClock = .{};
+    const d = LaunchQuery.launch(&fs, &clock, .absent, 1, true);
+    try testing.expectEqual(R.Renderer.gles, d.renderer);
+    try testing.expectEqual(R.Source.crash_guard_unrecorded, d.source);
+}
+
+test "default auto on a device without Vulkan 1.1: gles, no start mark" {
+    const R = LaunchQuery.renderer;
+    var fs: FakeFs = .{};
+    var clock: FakeClock = .{};
+    const d = LaunchQuery.launch(&fs, &clock, .absent, 1, false);
+    try testing.expectEqual(R.Renderer.gles, d.renderer);
+    try testing.expectEqual(R.Source.auto_default, d.source);
+    try testing.expect(fs.start == null and fs.disabled == null);
 }
 
 // ── Codex bot findings on labelle-android#33 (final round) ─────────────

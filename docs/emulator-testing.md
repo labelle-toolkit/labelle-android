@@ -77,7 +77,7 @@ On an M1 Max host the device is `Apple M1 Max` (gfxstream over MoltenVK) and the
 
 On a macOS host, the emulator's GLES runs on the host's desktop OpenGL 4.1, which has no ASTC. An ASTC-only Android build can't load its atlases there under GLES.
 
-Under Vulkan, ASTC works natively: bgfx reports every ASTC format as `TEXTURE_2D`, and the atlases sample correctly. **Use the Vulkan renderer for ASTC builds on the emulator.** Set `"renderer": "vulkan"` in a local `providers/android.json`, or use the launch override below.
+Under Vulkan, ASTC works natively: bgfx reports every ASTC format as `TEXTURE_2D`, and the atlases sample correctly. **Use the Vulkan renderer for ASTC builds on the emulator.** From labelle-android 0.5.0 the default `auto` setting already picks Vulkan here (the guest reports Vulkan 1.3); with an explicit `"renderer": "gles"`, or on an older release, set `"renderer": "vulkan"` in a local `providers/android.json`, or use the launch override below.
 
 ## 5. Launch with a renderer override
 

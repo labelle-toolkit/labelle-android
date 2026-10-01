@@ -2,7 +2,7 @@
 
 On Android, labelle-bgfx can render with **GLES** or **Vulkan**. labelle-android decides which one at launch and passes the choice to bgfx through the `LABELLE_BGFX_RENDERER` environment variable ([labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172), D1–D4 and D11).
 
-This page describes labelle-android ≥ 0.4.0. Earlier releases don't read the setting at launch; at most they stamp it into the manifest.
+This page describes labelle-android ≥ 0.5.0, where the default is `auto`. In 0.4.0 the default was `gles`. Earlier releases don't read the setting at launch; at most they stamp it into the manifest.
 
 It also needs a labelle-bgfx that reads `LABELLE_BGFX_RENDERER` on every platform ([labelle-bgfx#176](https://github.com/labelle-toolkit/labelle-bgfx/issues/176)). The crash guard's frame-based stable rule needs `labelle_bgfx_frames_presented` ([labelle-bgfx#182](https://github.com/labelle-toolkit/labelle-bgfx/issues/182)); without it the guard uses a time-only rule.
 
@@ -14,24 +14,26 @@ Set it in `providers/android.json`:
 {
   "schema_version": 1,
   "package_name": "com.example.game",
-  "renderer": "vulkan"
+  "renderer": "gles"
 }
 ```
 
 | Value | Meaning |
 |---|---|
-| `"gles"` (default) | GLES 3.0. |
+| `"auto"` (default) | Vulkan when the device reports Vulkan ≥ 1.1 (the `android.hardware.vulkan.version` system feature ≥ `0x401000`), else GLES. |
+| `"gles"` | GLES 3.0. The opt-out from Vulkan. |
 | `"vulkan"` | Vulkan. bgfx falls back to GLES if Vulkan init fails. |
-| `"auto"` | Vulkan when the device reports Vulkan ≥ 1.1 (the `android.hardware.vulkan.version` system feature ≥ `0x401000`), else GLES. |
+
+Leaving the key out means `auto`. To stay on GLES, set `"renderer": "gles"`, as in the example above.
 
 Any other value, or a non-string value, fails the build with `renderer must be one of "gles", "vulkan", "auto"`.
 
 The packager stamps the setting into `AndroidManifest.xml`:
 
 - **Always**, `gles` included: `<meta-data android:name="labelle.renderer" android:value="<value>" />` as the first child of `<application>`. This is what the runtime reads.
-- **For `vulkan` and `auto` only:** `<uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />`. It's optional, so Play still offers the app to devices without Vulkan. The required GLES 3.0 feature stays, as the fallback.
+- **For `vulkan` and `auto` (so also with no `renderer` key):** `<uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="false" />`. It's optional, so Play still offers the app to devices without Vulkan. The required GLES 3.0 feature stays, as the fallback.
 
-With `gles`, the manifest is otherwise unchanged. To check a packaged APK (from the generated target directory, e.g. `.labelle/bgfx_android/`):
+With an explicit `gles`, the manifest is otherwise unchanged from the pre-Vulkan one, with no Vulkan feature. To check a packaged APK (from the generated target directory, e.g. `.labelle/bgfx_android/`):
 
 ```sh
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
@@ -51,8 +53,8 @@ This uses the newest installed build-tools revision **that actually contains `aa
 |---|---|---|
 | 1 | `intent` | The `LABELLE_BGFX_RENDERER` launch extra, `vulkan` or `gles` (exact, lower-case). **Debuggable builds only.** In a non-debuggable build it's ignored with an info line. Any other value is warned about and ignored. An empty extra counts as absent. |
 | 2 | `crash-guard` | A previous Vulkan start didn't complete, so start on `gles` (see [Crash guard](#crash-guard)). |
-| 3 | `setting` | The `labelle.renderer` meta-data: `gles` or `vulkan`. Missing or unreadable → `gles`. An invalid value → `gles`, with a warning. |
-| 4 | `auto` | The setting is `auto`: `vulkan` if the device has the Vulkan 1.1 feature, else `gles`. If the query fails, it counts as no Vulkan. |
+| 3 | `setting` | The `labelle.renderer` meta-data: `gles` or `vulkan`. Missing (the key isn't in the manifest's meta-data) → the default, `auto` (rule 4). Unreadable → `gles`. Invalid → `gles`, with a warning, logged with `; invalid meta-data`: an unknown string, a too-long one, or a key that's present but isn't a string (for example `android:value="true"`, a number, or `android:resource`). An invalid meta-data never becomes the default and never enables Vulkan. |
+| 4 | `auto` | The setting is `auto`, or the meta-data is missing (the default; logged with `; default`): `vulkan` if the device has the Vulkan 1.1 feature, else `gles`. If the query fails, it counts as no Vulkan. |
 
 The result is exported with `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles")`. It always replaces any value already in the process environment.
 
@@ -88,15 +90,18 @@ adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash
 
 | Line | Meaning |
 |---|---|
-| `renderer: vulkan (source: setting)` | labelle-android's choice and the rule that made it: `intent`, `crash-guard`, `setting` or `auto`. Logged once per launch. |
+| `renderer: vulkan (source: auto)` | labelle-android's choice and the rule that made it: `intent`, `crash-guard`, `setting` or `auto`. Logged once per launch. A default project's APK stamps `auto`, so this is the usual line on a Vulkan 1.1 device. |
+| `renderer: vulkan (source: auto; default)` | The APK has no `labelle.renderer` meta-data (packaged before the setting existed), so the default `auto` applied. |
+| `renderer: gles (source: setting; invalid meta-data)` | The `labelle.renderer` meta-data is present but invalid; see the warning before it. |
 | `renderer: gles (source: crash-guard; …)` | The crash guard decided; see [Crash guard log lines](#crash-guard-log-lines). |
 | `android: LABELLE_BGFX_RENDERER=vulkan (launch intent extra)` | The override was applied (debuggable build). |
 | `android: LABELLE_BGFX_RENDERER cleared (set by a previous launch's intent)` / `… restored to <v> (set by a previous launch's intent)` | A launch without the extra undid the previous launch's override. |
 | `android: ignoring intent extra LABELLE_BGFX_RENDERER: the apk is not debuggable` | The override was sent to a release build. |
 | `android: ignoring intent extra LABELLE_BGFX_RENDERER='<v>' (expected 'vulkan' or 'gles')` | Bad override value. The next rule decides. |
 | `android: invalid labelle.renderer meta-data '<v>' (expected 'gles', 'vulkan' or 'auto'); using gles` | The APK carries a bad setting. The strict setting parser should make this impossible. |
-| `android: no labelle.renderer meta-data; using gles` | The APK has no setting (built before the setting existed). |
+| `android: no labelle.renderer meta-data; using the default (auto)` | The APK has no setting (built before the setting existed). |
 | `android: labelle.renderer meta-data too long; using gles` | The value doesn't fit the reader's buffer. |
+| `android: labelle.renderer meta-data is not a string (use android:value="gles\|vulkan\|auto"); using gles` | The key is present but holds a boolean, number, resource id or null. Treated as invalid, not as missing. |
 | `android: could not read the labelle.renderer meta-data; using gles (crash-guard marks kept)` | The setting couldn't be read, and the launch uses GLES. The unreadable setting can't itself reset a marker; a marker is still reset if the `versionCode` was read and changed. |
 | `android: could not set LABELLE_BGFX_RENDERER=<v>` | `setenv` failed; bgfx uses its platform default. |
 | `bgfx: renderer requested=Vulkan actual=Vulkan` | bgfx started what was asked for. Logged on every init and resume. |
@@ -110,11 +115,13 @@ If the game crashes, hangs or is killed while starting on Vulkan, the next launc
 
 ### Markers
 
-Two marker files, each holding `<versionCode> <setting>`. The setting is the effective `renderer` setting; an absent or invalid one counts as `gles`.
+Two marker files, each holding `<versionCode> <setting>`. The setting is the effective `renderer` setting; an absent one counts as `auto` (the default), an invalid one (including a non-string value) as `gles`.
+
+The guard covers every Vulkan start, whichever rule chose it: an explicit `vulkan`, an explicit `auto`, the default `auto`, or the intent override. A default `auto` that resolves to Vulkan is marked before init, cleared once stable, and sends the next launch to GLES after a crashed start, exactly like an explicit `vulkan`.
 
 | File | Written | Removed |
 |---|---|---|
-| `.labelle_vulkan_start` | Whenever the resolved renderer is `vulkan` (intent override included), before `setenv`. | When this Vulkan start becomes **stable** (below); or at the next launch in a new process, which then writes `.labelle_vulkan_disabled`. |
+| `.labelle_vulkan_start` | Whenever the resolved renderer is `vulkan` (default `auto` and intent override included), before `setenv`. | When this Vulkan start becomes **stable** (below); or at the next launch in a new process, which then writes `.labelle_vulkan_disabled`. |
 | `.labelle_vulkan_disabled` | At launch, when a `.labelle_vulkan_start` left by a process that's gone has a matching stamp. | When its stamp is proven to have changed (see Reset). |
 
 **Where they live.** The directory is chosen once per process:
@@ -180,8 +187,10 @@ These are logged under the game's `labelle` tag:
 
 The JNI helpers log under the `labelle-android` tag. When a JNI local frame can't be pushed, they log `renderer meta-data: PushLocalFrame failed; exception cleared`, or the same line with `system feature:`, `no-backup dir:` or `version code:` in front, and the query counts as failed.
 
-## Vulkan will become the default
+## Vulkan is the default
 
-The default is `"gles"` for now. Once Vulkan passes the production gate in [labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172) (D8), a minor labelle-android release changes the default to `"vulkan"` (D12). Devices without working Vulkan still start: bgfx's fallback covers a failed init, and the crash guard covers a crashed one. A project that needs GLES should set `"renderer": "gles"` explicitly.
+Since labelle-android 0.5.0 the default is `"auto"` ([labelle-android#30](https://github.com/labelle-toolkit/labelle-android/issues/30), [labelle-bgfx#172](https://github.com/labelle-toolkit/labelle-bgfx/issues/172) D12). This replaces the earlier plan to switch to `"vulkan"` only after the production gate: the owner chose `auto` without waiting for the gate.
+
+Devices without Vulkan 1.1 use GLES (the device check). Devices where Vulkan fails still start: bgfx's fallback covers a failed init, and the crash guard covers a crashed or hung one. To stay on GLES, set `"renderer": "gles"`.
 
 For testing Vulkan on the emulator, see [Android emulator testing](emulator-testing.md).
