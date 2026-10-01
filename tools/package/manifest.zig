@@ -29,8 +29,9 @@ pub const Inputs = struct {
     version_name: []const u8 = "1.0",
     /// Whether `icon.stage` wrote `res/mipmap-*/ic_launcher.png`.
     has_launcher_icon: bool = false,
-    /// `providers/android.json` `renderer` (labelle-bgfx#172 D2/D7).
-    renderer: settings_mod.Renderer = .gles,
+    /// `providers/android.json` `renderer` (labelle-bgfx#172 D2/D7); the
+    /// settings default, `auto`, when the key is absent.
+    renderer: settings_mod.Renderer = settings_mod.default_renderer,
 };
 
 /// The optional Vulkan 1.1 feature (D7). `0x401000` is
@@ -41,7 +42,8 @@ pub const vulkan_feature_line =
 
 /// The `<application>` meta-data name the runtime reads at launch to pick a
 /// renderer (labelle-android#27). It is written for every value, `gles`
-/// included, so the runtime never has to guess.
+/// included, so the runtime never has to guess (an APK without it gets the
+/// runtime's default, `auto`, the same as the settings default).
 pub const renderer_meta_name = "labelle.renderer";
 
 /// The Android `android:screenOrientation` value for `o`.
@@ -236,13 +238,12 @@ fn fpInputs(renderer: settings_mod.Renderer) Inputs {
     };
 }
 
-test "defaults reproduce the CLI's manifest plus only the gles renderer meta-data" {
+test "explicit gles reproduces the CLI's manifest plus only the gles renderer meta-data" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const xml = try generate(a, fpInputs(.gles));
-    // The default is gles (D2), and it is written: the runtime never guesses.
-    try std.testing.expectEqual(settings_mod.Renderer.gles, (Inputs{ .package_name = "", .app_name = "" }).renderer);
+    // gles is written too: the runtime never guesses.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, xml, gles_meta_line));
     // The meta-data is the first child of <application>, not in <activity>.
     const app_open_end = std.mem.indexOfPos(u8, xml, std.mem.indexOf(u8, xml, "<application").?, ">\n").?;
@@ -274,6 +275,50 @@ test "vulkan and auto add the optional Vulkan 1.1 feature and keep GLES 3.0 requ
         const as_gles = try std.mem.replaceOwned(u8, a, no_feature, meta, gles_meta_line);
         try std.testing.expectEqualStrings(gles, as_gles);
     }
+}
+
+/// Settings → manifest inputs the way `package.zig` maps them.
+fn inputsFromSettings(s: settings_mod.Settings) Inputs {
+    var in = fpInputs(s.renderer);
+    in.package_name = s.package_name;
+    return in;
+}
+
+test "default (no renderer key) is auto: the manifest has the optional Vulkan feature and auto meta-data (#30)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: settings_mod.Diagnostic = .{};
+    const s = try settings_mod.parse(a, "{\"schema_version\": 1, \"package_name\": \"com.labelle.flying_platform\"}", &diag);
+    // The mechanism: the key is absent, so the field default applied, and
+    // that default is `auto`, for both the settings and the bare Inputs.
+    try std.testing.expectEqual(settings_mod.Renderer.auto, settings_mod.default_renderer);
+    try std.testing.expectEqual(settings_mod.default_renderer, s.renderer);
+    try std.testing.expectEqual(settings_mod.default_renderer, (Inputs{ .package_name = "", .app_name = "" }).renderer);
+
+    const xml = try generate(a, inputsFromSettings(s));
+    const auto_meta = "        <meta-data android:name=\"" ++ renderer_meta_name ++ "\" android:value=\"auto\" />\n";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, xml, auto_meta));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, xml, vulkan_feature_line));
+    // Exactly the explicit-auto manifest.
+    try std.testing.expectEqualStrings(try generate(a, fpInputs(.auto)), xml);
+    // And, minus those two lines, the CLI's (gles-era) manifest.
+    const no_feature = try std.mem.replaceOwned(u8, a, xml, vulkan_feature_line, "");
+    const stripped = try std.mem.replaceOwned(u8, a, no_feature, auto_meta, "");
+    try std.testing.expectEqualStrings(fp_manifest, stripped);
+}
+
+test "explicit gles in providers/android.json: the old manifest, no Vulkan feature (#30 opt-out)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: settings_mod.Diagnostic = .{};
+    const s = try settings_mod.parse(a, "{\"schema_version\": 1, \"package_name\": \"com.labelle.flying_platform\", \"renderer\": \"gles\"}", &diag);
+    try std.testing.expectEqual(settings_mod.Renderer.gles, s.renderer);
+    const xml = try generate(a, inputsFromSettings(s));
+    try std.testing.expect(std.mem.indexOf(u8, xml, "vulkan") == null);
+    const stripped = try std.mem.replaceOwned(u8, a, xml, gles_meta_line, "");
+    try std.testing.expectEqualStrings(fp_manifest, stripped);
 }
 
 test "omits android:debuggable unless the settings opt in (#737)" {

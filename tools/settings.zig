@@ -69,6 +69,13 @@ pub const Renderer = enum {
     }
 };
 
+/// The renderer when `providers/android.json` has no `renderer` key
+/// (labelle-android#30; labelle-bgfx#172 D12): `auto`, i.e. Vulkan on
+/// devices that report Vulkan >= 1.1, else GLES. The runtime uses the same
+/// default for an APK without the meta-data (`src/renderer.zig`
+/// `default_setting`). `"renderer": "gles"` opts out.
+pub const default_renderer: Renderer = .auto;
+
 /// `"gles", "vulkan", "auto"`, for the rejection message.
 const renderer_values = blk: {
     var text: []const u8 = "";
@@ -91,8 +98,8 @@ pub const Settings = struct {
     abis: []const []const u8 = &.{supported_abi},
     signing: ?Signing = null,
     deploy: ?Deploy = null,
-    /// `gles` until the Vulkan production gate passes (D12 flips it).
-    renderer: Renderer = .gles,
+    /// `default_renderer` (`auto`) when the key is absent.
+    renderer: Renderer = default_renderer,
 };
 
 pub const Error = error{
@@ -301,7 +308,7 @@ test "a minimal file gets today's defaults" {
     try std.testing.expectEqual(@as(usize, 1), s.abis.len);
     try std.testing.expectEqualStrings("arm64-v8a", s.abis[0]);
     try std.testing.expect(s.signing == null and s.deploy == null);
-    try std.testing.expectEqual(Renderer.gles, s.renderer);
+    try std.testing.expectEqual(Renderer.auto, s.renderer);
     // app_name falls back to the project title.
     try std.testing.expectEqualStrings("Project Title", appName(s, "Project Title"));
 }

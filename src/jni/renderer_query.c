@@ -7,7 +7,7 @@
 //     labelle-android#26):
 //       getPackageManager()
 //         .getApplicationInfo(getPackageName(), GET_META_DATA)
-//         .metaData.getString("labelle.renderer")
+//         .metaData  .containsKey / .get("labelle.renderer") instanceof String
 //   * `auto`'s device check:
 //       getPackageManager().hasSystemFeature("android.hardware.vulkan.version",
 //                                            0x401000)   // Vulkan 1.1
@@ -46,12 +46,21 @@ static jobject package_manager(JNIEnv *env, jobject activity) {
 }
 
 // Copy the `labelle.renderer` meta-data string into `buf` (NUL-terminated).
-// Returns its length (>= 0), -1 when the key is absent (or not a string),
-// -2 on any JNI failure, -3 when the value does not fit in `buf_cap`.
-// -1 (absent) and -2 (failure) MUST stay distinct: `renderer.MetaRead` maps
-// -1 to the default `gles` but -2 to "unknown", and the crash guard keeps its
-// marks on unknown rather than reading a transient failure as a setting
-// change (labelle-android#33 review).
+// The return-code contract (mirrored by `renderer.MetaRead.fromCode`, whose
+// host tests pin the Zig side; this TU only builds for Android, so it has no
+// host test of its own):
+//   >= 0  the value is a String; its length (the bytes in `buf`)
+//   -1    ABSENT: no meta-data bundle at all, or `containsKey` is false.
+//         The ONLY outcome that means the default `auto`.
+//   -2    READ FAILURE: any JNI failure or pending exception → `gles`, and
+//         the crash guard keeps its marks (an unknown setting must not read
+//         as a setting change; labelle-android#33 review)
+//   -3    TOO LONG: a String that does not fit in `buf_cap` → `gles`
+//   -4    WRONG TYPE: the key is present but its value is not a String
+//         (`android:value="true"` / `"1"` arrive as Boolean / Integer,
+//         `android:resource` as an Integer id) or is null → `gles`.
+//         MUST stay distinct from -1, or a malformed meta-data would become
+//         the default `auto` and enable Vulkan (labelle-android#39 review).
 // Never leaves a Java exception pending and never leaks a local ref.
 // Callable from any thread (attached or not).
 int labelle_android_read_renderer_meta(const void *activity_ptr, char *buf, size_t buf_cap) {
@@ -86,25 +95,39 @@ int labelle_android_read_renderer_meta(const void *activity_ptr, char *buf, size
                     result = -1;
                 } else {
                     jclass bundle_cls = (*env)->GetObjectClass(env, bundle);
-                    jmethodID get_string = bundle_cls ? (*env)->GetMethodID(env, bundle_cls, "getString", "(Ljava/lang/String;)Ljava/lang/String;") : NULL;
-                    jstring jkey = (get_string && !(*env)->ExceptionCheck(env)) ? (*env)->NewStringUTF(env, "labelle.renderer") : NULL;
-                    jstring jval = (jkey && !(*env)->ExceptionCheck(env)) ? (jstring)(*env)->CallObjectMethod(env, bundle, get_string, jkey) : NULL;
+                    // `containsKey` separates "absent" from "present but not a
+                    // String"; `get` + `instanceof String` then reads it
+                    // (`getString` returns null for both, so it can't).
+                    jmethodID contains_key = bundle_cls ? (*env)->GetMethodID(env, bundle_cls, "containsKey", "(Ljava/lang/String;)Z") : NULL;
+                    jmethodID get_obj = (contains_key && !(*env)->ExceptionCheck(env)) ? (*env)->GetMethodID(env, bundle_cls, "get", "(Ljava/lang/String;)Ljava/lang/Object;") : NULL;
+                    jclass string_cls = (get_obj && !(*env)->ExceptionCheck(env)) ? (*env)->FindClass(env, "java/lang/String") : NULL;
+                    jstring jkey = (string_cls && !(*env)->ExceptionCheck(env)) ? (*env)->NewStringUTF(env, "labelle.renderer") : NULL;
                     if (jkey != NULL && !(*env)->ExceptionCheck(env)) {
-                        if (jval == NULL) {
-                            // Missing key, or a non-string value.
+                        jboolean present = (*env)->CallBooleanMethod(env, bundle, contains_key, jkey);
+                        if ((*env)->ExceptionCheck(env)) {
+                            // read failure; cleared below
+                        } else if (!present) {
                             result = -1;
                         } else {
-                            // The accepted values are ASCII, so modified
-                            // UTF-8 is byte-identical for every valid one.
-                            jsize chars = (*env)->GetStringLength(env, jval);
-                            jsize bytes = (*env)->GetStringUTFLength(env, jval);
-                            if (bytes < 0 || (size_t)bytes + 1 > buf_cap) {
-                                result = -3;
+                            jobject jval = (*env)->CallObjectMethod(env, bundle, get_obj, jkey);
+                            if ((*env)->ExceptionCheck(env)) {
+                                // read failure; cleared below
+                            } else if (jval == NULL || !(*env)->IsInstanceOf(env, jval, string_cls)) {
+                                // Present, but null or not a String.
+                                result = -4;
                             } else {
-                                (*env)->GetStringUTFRegion(env, jval, 0, chars, buf);
-                                if (!(*env)->ExceptionCheck(env)) {
-                                    buf[bytes] = 0;
-                                    result = (int)bytes;
+                                // The accepted values are ASCII, so modified
+                                // UTF-8 is byte-identical for every valid one.
+                                jsize chars = (*env)->GetStringLength(env, (jstring)jval);
+                                jsize bytes = (*env)->GetStringUTFLength(env, (jstring)jval);
+                                if (bytes < 0 || (size_t)bytes + 1 > buf_cap) {
+                                    result = -3;
+                                } else {
+                                    (*env)->GetStringUTFRegion(env, (jstring)jval, 0, chars, buf);
+                                    if (!(*env)->ExceptionCheck(env)) {
+                                        buf[bytes] = 0;
+                                        result = (int)bytes;
+                                    }
                                 }
                             }
                         }
