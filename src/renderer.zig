@@ -15,10 +15,13 @@
 //!      new version or a changed setting tries Vulkan again.
 //!   3. `setting`: the provider setting, stamped into the manifest as
 //!      `<meta-data android:name="labelle.renderer" android:value="..."/>`
-//!      (labelle-android#26). Missing or unreadable → `gles`; an invalid
-//!      value → `gles` with a warning.
-//!   4. `auto` (the setting's third value): Vulkan when the device reports
-//!      `android.hardware.vulkan.version` >= 1.1 (0x401000), else `gles`.
+//!      (labelle-android#26). Missing → the default, `auto` (rule 4, source
+//!      `auto` with `; default`; labelle-android#30). Unreadable (a JNI
+//!      error) or too long → `gles`; an invalid value → `gles` with a
+//!      warning.
+//!   4. `auto` (the setting's third value, and the default since 0.5.0):
+//!      Vulkan when the device reports `android.hardware.vulkan.version`
+//!      >= 1.1 (0x401000), else `gles`.
 //!
 //! Then, when the result is `vulkan`, `crash_guard.beginVulkanStart` (the
 //! start mark + the stable thread: 120 frames and 10 s). If the start mark
@@ -27,7 +30,9 @@
 //! `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles", 1)` and one log line:
 //! `renderer: <value> (source: intent|crash-guard|setting|auto)`, with
 //! `; previous Vulkan start did not complete` (or `; could not record the
-//! Vulkan start`) after `crash-guard`.
+//! Vulkan start`) after `crash-guard`, and `; default` after an `auto` that
+//! came from a missing meta-data. A default `auto` that picks Vulkan goes
+//! through the crash guard exactly like an explicit `vulkan` or `auto`.
 //!
 //! ## Where it runs
 //!
@@ -73,13 +78,16 @@ pub const Source = enum {
     crash_guard_unrecorded,
     setting,
     auto,
+    /// `auto` because the meta-data is missing: the default setting
+    /// (labelle-android#30). Logged as `auto` with `; default`.
+    auto_default,
 
     pub fn label(self: Source) []const u8 {
         return switch (self) {
             .intent => "intent",
             .crash_guard, .crash_guard_unrecorded => "crash-guard",
             .setting => "setting",
-            .auto => "auto",
+            .auto, .auto_default => "auto",
         };
     }
 
@@ -88,6 +96,7 @@ pub const Source = enum {
         return switch (self) {
             .crash_guard => "; previous Vulkan start did not complete",
             .crash_guard_unrecorded => "; could not record the Vulkan start",
+            .auto_default => "; default",
             else => "",
         };
     }
@@ -111,6 +120,12 @@ pub fn afterStart(d: Decision, recorded: bool) Decision {
 /// The provider setting's values.
 pub const Setting = enum { gles, vulkan, auto };
 
+/// What a missing `labelle.renderer` meta-data means (labelle-android#30):
+/// the same default as a `providers/android.json` without a `renderer` key,
+/// so an APK packaged without the meta-data behaves like a new default one.
+/// `gles` is the explicit opt-out.
+pub const default_setting: Setting = .auto;
+
 /// The three (four) outcomes of the `labelle.renderer` meta-data read. The
 /// JNI helper's return code carries them across the C boundary:
 /// `>= 0` = value length, `-1` = absent, `-3` = too long, `-2` (or any
@@ -118,7 +133,8 @@ pub const Setting = enum { gles, vulkan, auto };
 pub const MetaRead = union(enum) {
     /// Read successfully (may still be an invalid value; `decide` warns).
     value: []const u8,
-    /// Read successfully; the key is not there → the default, `gles`.
+    /// Read successfully; the key is not there → the default
+    /// (`default_setting`, `auto`).
     absent,
     /// Read successfully; the value does not fit the buffer (so it is not a
     /// valid setting) → `gles`, like any invalid value.
@@ -135,31 +151,25 @@ pub const MetaRead = union(enum) {
         };
     }
 
-    /// What the setting rule sees: the value, or null (→ `gles`) otherwise.
-    /// For the RENDERER, a read error still means gles, as before.
-    pub fn metaData(self: MetaRead) ?[]const u8 {
-        return switch (self) {
-            .value => |v| v,
-            else => null,
-        };
-    }
-
     /// The setting the crash guard compares/records: the effective setting
-    /// for every SUCCESSFUL read (absent/invalid/too long → `gles`), and null
-    /// for a read error, which the guard treats as unknown (marks kept).
+    /// for every SUCCESSFUL read (absent → the default `auto`; invalid/too
+    /// long → `gles`), and null for a read error, which the guard treats as
+    /// unknown (marks kept).
     pub fn guardSetting(self: MetaRead) ?[]const u8 {
         return switch (self) {
             .value => |v| settingLabel(v),
-            .absent, .too_long => "gles",
+            .absent => settingLabel(null),
+            .too_long => "gles",
             .read_error => null,
         };
     }
 };
 
 /// The effective setting the crash guard's stamp records: the parsed
-/// meta-data, and `gles` for missing or invalid (which is what they mean).
+/// meta-data, `default_setting` (`auto`) for missing, and `gles` for
+/// invalid (which is what they mean).
 pub fn settingLabel(meta: ?[]const u8) []const u8 {
-    const raw = meta orelse return "gles";
+    const raw = meta orelse return @tagName(default_setting);
     return @tagName(parseSetting(raw) orelse .gles);
 }
 
@@ -186,9 +196,9 @@ pub fn parseSetting(value: []const u8) ?Setting {
 ///   * `intentExtra() ?[]const u8` — the launch extra (null = absent)
 ///   * `debuggable() bool` — asked only when the extra is present
 ///   * `vulkanDisabled() bool` — the D11 crash guard
-///   * `metaData() ?[]const u8` — the `labelle.renderer` meta-data (null =
-///     missing or unreadable)
-///   * `hasVulkan() bool` — asked only for `auto`
+///   * `metaData() MetaRead` — the `labelle.renderer` meta-data read
+///     (absent → `default_setting`; read error or too long → `gles`)
+///   * `hasVulkan() bool` — asked only for `auto` (explicit or default)
 pub fn decide(q: anytype) Decision {
     if (q.intentExtra()) |v| {
         // An empty extra counts as absent, as it does in `intent_env`.
@@ -205,17 +215,23 @@ pub fn decide(q: anytype) Decision {
         }
     }
     if (q.vulkanDisabled()) return .{ .renderer = .gles, .source = .crash_guard };
-    const setting: Setting = if (q.metaData()) |raw|
-        parseSetting(raw) orelse blk: {
+    const meta: MetaRead = q.metaData();
+    const setting: Setting = switch (meta) {
+        .value => |raw| parseSetting(raw) orelse blk: {
             std.log.warn("android: invalid {s} meta-data '{s}' (expected 'gles', 'vulkan' or 'auto'); using gles", .{ meta_data_name, raw });
             break :blk .gles;
-        }
-    else
-        .gles;
+        },
+        .absent => default_setting,
+        // Not a usable setting: stay on the safe renderer.
+        .too_long, .read_error => .gles,
+    };
     return switch (setting) {
         .gles => .{ .renderer = .gles, .source = .setting },
         .vulkan => .{ .renderer = .vulkan, .source = .setting },
-        .auto => .{ .renderer = if (q.hasVulkan()) .vulkan else .gles, .source = .auto },
+        .auto => .{
+            .renderer = if (q.hasVulkan()) .vulkan else .gles,
+            .source = if (meta == .absent) .auto_default else .auto,
+        },
     };
 }
 
@@ -244,8 +260,8 @@ const JniQuery = struct {
     pub fn vulkanDisabled(self: *JniQuery) bool {
         return crash_guard.vulkanDisabled(self.activity, self.metaRead().guardSetting());
     }
-    pub fn metaData(self: *JniQuery) ?[]const u8 {
-        return self.metaRead().metaData();
+    pub fn metaData(self: *JniQuery) MetaRead {
+        return self.metaRead();
     }
     fn metaRead(self: *JniQuery) MetaRead {
         if (self.meta) |m| return m;
@@ -253,7 +269,7 @@ const JniQuery = struct {
         const m = MetaRead.fromCode(n, &self.meta_buf);
         switch (m) {
             .value => {},
-            .absent => std.log.info("android: no {s} meta-data; using gles", .{meta_data_name}),
+            .absent => std.log.info("android: no {s} meta-data; using the default ({s})", .{ meta_data_name, @tagName(default_setting) }),
             .too_long => std.log.warn("android: {s} meta-data too long; using gles", .{meta_data_name}),
             .read_error => std.log.warn("android: could not read the {s} meta-data; using gles (crash-guard marks kept)", .{meta_data_name}),
         }
@@ -295,7 +311,10 @@ const Fake = struct {
     extra: ?[]const u8 = null,
     is_debuggable: bool = false,
     disabled: bool = false,
+    /// The meta-data value; null = the key is absent.
     meta: ?[]const u8 = null,
+    /// Overrides `meta` with another read outcome (too long, read error).
+    read: ?MetaRead = null,
     vulkan: bool = false,
 
     debuggable_calls: usize = 0,
@@ -314,9 +333,10 @@ const Fake = struct {
         self.guard_calls += 1;
         return self.disabled;
     }
-    pub fn metaData(self: *Fake) ?[]const u8 {
+    pub fn metaData(self: *Fake) MetaRead {
         self.meta_calls += 1;
-        return self.meta;
+        if (self.read) |r| return r;
+        return if (self.meta) |v| .{ .value = v } else .absent;
     }
     pub fn hasVulkan(self: *Fake) bool {
         self.vulkan_calls += 1;
@@ -385,11 +405,50 @@ test "the setting applies when there is no override and the guard is clear" {
     try expectDecision(.{ .renderer = .gles, .source = .setting }, decide(&g));
 }
 
-test "missing meta-data means gles" {
+test "the default setting is auto (labelle-android#30)" {
+    try testing.expectEqual(Setting.auto, default_setting);
+    try testing.expectEqualStrings("auto", settingLabel(null));
+}
+
+test "missing meta-data means the default auto: Vulkan on a Vulkan 1.1 device" {
     var f: Fake = .{ .meta = null, .vulkan = true };
-    try expectDecision(.{ .renderer = .gles, .source = .setting }, decide(&f));
+    // The default-auto path ran (not `setting`, not an explicit `auto`).
+    try expectDecision(.{ .renderer = .vulkan, .source = .auto_default }, decide(&f));
+    try testing.expectEqual(@as(usize, 1), f.guard_calls);
     try testing.expectEqual(@as(usize, 1), f.meta_calls);
+    try testing.expectEqual(@as(usize, 1), f.vulkan_calls); // the device check ran
+}
+
+test "missing meta-data on a device without Vulkan 1.1: gles via the default auto's device check" {
+    var f: Fake = .{ .meta = null, .vulkan = false };
+    try expectDecision(.{ .renderer = .gles, .source = .auto_default }, decide(&f));
+    try testing.expectEqual(@as(usize, 1), f.vulkan_calls);
+}
+
+test "explicit gles is the opt-out: no device check, even on a Vulkan device" {
+    var f: Fake = .{ .meta = "gles", .vulkan = true };
+    try expectDecision(.{ .renderer = .gles, .source = .setting }, decide(&f));
     try testing.expectEqual(@as(usize, 0), f.vulkan_calls);
+}
+
+test "an unreadable or too-long meta-data stays gles (not the default)" {
+    inline for (.{ MetaRead.read_error, MetaRead.too_long }) |r| {
+        var f: Fake = .{ .read = r, .vulkan = true };
+        try expectDecision(.{ .renderer = .gles, .source = .setting }, decide(&f));
+        try testing.expectEqual(@as(usize, 0), f.vulkan_calls);
+    }
+}
+
+test "the crash guard still beats the default auto; the intent still beats both" {
+    var f: Fake = .{ .meta = null, .disabled = true, .vulkan = true };
+    try expectDecision(.{ .renderer = .gles, .source = .crash_guard }, decide(&f));
+    try testing.expectEqual(@as(usize, 0), f.meta_calls);
+    try testing.expectEqual(@as(usize, 0), f.vulkan_calls);
+
+    var g: Fake = .{ .extra = "gles", .is_debuggable = true, .meta = null, .vulkan = true };
+    try expectDecision(.{ .renderer = .gles, .source = .intent }, decide(&g));
+    try testing.expectEqual(@as(usize, 0), g.guard_calls);
+    try testing.expectEqual(@as(usize, 0), g.meta_calls);
 }
 
 test "an invalid meta-data value means gles" {
@@ -416,6 +475,9 @@ test "env values and log labels" {
     try testing.expectEqualStrings("intent", Source.intent.label());
     try testing.expectEqualStrings("setting", Source.setting.label());
     try testing.expectEqualStrings("auto", Source.auto.label());
+    try testing.expectEqualStrings("auto", Source.auto_default.label());
+    try testing.expectEqualStrings("; default", Source.auto_default.detail());
+    try testing.expectEqualStrings("", Source.auto.detail());
     try testing.expectEqualStrings("; previous Vulkan start did not complete", Source.crash_guard.detail());
     try testing.expectEqualStrings("crash-guard", Source.crash_guard_unrecorded.label());
     try testing.expectEqualStrings("; could not record the Vulkan start", Source.crash_guard_unrecorded.detail());
@@ -426,14 +488,12 @@ test "MetaRead: the JNI return code's outcomes, and what each side sees" {
     const buf = "vulkanXXXX";
     const v = MetaRead.fromCode(6, buf);
     try testing.expectEqualStrings("vulkan", v.value);
-    try testing.expectEqualStrings("vulkan", v.metaData().?);
     try testing.expectEqualStrings("vulkan", v.guardSetting().?);
 
-    // Absent: a successful read → default gles for both sides.
+    // Absent: a successful read → the default auto for both sides.
     const a = MetaRead.fromCode(-1, buf);
     try testing.expect(a == .absent);
-    try testing.expect(a.metaData() == null);
-    try testing.expectEqualStrings("gles", a.guardSetting().?);
+    try testing.expectEqualStrings("auto", a.guardSetting().?);
 
     // Too long: an (invalid) value → gles.
     const t = MetaRead.fromCode(-3, buf);
@@ -444,7 +504,6 @@ test "MetaRead: the JNI return code's outcomes, and what each side sees" {
     inline for (.{ -2, -7 }) |code| {
         const e = MetaRead.fromCode(code, buf);
         try testing.expect(e == .read_error);
-        try testing.expect(e.metaData() == null);
         try testing.expect(e.guardSetting() == null);
     }
 
@@ -456,7 +515,7 @@ test "settingLabel: the effective setting for the crash guard's stamp" {
     try testing.expectEqualStrings("vulkan", settingLabel("vulkan"));
     try testing.expectEqualStrings("auto", settingLabel("auto"));
     try testing.expectEqualStrings("gles", settingLabel("gles"));
-    try testing.expectEqualStrings("gles", settingLabel(null));
+    try testing.expectEqualStrings("auto", settingLabel(null)); // missing = default
     try testing.expectEqualStrings("gles", settingLabel("metal"));
 }
 

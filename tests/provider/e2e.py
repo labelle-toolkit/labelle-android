@@ -375,6 +375,11 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     assert 'package="com.labelle.fixture"' in manifest and 'android:versionCode="1"' in manifest, manifest
     assert 'android:versionName="1.0"' in manifest and 'android:label="Fixture Game"' in manifest, manifest
     assert 'android:icon="@mipmap/ic_launcher"' in manifest and 'debuggable' not in manifest, manifest
+    # No `renderer` key: the default `auto` (labelle-android#30) is stamped,
+    # with the optional Vulkan 1.1 feature (D7).
+    assert '<meta-data android:name="labelle.renderer" android:value="auto" />' in manifest, manifest
+    assert ('<uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" '
+            'android:required="false" />') in manifest, manifest
     record = json.loads((apk_dir / 'package.json').read_text())
     assert record['optimize'] == 'Debug' and record['version_code'] == 1, record
     assert record['package_name'] == 'com.labelle.fixture', record
