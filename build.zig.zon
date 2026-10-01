@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0x1ba3596142e04ab0,
     .name = .labelle_android,
-    .version = "0.5.0",
+    .version = "0.6.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
