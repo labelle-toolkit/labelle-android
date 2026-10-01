@@ -53,7 +53,7 @@ This uses the newest installed build-tools revision **that actually contains `aa
 |---|---|---|
 | 1 | `intent` | The `LABELLE_BGFX_RENDERER` launch extra, `vulkan` or `gles` (exact, lower-case). **Debuggable builds only.** In a non-debuggable build it's ignored with an info line. Any other value is warned about and ignored. An empty extra counts as absent. |
 | 2 | `crash-guard` | A previous Vulkan start didn't complete, so start on `gles` (see [Crash guard](#crash-guard)). |
-| 3 | `setting` | The `labelle.renderer` meta-data: `gles` or `vulkan`. Missing → the default, `auto` (rule 4). Unreadable or too long → `gles`. An invalid value → `gles`, with a warning. |
+| 3 | `setting` | The `labelle.renderer` meta-data: `gles` or `vulkan`. Missing (the key isn't in the manifest's meta-data) → the default, `auto` (rule 4). Unreadable → `gles`. Invalid → `gles`, with a warning, logged with `; invalid meta-data`: an unknown string, a too-long one, or a key that's present but isn't a string (for example `android:value="true"`, a number, or `android:resource`). An invalid meta-data never becomes the default and never enables Vulkan. |
 | 4 | `auto` | The setting is `auto`, or the meta-data is missing (the default; logged with `; default`): `vulkan` if the device has the Vulkan 1.1 feature, else `gles`. If the query fails, it counts as no Vulkan. |
 
 The result is exported with `setenv("LABELLE_BGFX_RENDERER", "vulkan"|"gles")`. It always replaces any value already in the process environment.
@@ -92,6 +92,7 @@ adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash
 |---|---|
 | `renderer: vulkan (source: auto)` | labelle-android's choice and the rule that made it: `intent`, `crash-guard`, `setting` or `auto`. Logged once per launch. A default project's APK stamps `auto`, so this is the usual line on a Vulkan 1.1 device. |
 | `renderer: vulkan (source: auto; default)` | The APK has no `labelle.renderer` meta-data (packaged before the setting existed), so the default `auto` applied. |
+| `renderer: gles (source: setting; invalid meta-data)` | The `labelle.renderer` meta-data is present but invalid; see the warning before it. |
 | `renderer: gles (source: crash-guard; …)` | The crash guard decided; see [Crash guard log lines](#crash-guard-log-lines). |
 | `android: LABELLE_BGFX_RENDERER=vulkan (launch intent extra)` | The override was applied (debuggable build). |
 | `android: LABELLE_BGFX_RENDERER cleared (set by a previous launch's intent)` / `… restored to <v> (set by a previous launch's intent)` | A launch without the extra undid the previous launch's override. |
@@ -100,6 +101,7 @@ adb logcat -d -s labelle | grep -E 'renderer: (gles|vulkan)|bgfx: renderer|crash
 | `android: invalid labelle.renderer meta-data '<v>' (expected 'gles', 'vulkan' or 'auto'); using gles` | The APK carries a bad setting. The strict setting parser should make this impossible. |
 | `android: no labelle.renderer meta-data; using the default (auto)` | The APK has no setting (built before the setting existed). |
 | `android: labelle.renderer meta-data too long; using gles` | The value doesn't fit the reader's buffer. |
+| `android: labelle.renderer meta-data is not a string (use android:value="gles\|vulkan\|auto"); using gles` | The key is present but holds a boolean, number, resource id or null. Treated as invalid, not as missing. |
 | `android: could not read the labelle.renderer meta-data; using gles (crash-guard marks kept)` | The setting couldn't be read, and the launch uses GLES. The unreadable setting can't itself reset a marker; a marker is still reset if the `versionCode` was read and changed. |
 | `android: could not set LABELLE_BGFX_RENDERER=<v>` | `setenv` failed; bgfx uses its platform default. |
 | `bgfx: renderer requested=Vulkan actual=Vulkan` | bgfx started what was asked for. Logged on every init and resume. |
@@ -113,7 +115,7 @@ If the game crashes, hangs or is killed while starting on Vulkan, the next launc
 
 ### Markers
 
-Two marker files, each holding `<versionCode> <setting>`. The setting is the effective `renderer` setting; an absent one counts as `auto` (the default), an invalid one as `gles`.
+Two marker files, each holding `<versionCode> <setting>`. The setting is the effective `renderer` setting; an absent one counts as `auto` (the default), an invalid one (including a non-string value) as `gles`.
 
 The guard covers every Vulkan start, whichever rule chose it: an explicit `vulkan`, an explicit `auto`, the default `auto`, or the intent override. A default `auto` that resolves to Vulkan is marked before init, cleared once stable, and sends the next launch to GLES after a crashed start, exactly like an explicit `vulkan`.
 
