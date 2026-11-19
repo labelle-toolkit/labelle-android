@@ -29,9 +29,8 @@ import android.view.inputmethod.InputMethodManager;
  */
 public final class LabelleActivity extends NativeActivity {
     /**
-     * In the window only while the keyboard is up: any view in the hierarchy
-     * besides NativeActivity's own made the whole game blink on the P42
-     * (Android 16), so play runs on the stock window.
+     * In the window only while the keyboard is up, so play runs on the stock
+     * NativeActivity window.
      */
     private TextField field;
 
