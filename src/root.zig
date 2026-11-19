@@ -23,6 +23,8 @@
 //!     end the process (moca-tecnologia/flying-platform-labelle#979).
 //!   * `assets` — open a bundled APK asset as a file descriptor for the fd
 //!     decoders above (labelle-bgfx#168).
+//!   * `text_input` — show/hide the on-screen keyboard and read what it
+//!     types, through `LabelleActivity` (`java/`).
 //!
 //! Every file is reached from here by relative import inside this module.
 //! Consumers `@import("labelle_android")` and pass the running
@@ -58,6 +60,7 @@ pub const renderer = @import("renderer.zig");
 pub const crash_guard = @import("crash_guard.zig");
 pub const activity = @import("activity.zig");
 pub const assets = @import("assets.zig");
+pub const text_input = @import("text_input.zig");
 
 test {
     // Explicit refs: a lazily-referenced file's tests are otherwise never
@@ -73,4 +76,5 @@ test {
     _ = crash_guard;
     _ = activity;
     _ = assets;
+    _ = text_input;
 }

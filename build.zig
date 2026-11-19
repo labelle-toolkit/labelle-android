@@ -139,6 +139,7 @@ pub fn build(b: *std.Build) void {
                 "src/jni/renderer_query.c",
                 "src/jni/activity_finish.c",
                 "src/jni/asset_fd.c",
+                "src/jni/text_input.c",
             },
             .flags = &.{ "-std=c11", "-Wall" },
         });
@@ -211,6 +212,9 @@ pub fn build(b: *std.Build) void {
     provider_module.addIncludePath(b.path("tools/vendor"));
     // `tools/main.zig`'s test checks its routing table against the manifest.
     provider_module.addAnonymousImport("plugin.labelle", .{ .root_source_file = b.path("plugin.labelle") });
+    // The prebuilt `LabelleActivity` dex the packager writes into every APK
+    // (`java/build-dex.sh` regenerates it), so packaging needs no JDK compiler.
+    provider_module.addAnonymousImport("classes.dex", .{ .root_source_file = b.path("java/classes.dex") });
     const provider = b.addExecutable(.{ .name = "labelle-android", .root_module = provider_module });
     b.step("install-provider", "Install the labelle-cli provider tool (bin/labelle-android)")
         .dependOn(&b.addInstallArtifact(provider, .{}).step);

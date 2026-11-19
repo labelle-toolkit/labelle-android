@@ -12,7 +12,8 @@
 //!   generated `main.zig` embeds, and the PNG of an embedded ASTC (`slim.zig`);
 //! - `aapt package -f -M -I -F [-A assets] [-S res -0 arsc]`, then
 //!   `jar --update --no-compress --file <apk> -C <staging> lib` (so `lib/` is
-//!   stored), `zipalign -f 4`, and `apksigner sign` (`signing.zig`).
+//!   stored), `jar --update` of the embedded `classes.dex` (`java/`),
+//!   `zipalign -f 4`, and `apksigner sign` (`signing.zig`).
 //!
 //! What changed: the inputs (settings + project identity instead of the
 //! CLI's `AndroidConfig`), the version stamp (a parameter), and where things
@@ -29,6 +30,9 @@ const slim = @import("slim.zig");
 const icon = @import("icon.zig");
 const manifest = @import("manifest.zig");
 const signing = @import("signing.zig");
+
+/// The compiled `java/labelle/android/LabelleActivity.java` (`java/build-dex.sh`).
+pub const classes_dex = @embedFile("classes.dex");
 
 /// The ABI directory v1 packages (settings accept only this one).
 pub const abi_dir = settings_mod.supported_abi;
@@ -219,6 +223,16 @@ pub fn package(
     // adds): API 30+ requires uncompressed `.so`s. `jar` ships with every
     // JDK, unlike `zip` on Windows.
     try runTool(a, io, "jar (add native libs)", &.{ tools.jar, "--update", "--no-compress", "--file", unsigned_apk, "-C", out.staging, "lib" });
+    // `classes.dex`: the `LabelleActivity` the manifest launches (the stock
+    // NativeActivity plus a working on-screen keyboard, `java/`). Staged in a
+    // directory of its own so `jar` adds it at the APK root.
+    {
+        const dex_dir = try std.fs.path.join(a, &.{ out.staging, "dex" });
+        try cwd.createDirPath(io, dex_dir);
+        const dex_path = try std.fs.path.join(a, &.{ dex_dir, "classes.dex" });
+        try cwd.writeFile(io, .{ .sub_path = dex_path, .data = classes_dex });
+        try runTool(a, io, "jar (add classes.dex)", &.{ tools.jar, "--update", "--file", unsigned_apk, "-C", dex_dir, "classes.dex" });
+    }
     try runTool(a, io, "zipalign", &.{ tools.zipalign, "-f", "4", unsigned_apk, aligned_apk });
 
     const project_signing = in.settings.signing;

@@ -8,9 +8,12 @@
 //! `"1.0"`; `labelle bundle --build-number=N` now stamps `N`). With the
 //! defaults (`1`, `"1.0"`) the output is identical to the CLI's.
 //!
-//! The manifest is backend-neutral: `android.app.NativeActivity` loading
-//! `libgame.so` (`android.app.lib_name = game`). Only the bgfx backend is
-//! verified through this packager so far.
+//! The manifest is backend-neutral: `labelle.android.LabelleActivity` (the
+//! stock `android.app.NativeActivity` plus a working on-screen keyboard,
+//! `java/`, shipped as the APK's `classes.dex`) loading `libgame.so`
+//! (`android.app.lib_name = game`). `adjustNothing`: the keyboard covers the
+//! game instead of resizing its surface. Only the bgfx backend is verified
+//! through this packager so far.
 const std = @import("std");
 const settings_mod = @import("../settings.zig");
 const icon = @import("icon.zig");
@@ -79,8 +82,8 @@ pub fn generate(allocator: std.mem.Allocator, in: Inputs) ![]u8 {
 
     // Launcher icon (cli#340): the mipmaps staged by `icon.zig` are the only
     // compiled resources in the APK, which is why the packager hands aapt a
-    // `-S <staging>/res`. `android:hasCode="false"` is unaffected —
-    // resources are not code.
+    // `-S <staging>/res`. Resources are not code: `android:hasCode` is
+    // about the `classes.dex` the packager adds.
     const icon_attr: []const u8 = if (in.has_launcher_icon)
         " android:icon=\"" ++ icon.icon_resource_ref ++ "\""
     else
@@ -112,10 +115,11 @@ pub fn generate(allocator: std.mem.Allocator, in: Inputs) ![]u8 {
         \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />{s}
         \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
         \\
-        \\    <application android:hasCode="false" android:label="{s}"{s}{s}>
+        \\    <application android:hasCode="true" android:label="{s}"{s}{s}>
         \\        <meta-data android:name="labelle.renderer" android:value="{s}" />
-        \\        <activity android:name="android.app.NativeActivity"
+        \\        <activity android:name="labelle.android.LabelleActivity"
         \\            android:configChanges="orientation|keyboardHidden|screenSize"
+        \\            android:windowSoftInputMode="adjustNothing|stateHidden"
         \\            android:screenOrientation="{s}"{s}
         \\            android:exported="true">
         \\            <meta-data android:name="android.app.lib_name" android:value="game" />
@@ -208,9 +212,10 @@ const fp_manifest =
     \\    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     \\    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
     \\
-    \\    <application android:hasCode="false" android:label="Flying Platform" android:icon="@mipmap/ic_launcher">
-    \\        <activity android:name="android.app.NativeActivity"
+    \\    <application android:hasCode="true" android:label="Flying Platform" android:icon="@mipmap/ic_launcher">
+    \\        <activity android:name="labelle.android.LabelleActivity"
     \\            android:configChanges="orientation|keyboardHidden|screenSize"
+    \\            android:windowSoftInputMode="adjustNothing|stateHidden"
     \\            android:screenOrientation="landscape"
     \\            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
     \\            android:exported="true">
@@ -330,7 +335,7 @@ test "omits android:debuggable unless the settings opt in (#737)" {
     const debuggable = try generate(a, with("debuggable", true));
     // On <application>, not on <activity>: `wrap.<package>` is honoured per
     // APPLICATION, and `run-as` keys off the application flag too.
-    try std.testing.expect(std.mem.indexOf(u8, debuggable, "<application android:hasCode=\"false\" android:label=\"Test\" android:debuggable=\"true\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debuggable, "<application android:hasCode=\"true\" android:label=\"Test\" android:debuggable=\"true\">") != null);
     // The only difference is that one attribute — nothing else drifts.
     const stripped = try std.mem.replaceOwned(u8, a, debuggable, " android:debuggable=\"true\"", "");
     try std.testing.expectEqualStrings(release, stripped);
@@ -378,7 +383,7 @@ test "omits android:icon when no icon was staged" {
     defer arena.deinit();
     const xml = try generate(arena.allocator(), base);
     try std.testing.expect(std.mem.indexOf(u8, xml, "android:icon=") == null);
-    try std.testing.expect(std.mem.indexOf(u8, xml, "android:hasCode=\"false\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "android:hasCode=\"true\"") != null);
 }
 
 test "maps every Orientation to its android:screenOrientation value" {
