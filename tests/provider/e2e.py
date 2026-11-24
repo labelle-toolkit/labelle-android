@@ -330,6 +330,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
         # Stored lib/ (the jar --no-compress pass), resources.arsc from -S.
         assert files['lib/arm64-v8a/libgame.so'][0] == zipfile.ZIP_STORED, files.keys()
         assert 'resources.arsc' in files, files.keys()
+        # The LabelleActivity the manifest launches (the second jar pass).
+        assert 'classes.dex' in files, files.keys()
         for density in ('mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi'):
             assert files[f'res/mipmap-{density}/ic_launcher.png'][1].startswith(b'\x89PNG'), density
         # Staged: videos (even under raw/) and unreferenced files. Left out:
@@ -350,10 +352,11 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     # the provider's `keytool` does, on this first signed build.
     assert calls(provider=False) == [], calls(provider=False)
     assert not (target / 'game.apk').exists(), list(target.iterdir())
-    assert [e['tool'] for e in calls()] == ['aapt', 'jar', 'zipalign', 'keytool', 'apksigner'], calls()
+    assert [e['tool'] for e in calls()] == ['aapt', 'jar', 'jar', 'zipalign', 'keytool', 'apksigner'], calls()
+    jars = [e['argv'] for e in calls() if e['tool'] == 'jar']
     assert keystore.is_file(), keystore
     assert not list(apk_dir.glob('.staging-*')), list(apk_dir.iterdir())
-    staging = Path(argv_of('jar')[argv_of('jar').index('-C') + 1])
+    staging = Path(jars[0][jars[0].index('-C') + 1])
     assert staging.parent == apk_dir and staging.name.startswith('.staging-'), staging
     same(argv_of('aapt')[:8], ['package', '-f', '-M', str(staging / 'AndroidManifest.xml'),
                                    '-I', str(sdk / 'platforms/android-34/android.jar'), '-F',
@@ -361,8 +364,8 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     # `-0 mov`: the one runtime-read video suffix aapt would deflate.
     same(argv_of('aapt')[8:], ['-A', str(staging / 'assets'), '-0', 'mov',
                                    '-S', str(staging / 'res'), '-0', 'arsc'])
-    same(argv_of('jar'), ['--update', '--no-compress', '--file', str(staging / 'game.apk.unsigned'),
-                              '-C', str(staging), 'lib'])
+    same(jars, [['--update', '--no-compress', '--file', str(staging / 'game.apk.unsigned'), '-C', str(staging), 'lib'],
+                ['--update', '--file', str(staging / 'game.apk.unsigned'), '-C', str(staging / 'dex'), 'classes.dex']])
     same(argv_of('zipalign'), ['-f', '4', str(staging / 'game.apk.unsigned'), str(staging / 'game.apk.aligned')])
     same(argv_of('apksigner'), ['sign', '--ks', str(keystore), '--ks-pass', 'pass:android',
                                         '--ks-key-alias', 'androiddebugkey', '--key-pass', 'pass:android',
@@ -389,7 +392,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     reset_log()
     run('build', '--platform=android', '--optimize=ReleaseFast')
     strip = argv_of('llvm-strip')
-    staging = Path(argv_of('jar')[argv_of('jar').index('-C') + 1])
+    staging = Path(argv_of('aapt')[argv_of('aapt').index('-M') + 1]).parent
     same(strip, ['--strip-unneeded', '-o', str(staging / 'lib/arm64-v8a/libgame.so'), str(so)])
     assert inventory(apk)['lib/arm64-v8a/libgame.so'][1] == b'STRIPPED'
     assert (apk_dir / 'symbols/arm64-v8a/libgame.so').read_text() == BUILT
@@ -422,7 +425,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     adb = [e['argv'] for e in calls() if e['tool'] == 'adb']
     same(adb, [
         ['install', '-r', str(apk)],
-        ['shell', 'am', 'start', '-S', '-n', 'com.labelle.fixture/android.app.NativeActivity',
+        ['shell', 'am', 'start', '-S', '-n', 'com.labelle.fixture/labelle.android.LabelleActivity',
          '--es', 'LABELLE_SCENE', "'intro'", '--es', 'LABELLE_SCREENSHOT_PATH', "'shot'",
          '--es', 'LABELLE_SCREENSHOT_AFTER_SEC', "'4.000'"],
     ])
@@ -433,7 +436,7 @@ with tempfile.TemporaryDirectory(prefix='labelle-android-provider-') as temp:
     run('android', 'run', '--device', 'SERIAL-1')
     same([e['argv'] for e in calls() if e['tool'] == 'adb'], [
         ['-s', 'SERIAL-1', 'install', '-r', str(apk)],
-        ['-s', 'SERIAL-1', 'shell', 'am', 'start', '-S', '-n', 'com.labelle.fixture/android.app.NativeActivity'],
+        ['-s', 'SERIAL-1', 'shell', 'am', 'start', '-S', '-n', 'com.labelle.fixture/labelle.android.LabelleActivity'],
     ])
     # Nor one packaged with other settings (a new package_name, no rebuild):
     # it would install under the old name and fail to launch as the new one.

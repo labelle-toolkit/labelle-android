@@ -16,7 +16,7 @@
 //!
 //! The APK stand-in is a real (stored-only) zip, so the e2e can read the
 //! inventory the provider produced: aapt writes the manifest, `res/` and
-//! `assets/`; `jar --update` adds `lib/`; zipalign and apksigner copy.
+//! `assets/`; `jar --update` adds `lib/` and `classes.dex`; zipalign and apksigner copy.
 const std = @import("std");
 
 const Entry = struct { name: []const u8, data: []const u8 };
@@ -124,13 +124,21 @@ fn act(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, to
         return 0;
     }
     if (std.mem.eql(u8, tool, "jar")) {
-        if (!has(args, "--update") or !has(args, "--no-compress")) return error.UnexpectedJarArgs;
+        // `--update` of `lib/` (a tree, `--no-compress`: API 30+ needs the
+        // `.so`s stored) or of `classes.dex` (one file at the APK root).
+        if (!has(args, "--update")) return error.UnexpectedJarArgs;
         const apk = flag(args, "--file") orelse return error.NoFile;
         const base = flag(args, "-C") orelse return error.NoBase;
         var entries: std.ArrayList(Entry) = .empty;
         try entries.appendSlice(a, try unzip(a, try read(a, io, apk)));
         const sub = args[args.len - 1];
-        try addTree(a, io, try std.fs.path.join(a, &.{ base, sub }), sub, &entries);
+        const path = try std.fs.path.join(a, &.{ base, sub });
+        if (std.mem.eql(u8, sub, "lib")) {
+            if (!has(args, "--no-compress")) return error.LibsMustBeStored;
+            try addTree(a, io, path, sub, &entries);
+        } else {
+            try entries.append(a, .{ .name = sub, .data = try read(a, io, path) });
+        }
         try write(io, apk, try zip(a, entries.items));
         return 0;
     }

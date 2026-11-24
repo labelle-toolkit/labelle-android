@@ -148,7 +148,7 @@ def check_apk(apk, version_code, symbols_so):
     b = badging(apk)
     for needle in (f"package: name='com.labelle.tiny_android' versionCode='{version_code}' versionName='0.3'",
                    "sdkVersion:'28'", "targetSdkVersion:'34'", "application-label:'Tiny Android'",
-                   "launchable-activity: name='android.app.NativeActivity'", "icon='res/mipmap-"):
+                   "launchable-activity: name='labelle.android.LabelleActivity'", "icon='res/mipmap-"):
         assert needle in b, (needle, b)
     assert re.search(r"application-icon-640:'res/mipmap-xxxhdpi(-v4)?/ic_launcher.png'", b), b
     files = inventory(apk)
