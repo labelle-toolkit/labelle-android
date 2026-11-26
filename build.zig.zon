@@ -9,6 +9,7 @@
         "build.zig.zon",
         "plugin.labelle",
         "README.md",
+        "java",
         "src",
         "tools",
     },

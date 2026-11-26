@@ -1,4 +1,4 @@
-//! Install a packaged APK and launch its NativeActivity (ported from
+//! Install a packaged APK and launch its LabelleActivity (ported from
 //! labelle-cli `src/cli/android/run.zig`, development 23aa180;
 //! labelle-cli#405). Used by the `deploy` hook that replaces `labelle run`
 //! and by `labelle android run`. Neither builds nor packages: the APK is
@@ -22,9 +22,11 @@ pub const Launch = struct {
     extras: []const contract.RunEnv = &.{},
 };
 
-/// The NativeActivity component of `package_name`.
+/// The launch component of `package_name`: `labelle.android.LabelleActivity`,
+/// the only activity the manifest declares (`tools/package/manifest.zig`;
+/// the stock NativeActivity plus the on-screen keyboard, `java/`).
 pub fn activity(a: std.mem.Allocator, package_name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s}/android.app.NativeActivity", .{package_name});
+    return std.fmt.allocPrint(a, "{s}/labelle.android.LabelleActivity", .{package_name});
 }
 
 /// `adb [-s serial] install -r <apk>`, then `adb [-s serial] shell am start
@@ -70,7 +72,7 @@ pub fn installAndLaunch(a: std.mem.Allocator, io: std.Io, env: *const sdk.Env, l
     std.debug.print("labelle-android: app launched on device\n", .{});
 }
 
-/// The `adb` arguments that launch the NativeActivity:
+/// The `adb` arguments that launch the LabelleActivity:
 /// `shell am start -S -n <activity> [--es <key> <value>]...`, one string
 /// extra per `LABELLE_*` run option (cli#397). The Android runtime turns the
 /// extras back into env vars before the game starts (labelle-android's
@@ -131,7 +133,7 @@ fn expectArgs(expected: []const []const u8, got: []const []const u8) !void {
     for (expected, got) |e, g| try std.testing.expectEqualStrings(e, g);
 }
 
-const component_under_test = "com.example.game/android.app.NativeActivity";
+const component_under_test = "com.example.game/labelle.android.LabelleActivity";
 
 test "amStartArgs: no run options → the bare launch, no extras" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
